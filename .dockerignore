@@ -12,9 +12,12 @@ data_test
 .env
 *.env
 zcode_oauth_result.json
+docker-compose.yml
+nginx.conf
 
 # ── 依赖与缓存（镜像内重新安装）──
 captcha_node/node_modules
+temp
 **/__pycache__
 *.pyc
 *.pyo

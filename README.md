@@ -110,6 +110,9 @@ python main.py set-admin-key <key>                 # 设置后台密码
 python main.py export [file] / import <file>       # 导出 / 导入账号
 ```
 
+`login zai` 会打开 ZCode 官方授权页；授权完成后，将浏览器地址栏中的完整登录完成页地址粘贴回终端即可完成凭证交换。
+使用 `--no-browser` 时需自行打开终端输出的授权链接。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -119,11 +122,13 @@ python main.py export [file] / import <file>       # 导出 / 导入账号
 | `ZCODE_ADMIN_KEY` | zcode | 后台密码初始值（之后以 DB 为准）|
 | `ZCODE_DATA_DIR` | ./data | 数据目录（SQLite 存放处）|
 | `ZCODE_QUOTA_REFRESH_INTERVAL` | 60 | 后台刷新额度间隔（秒），0 关闭 |
+| `ZCODE_CLIENT_VERSION` | 3.7.7 | ZCode 客户端版本（额度请求会附带此版本）|
 | `ZCODE_COOLING_SECONDS` | 300 | 限流冷却时长（秒）|
 | `ZCODE_NODE_PATH` | node | 无痕验证求解器使用的 Node 可执行文件 |
 | `ZCODE_CAPTCHA_TIMEOUT` | 40 | 单次验证码求解超时（秒）|
 | `ZCODE_CAPTCHA_RETRIES` | 4 | 验证码求解失败重试次数 |
 | `CAPTCHA_CACHE_TTL` | 45000 | 验证码缓存时长 (ms) |
+| `UPSTREAM_USER_AGENT` | `ZCode/<客户端版本>` | 上游请求 User-Agent |
 | `ZAI_UPSTREAM_URL` / `ZAI_FALLBACK_URL` / `BIGMODEL_UPSTREAM_URL` | — | 上游端点 |
 
 ## 项目结构

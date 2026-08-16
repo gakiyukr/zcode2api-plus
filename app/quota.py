@@ -16,7 +16,11 @@ from .store import store
 
 
 def _auth_headers(account: Account) -> dict:
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": settings.USER_AGENT,
+        "X-ZCode-App-Version": settings.ZCODE_CLIENT_VERSION,
+    }
     if account.mode == "jwt" and account.jwt_token:
         headers["Authorization"] = f"Bearer {account.jwt_token}"
     elif account.api_key:
@@ -24,89 +28,122 @@ def _auth_headers(account: Account) -> dict:
     return headers
 
 
-async def fetch_quota(account: Account) -> dict:
-    """拉取单个账号的 方案 / 余额 / 用量，写回账号状态并持久化。
+_QUOTA_CACHE_TTL_SECONDS = 15.0
+_quota_inflight: dict[str, asyncio.Task[dict]] = {}
+_quota_cache: dict[str, tuple[float, dict]] = {}
 
-    返回结构: {"billing":..., "balance":..., "usage":..., "error":...}
-    """
+
+async def _fetch_quota_once(account: Account) -> dict:
+    """拉取官方客户端使用的套餐与模型余额，写回账号状态并持久化。"""
     headers = _auth_headers(account)
-    base = settings.ZCODE_BILLING_BASE
-    result: dict = {}
+    url = f"{settings.ZCODE_BILLING_BASE}/billing/balance"
+    account.last_checked_at = time.time()
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        async def _get(path: str):
-            try:
-                return await client.get(f"{base}{path}", headers=headers)
-            except httpx.HTTPError:
-                return None
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                url,
+                headers=headers,
+                params={"app_version": settings.ZCODE_CLIENT_VERSION},
+            )
+    except httpx.HTTPError as err:
+        account.last_error = f"额度查询网络错误: {err}"
+        store.update_account(account)
+        return {"error": account.last_error}
 
-        billing_res, balance_res, usage_res = await asyncio.gather(
-            _get("/billing/current"),
-            _get("/billing/balance"),
-            _get("/usage"),
-        )
-
-    now = time.time()
-    account.last_checked_at = now
-
-    # 鉴权失败 → 标记 invalid
-    if billing_res is not None and billing_res.status_code in (401, 403):
-        body = (billing_res.text or "").lower()
-        if "captcha" not in body and "verify" not in body:
-            account.status = Status.INVALID
-            account.last_error = f"鉴权失败 HTTP {billing_res.status_code}"
+    if response.status_code in (401, 403):
+        account.status = Status.INVALID
+        account.last_error = f"鉴权失败 HTTP {response.status_code}"
+        store.update_account(account)
+        return {"error": account.last_error}
+    if response.status_code != 200:
+        if response.status_code == 405 and account.quota:
+            account.last_error = None
             store.update_account(account)
-            return {"error": account.last_error}
+            return {"cached": True, "reason": "上游额度接口拒绝了重复查询（HTTP 405）"}
+        account.last_error = f"额度查询失败 HTTP {response.status_code}"
+        store.update_account(account)
+        return {"error": account.last_error}
 
-    if billing_res is not None and billing_res.status_code == 200:
-        try:
-            data = billing_res.json()
-            result["billing"] = data
-            plans = (data.get("data") or {}).get("plans") or []
-            account.plan = plans[0] if plans else {}
-        except (ValueError, KeyError):
-            pass
+    try:
+        payload = response.json()
+    except ValueError:
+        account.last_error = "额度查询返回了无效 JSON"
+        store.update_account(account)
+        return {"error": account.last_error}
+    if payload.get("code") not in (None, 0):
+        account.last_error = (payload.get("msg") or f"额度查询失败 code={payload.get('code')}").strip()
+        store.update_account(account)
+        return {"balance": payload, "error": account.last_error}
+
+    data = payload.get("data") or {}
+    plans = data.get("plans") or []
+    balances = data.get("balances") or []
+    account.plan = plans[0] if plans else {}
 
     quota_map: dict = {}
-    if balance_res is not None and balance_res.status_code == 200:
-        try:
-            data = balance_res.json()
-            result["balance"] = data
-            for bal in (data.get("data") or {}).get("balances") or []:
-                name = bal.get("show_name") or bal.get("model") or "model"
-                quota_map[name] = {
-                    "total": bal.get("total_units"),
-                    "used": bal.get("used_units"),
-                    "remaining": bal.get("remaining_units"),
-                    "expires_at": bal.get("expires_at"),
-                }
-        except (ValueError, KeyError):
-            pass
+    for balance in balances:
+        name = balance.get("show_name") or balance.get("model") or "model"
+        quota_map[name] = {
+            "total": balance.get("total_units"),
+            "used": balance.get("used_units"),
+            "remaining": balance.get("remaining_units"),
+            "expires_at": balance.get("expires_at"),
+        }
 
-    if usage_res is not None and usage_res.status_code == 200:
-        try:
-            account.usage = usage_res.json().get("data") or {}
-            result["usage"] = account.usage
-        except (ValueError, KeyError):
-            pass
+    if not quota_map:
+        account.quota = {}
+        account.last_error = "账号未返回可用套餐额度"
+        store.update_account(account)
+        return {"balance": payload, "error": account.last_error}
 
-    if quota_map:
-        account.quota = quota_map
-        # 额度用完判定：所有模型剩余 <= 0
-        remainings = [
-            q.get("remaining") for q in quota_map.values() if q.get("remaining") is not None
-        ]
-        if remainings and all((r or 0) <= 0 for r in remainings):
-            account.status = Status.EXHAUSTED
-            account.last_error = "额度已用完"
-        elif account.status in (Status.EXHAUSTED, Status.COOLING, Status.INVALID):
-            # 额度恢复 → 重新激活
+    account.quota = quota_map
+    remainings = [
+        quota.get("remaining") for quota in quota_map.values()
+        if quota.get("remaining") is not None
+    ]
+    if remainings and all((remaining or 0) <= 0 for remaining in remainings):
+        account.status = Status.EXHAUSTED
+        account.last_error = "额度已用完"
+    else:
+        if account.status in (Status.EXHAUSTED, Status.COOLING, Status.INVALID):
             account.status = Status.ACTIVE
-            account.last_error = None
             account.cooling_until = None
+        account.last_error = None
 
     store.update_account(account)
-    return result or {"error": "无法获取额度数据"}
+    return {"balance": payload}
+
+
+async def _fetch_and_cache(account: Account) -> dict:
+    result = await _fetch_quota_once(account)
+    if "error" not in result:
+        _quota_cache[account.id] = (time.monotonic(), result)
+    return result
+
+
+async def fetch_quota(account: Account) -> dict:
+    """合并同账号并发查询，并短暂复用成功结果以避免触发上游限流。"""
+    inflight = _quota_inflight.get(account.id)
+    if inflight is not None:
+        return await asyncio.shield(inflight)
+
+    cached = _quota_cache.get(account.id)
+    if cached is not None:
+        cached_at, result = cached
+        if time.monotonic() - cached_at < _QUOTA_CACHE_TTL_SECONDS:
+            return {**result, "cached": True}
+        _quota_cache.pop(account.id, None)
+
+    task = asyncio.create_task(_fetch_and_cache(account))
+    _quota_inflight[account.id] = task
+
+    def _clear_inflight(done: asyncio.Task[dict]) -> None:
+        if _quota_inflight.get(account.id) is done:
+            _quota_inflight.pop(account.id, None)
+
+    task.add_done_callback(_clear_inflight)
+    return await asyncio.shield(task)
 
 
 async def refresh_accounts(accounts: list[Account]) -> dict:

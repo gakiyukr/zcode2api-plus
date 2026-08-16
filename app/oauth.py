@@ -1,45 +1,113 @@
 """Z.AI OAuth 登录流程。
 
-主要供 CLI `login zai` 使用：发起 OAuth → 轮询 → 兑换 API Key。
+使用 ZCode 官网当前的浏览器授权流程获取 Coding Plan 凭证。
 """
 
 from __future__ import annotations
 
+import base64
+import json
 import secrets
+import time
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
 
+_AUTHORIZE_URL = "https://chat.z.ai/api/oauth/authorize"
+_TOKEN_URL = "https://zcode.z.ai/api/v1/oauth/token"
+_CLIENT_ID = "client_P8X5CMWmlaRO9gyO-KSqtg"
+_REGISTERED_REDIRECT_URI = (
+    "https://zcode.z.ai/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback"
+)
+
+
 class ZaiAuthFlow:
-    def __init__(self, api_base: str = "https://zcode.z.ai/api/v1") -> None:
-        self.api_base = api_base
-        self.poll_token = secrets.token_hex(32)
+    def __init__(self) -> None:
+        self.redirect_uri = _REGISTERED_REDIRECT_URI
+        self.flow_id = secrets.token_urlsafe(24)
+        self.nonce = secrets.token_urlsafe(24)
+        self.state = ""
+        self.created_at = time.monotonic()
 
     async def init(self) -> tuple[str, str]:
+        state_data = {
+            "nonce": self.nonce,
+            "app_return_to": self.redirect_uri,
+            "redirect_uri": self.redirect_uri,
+        }
+        raw_state = json.dumps(state_data, ensure_ascii=False, separators=(",", ":")).encode()
+        self.state = base64.urlsafe_b64encode(raw_state).decode().rstrip("=")
+        query = urlencode({
+            "redirect_uri": self.redirect_uri,
+            "response_type": "code",
+            "client_id": _CLIENT_ID,
+            "state": self.state,
+        })
+        return self.flow_id, f"{_AUTHORIZE_URL}?{query}"
+
+    def matches_state(self, state: str) -> bool:
+        return bool(self.state and state and secrets.compare_digest(self.state, state))
+
+    @staticmethod
+    def parse_callback_url(callback_url: str) -> tuple[str, str, str]:
+        callback_url = callback_url.strip()
+        if not callback_url or len(callback_url) > 8192:
+            raise RuntimeError("回调地址为空或过长")
+        parsed = urlparse(callback_url)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if parsed.scheme == "https":
+            if parsed.netloc != "zcode.z.ai" or parsed.path.rstrip("/") != "/app/oauth/login":
+                raise RuntimeError("只接受 ZCode 官方登录完成页地址")
+            redirect = (query.get("redirect") or [""])[0]
+            if redirect.rstrip("/") != "zcode://oauth/callback":
+                raise RuntimeError("ZCode 官方回调目标无效")
+        elif parsed.scheme == "zcode":
+            if parsed.netloc != "oauth" or parsed.path.rstrip("/") != "/callback":
+                raise RuntimeError("ZCode 回调地址无效")
+        else:
+            raise RuntimeError("只接受 ZCode 官方 HTTPS 或 zcode:// 回调地址")
+
+        code = (query.get("code") or query.get("authCode") or [""])[0].strip()
+        state = (query.get("state") or [""])[0].strip()
+        error = (query.get("error") or [""])[0].strip()
+        if not error and (not code or not state):
+            raise RuntimeError("回调地址缺少 code/authCode 或 state")
+        return code, state, error
+
+    async def exchange_code(self, code: str, state: str) -> dict:
+        if not code:
+            raise RuntimeError("OAuth 回调缺少授权码")
+        if not self.matches_state(state):
+            raise RuntimeError("OAuth state 校验失败")
+
         async with httpx.AsyncClient(timeout=30) as client:
             res = await client.post(
-                f"{self.api_base}/oauth/cli/init",
-                headers={
-                    "Authorization": f"Bearer {self.poll_token}",
-                    "Content-Type": "application/json",
-                },
-                json={"provider": "zai"},
+                _TOKEN_URL,
+                headers={"Content-Type": "application/json"},
+                json={"code": code, "redirect_uri": self.redirect_uri, "state": state},
             )
-        res.raise_for_status()
-        data = res.json().get("data") or {}
-        flow_id, authorize_url = data.get("flow_id"), data.get("authorize_url")
-        if not flow_id or not authorize_url:
-            raise RuntimeError("返回的 OAuth 流程数据不完整")
-        return flow_id, authorize_url
+        if not res.is_success:
+            detail = res.text.strip()[:200]
+            raise RuntimeError(f"Z.AI 凭证交换失败 ({res.status_code}): {detail}")
+        try:
+            payload = res.json()
+        except ValueError as err:
+            raise RuntimeError("Z.AI 凭证交换返回了无效 JSON") from err
+        if payload.get("code") != 0:
+            raise RuntimeError((payload.get("msg") or "Z.AI 凭证交换失败").strip())
 
-    async def poll(self, flow_id: str) -> dict:
-        async with httpx.AsyncClient(timeout=30) as client:
-            res = await client.get(
-                f"{self.api_base}/oauth/cli/poll/{flow_id}",
-                headers={"Authorization": f"Bearer {self.poll_token}"},
-            )
-        res.raise_for_status()
-        return res.json().get("data") or {}
+        data = payload.get("data") or {}
+        zcode_jwt = (data.get("token") or "").strip()
+        access_token = ((data.get("zai") or {}).get("access_token") or "").strip()
+        if not zcode_jwt:
+            raise RuntimeError("Z.AI 凭证响应中不含 Coding Plan Token")
+        return {
+            "status": "ready",
+            "token": zcode_jwt,
+            "zai": {"access_token": access_token} if access_token else {},
+            "user": data.get("user") or {},
+        }
 
     async def exchange_api_key(self, access_token: str) -> str:
         """OAuth access_token → 业务 token → 机构/项目 → API Key。"""

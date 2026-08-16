@@ -52,7 +52,7 @@ def build_request(
         **auth,
         "anthropic-version": "2023-06-01",
         "User-Agent": settings.USER_AGENT,
-        "X-ZCode-App-Version": "3.0.1",
+        "X-ZCode-App-Version": settings.ZCODE_CLIENT_VERSION,
         "X-ZCode-Agent": "glm",
         "HTTP-Referer": "https://zcode.z.ai/",
     }

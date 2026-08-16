@@ -15,8 +15,19 @@ from ..store import store
 
 router = APIRouter(prefix="/admin/api", dependencies=[Depends(verify_admin_key)])
 
-# 进行中的 OAuth 登录流程（flow_id -> ZaiAuthFlow），需跨请求保留 poll_token
+# 以不可预测的 flow_id/state 关联后台发起的 OAuth 会话。
 _login_flows: dict[str, ZaiAuthFlow] = {}
+_login_results: dict[str, dict] = {}
+_LOGIN_TTL_SECONDS = 600
+
+
+def _cleanup_login_flows() -> None:
+    now = time.monotonic()
+    expired = [flow_id for flow_id, flow in _login_flows.items()
+               if now - flow.created_at > _LOGIN_TTL_SECONDS]
+    for flow_id in expired:
+        _login_flows.pop(flow_id, None)
+        _login_results.pop(flow_id, None)
 
 
 # ── 鉴权探针 ─────────────────────────────────────────────────────────────────
@@ -142,46 +153,23 @@ async def refresh_one(account_id: str):
     if acc.mode != "jwt":
         return {"ok": False, "message": "仅 Coding Plan (JWT) 账号支持额度查询"}
     res = await fetch_quota(acc)
-    return {"ok": "error" not in res, "result": res, "account": acc.public_view()}
+    updated = store.find_any(account_id) or acc
+    return {"ok": "error" not in res, "result": res, "account": updated.public_view()}
 
 
 # ── OAuth 登录（Z.AI）────────────────────────────────────────────────────────
-@router.post("/login/start")
-async def login_start():
-    """发起 Z.AI OAuth，返回授权链接供前端展示。"""
-    flow = ZaiAuthFlow()
-    try:
-        flow_id, authorize_url = await flow.init()
-    except Exception as err:  # noqa: BLE001
-        raise HTTPException(502, f"登录初始化失败: {err}")
-    _login_flows[flow_id] = flow
-    return {"flow_id": flow_id, "authorize_url": authorize_url}
+def _find_login_flow(state: str) -> tuple[str | None, ZaiAuthFlow | None]:
+    _cleanup_login_flows()
+    for flow_id, flow in _login_flows.items():
+        if flow.matches_state(state):
+            return flow_id, flow
+    return None, None
 
 
-@router.get("/login/poll/{flow_id}")
-async def login_poll(flow_id: str):
-    """轮询授权状态；成功后自动兑换凭证并加入账号池。"""
-    flow = _login_flows.get(flow_id)
-    if not flow:
-        raise HTTPException(404, "登录会话不存在或已过期")
-    try:
-        data = await flow.poll(flow_id)
-    except Exception:  # noqa: BLE001 - 单次网络抖动按 pending 处理
-        return {"status": "pending"}
-
-    state = data.get("status")
-    if state == "failed":
-        _login_flows.pop(flow_id, None)
-        return {"status": "failed"}
-    if state != "ready":
-        return {"status": "pending"}
-
-    # 授权成功：保存 Coding Plan JWT，并尝试兑换 API Key 作为同账号回退
+async def _save_oauth_account(flow: ZaiAuthFlow, data: dict):
     zcode_jwt = data.get("token")
     access_token = (data.get("zai") or {}).get("access_token")
-    account = None
-    if zcode_jwt:
-        account = store.add_account("zai", "oauth-login", zcode_jwt)
+    account = store.add_account("zai", "oauth-login", zcode_jwt) if zcode_jwt else None
     if access_token:
         try:
             api_key = await flow.exchange_api_key(access_token)
@@ -192,14 +180,72 @@ async def login_poll(flow_id: str):
                 account = store.add_account("zai", "oauth-login", api_key)
         except Exception:  # noqa: BLE001 - 兑换失败不影响 JWT 已入池
             pass
-
-    _login_flows.pop(flow_id, None)
     if account is None:
-        return {"status": "failed", "message": "未能从授权结果中获取凭证"}
-
+        raise RuntimeError("未能从授权结果中获取凭证")
     if account.mode == "jwt":
-        await refresh_accounts([account])
-    return {"status": "ready", "account": account.public_view()}
+        try:
+            await refresh_accounts([account])
+        except Exception:  # noqa: BLE001 - 额度刷新失败不影响账号入池
+            pass
+    return account
+
+
+async def _complete_login_callback(code: str, state: str, error: str) -> tuple[bool, str]:
+    flow_id, flow = _find_login_flow(state)
+    if flow_id is None or flow is None:
+        raise RuntimeError("登录会话不存在、已过期或 state 无效")
+    if error:
+        message = f"Z.AI 拒绝授权: {error}"
+        _login_results[flow_id] = {"status": "failed", "message": message}
+        return False, message
+    try:
+        data = await flow.exchange_code(code, state)
+        account = await _save_oauth_account(flow, data)
+    except Exception as err:  # noqa: BLE001
+        message = str(err) or "OAuth 授权失败"
+        _login_results[flow_id] = {"status": "failed", "message": message}
+        return False, message
+    _login_results[flow_id] = {"status": "ready", "account": account.public_view()}
+    return True, "授权成功，账号已加入账号池"
+
+
+@router.post("/login/start")
+async def login_start():
+    """发起 Z.AI 浏览器 OAuth，返回使用官方已注册回调的授权链接。"""
+    _cleanup_login_flows()
+    flow = ZaiAuthFlow()
+    try:
+        flow_id, authorize_url = await flow.init()
+    except Exception as err:  # noqa: BLE001
+        raise HTTPException(502, f"登录初始化失败: {err}")
+    _login_flows[flow_id] = flow
+    _login_results[flow_id] = {"status": "pending"}
+    return {"flow_id": flow_id, "authorize_url": authorize_url}
+
+
+@router.post("/login/complete/{flow_id}")
+async def login_complete(flow_id: str, payload: dict = Body(...)):
+    """校验用户从官方登录完成页复制的回调地址并导入凭证。"""
+    _cleanup_login_flows()
+    flow = _login_flows.get(flow_id)
+    if flow is None:
+        raise HTTPException(404, "登录会话不存在或已过期")
+    callback_url = (payload.get("callback_url") or "").strip()
+    try:
+        code, state, error = flow.parse_callback_url(callback_url)
+    except Exception as err:  # noqa: BLE001
+        raise HTTPException(400, str(err) or "回调地址无效")
+    if not flow.matches_state(state):
+        raise HTTPException(400, "回调地址与当前登录会话不匹配")
+
+    ok, message = await _complete_login_callback(code, state, error)
+    result = _login_results.get(flow_id, {"status": "failed", "message": message})
+    if not ok:
+        _login_results[flow_id] = {"status": "pending"}
+        raise HTTPException(400, message)
+    _login_flows.pop(flow_id, None)
+    _login_results.pop(flow_id, None)
+    return result
 
 
 # ── 设置 ─────────────────────────────────────────────────────────────────────

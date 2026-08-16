@@ -61,7 +61,7 @@ async def cmd_login(args: list[str]) -> None:
         return
     flow = ZaiAuthFlow()
     try:
-        flow_id, authorize_url = await flow.init()
+        _flow_id, authorize_url = await flow.init()
     except Exception as err:  # noqa: BLE001
         print(c(f"❌ 登录初始化失败: {err}", "red"))
         return
@@ -76,32 +76,29 @@ async def cmd_login(args: list[str]) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-    print("正在等待授权...")
-    for _ in range(100):
-        await asyncio.sleep(2)
+    print("\n授权完成后，请复制浏览器地址栏中的完整登录完成页地址并粘贴：")
+    try:
+        callback_url = await asyncio.to_thread(input, "> ")
+        code, state, error = flow.parse_callback_url(callback_url)
+        if error:
+            raise RuntimeError(f"Z.AI 拒绝授权: {error}")
+        data = await flow.exchange_code(code, state)
+    except Exception as err:  # noqa: BLE001
+        print(c(f"❌ 授权失败: {err}", "red"))
+        return
+
+    access_token = (data.get("zai") or {}).get("access_token")
+    zcode_jwt = data.get("token")
+    if zcode_jwt:
+        acc = store.add_account("zai", "oauth-login", zcode_jwt)
+        print(c(f"\n✔ 已保存 Coding Plan JWT 账号: {acc.name} ({acc.id})", "green"))
+    if access_token:
         try:
-            data = await flow.poll(flow_id)
-        except Exception:  # noqa: BLE001
-            continue
-        status = data.get("status")
-        if status == "ready":
-            access_token = (data.get("zai") or {}).get("access_token")
-            zcode_jwt = data.get("token")
-            if zcode_jwt:
-                acc = store.add_account("zai", "oauth-login", zcode_jwt)
-                print(c(f"\n✔ 已保存 Coding Plan JWT 账号: {acc.name} ({acc.id})", "green"))
-            if access_token:
-                try:
-                    key = await flow.exchange_api_key(access_token)
-                    store.add_account("zai", "oauth-apikey", key)
-                    print(c(f"✔ 已兑换并保存 API Key: {key[:8]}...", "green"))
-                except Exception as err:  # noqa: BLE001
-                    print(c(f"⚠️ 兑换 API Key 失败: {err}", "yellow"))
-            return
-        if status == "failed":
-            print(c("❌ 授权失败或被拒绝。", "red"))
-            return
-    print(c("❌ 登录超时，请重试。", "red"))
+            key = await flow.exchange_api_key(access_token)
+            store.add_account("zai", "oauth-apikey", key)
+            print(c(f"✔ 已兑换并保存 API Key: {key[:8]}...", "green"))
+        except Exception as err:  # noqa: BLE001
+            print(c(f"⚠️ 兑换 API Key 失败: {err}", "yellow"))
 
 
 # ── 账号管理 ─────────────────────────────────────────────────────────────────

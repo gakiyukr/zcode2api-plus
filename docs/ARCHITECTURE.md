@@ -98,7 +98,7 @@ graph TD
 | Quota Monitor | `app/quota.py` | 单账号额度查询 + 状态判定 + 后台周期刷新任务 |
 | Captcha Manager | `app/captcha.py` | 拉取验证码配置、调用 Node 求解器、缓存/并发去重/重试 |
 | Captcha Solver | `captcha_node/solver.js` | jsdom 模拟浏览器跑阿里云无痕 SDK,输出 `verifyParam` |
-| OAuth Flow | `app/oauth.py` | Z.AI OAuth:init → poll → 兑换 API Key |
+| OAuth Flow | `app/oauth.py` | Z.AI OAuth：官方回调地址校验 → code 交换 → JWT / API Key 入池 |
 | Settings | `app/settings.py` | 环境变量 / 默认值 / 路径 / 上游端点 |
 | Logs | `app/logs.py` | 彩色终端日志(banner / req / req_ok / req_err …) |
 
@@ -300,8 +300,9 @@ meta(      key PK, value )      # admin_key / gateway_key / quota_refresh_interv
 > **说明**:由于作者**没有可长期使用的付费 Coding Plan 账号**,以下行为**未能充分实测验证**,
 > 文档中的相关描述基于上游接口的观测与推断,可能与真实上游存在偏差。欢迎有条件的使用者反馈/纠正:
 
-- **额度/计费字段**:`billing/current`、`billing/balance`、`usage` 的返回结构与字段含义(如
-  `total_units` / `used_units` / `remaining_units` / `expires_at`)主要依据观测,不同套餐可能不一致。
+- **额度/计费字段**:当前按 ZCode 3.7.7 官方客户端请求
+  `billing/balance?app_version=3.7.7`;`total_units` / `used_units` / `remaining_units` / `expires_at`
+  等字段已按实际响应解析,但不同套餐的字段仍可能不一致。
 - **额度用完判定**:`exhausted` 触发条件(余额=0、HTTP 402、错误体含 `quota/insufficient/余额` 等关键字)
   为启发式;真实上游的耗尽信号若不同,可能需要调整 `app/quota.py` / `app/routes/gateway.py` 的判定。
 - **模型清单**:`/v1/models` 当前固定为 `GLM-5.2` 与 `GLM-5-Turbo`,未做上游动态拉取。

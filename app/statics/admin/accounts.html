@@ -99,18 +99,21 @@
     <!-- 授权登录 -->
     <div id="add-pane-login" style="display:none">
       <div class="dialog-body">
-        <div class="dialog-help">通过 Z.AI 官方 OAuth 授权登录，授权成功后自动导入到账号池（含 Coding Plan 额度）。</div>
+        <div class="dialog-help">Z.AI 只允许 ZCode 官方回调地址，需要在登录完成后复制一次浏览器地址，不需要提供账号密码。</div>
         <div id="login-idle">
           <button onclick="startLogin()" id="login-start-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px">开始登录</button>
         </div>
         <div id="login-active" style="display:none">
-          <div class="dialog-help" style="margin-bottom:6px">请在浏览器中打开下面链接完成授权：</div>
+          <div class="dialog-help" style="margin-bottom:6px">1. 打开授权页并完成 Z.AI 登录：</div>
           <div style="display:flex;gap:8px;align-items:center">
             <input class="input" id="login-url" readonly style="font-size:12px">
             <button onclick="copyLoginUrl()" class="dialog-btn">复制</button>
             <button onclick="openLoginUrl()" class="dialog-btn dialog-btn-primary">打开</button>
           </div>
-          <div class="live-dot" id="login-status" style="margin-top:16px">等待授权中…</div>
+          <div class="dialog-help" style="margin:16px 0 6px">2. 页面显示“登录已完成”后，复制该页面浏览器地址栏里的完整地址并粘贴到这里：</div>
+          <textarea class="input" id="login-callback-url" rows="3" placeholder="https://zcode.z.ai/app/oauth/login?... 或 zcode://oauth/callback?..."></textarea>
+          <button onclick="completeLogin()" id="login-complete-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px;margin-top:10px">3. 完成导入</button>
+          <div id="login-status" style="margin-top:14px">等待完成授权并粘贴回调地址…</div>
         </div>
       </div>
       <div class="dialog-actions">
@@ -272,55 +275,52 @@ async function doAdd(){
 }
 
 /* ── 授权登录 ── */
-let _loginTimer=null, _loginUrl='';
+let _loginUrl='', _loginFlowId='';
 function switchAddTab(tab){
   document.getElementById('tab-paste').classList.toggle('active',tab==='paste');
   document.getElementById('tab-login').classList.toggle('active',tab==='login');
   document.getElementById('add-pane-paste').style.display=tab==='paste'?'':'none';
   document.getElementById('add-pane-login').style.display=tab==='login'?'':'none';
-  if(tab!=='login')stopLoginPoll();
 }
 function resetLoginPane(){
-  stopLoginPoll();
-  _loginUrl='';
+  _loginUrl='';_loginFlowId='';
   document.getElementById('login-idle').style.display='';
   document.getElementById('login-active').style.display='none';
   document.getElementById('login-start-btn').disabled=false;
+  document.getElementById('login-callback-url').value='';
+  document.getElementById('login-complete-btn').disabled=false;
 }
 async function startLogin(){
   const btn=document.getElementById('login-start-btn');
   btn.disabled=true;
   try{
     const d=await api('POST','/login/start');
-    _loginUrl=d.authorize_url;
+    _loginUrl=d.authorize_url;_loginFlowId=d.flow_id;
     document.getElementById('login-url').value=_loginUrl;
     document.getElementById('login-idle').style.display='none';
     document.getElementById('login-active').style.display='';
-    setLoginStatus('等待授权中…',false);
+    setLoginStatus('等待完成授权并粘贴回调地址…',false);
     try{window.open(_loginUrl,'_blank','noopener');}catch{}
-    pollLogin(d.flow_id);
   }catch(e){
     showToast('发起登录失败: '+e.message,'error');
     btn.disabled=false;
   }
 }
-function pollLogin(flowId){
-  let n=0;
-  _loginTimer=setInterval(async()=>{
-    if(++n>120){stopLoginPoll();setLoginStatus('登录超时，请重试',true);return;}
-    try{
-      const d=await api('GET','/login/poll/'+flowId);
-      if(d.status==='ready'){
-        stopLoginPoll();
-        showToast('登录成功，已导入账号池','success');
-        closeModal('modal-add');
-        load();
-      }else if(d.status==='failed'){
-        stopLoginPoll();
-        setLoginStatus(d.message||'授权失败或被拒绝',true);
-      }
-    }catch(e){/* 单次失败继续轮询 */}
-  },2500);
+async function completeLogin(){
+  const callbackUrl=document.getElementById('login-callback-url').value.trim();
+  if(!_loginFlowId)return showToast('请先开始登录','error');
+  if(!callbackUrl)return showToast('请粘贴登录完成页的完整地址','error');
+  const btn=document.getElementById('login-complete-btn');
+  btn.disabled=true;setLoginStatus('正在校验并导入账号…',false);
+  try{
+    const d=await api('POST','/login/complete/'+encodeURIComponent(_loginFlowId),{callback_url:callbackUrl});
+    if(d.status!=='ready')throw new Error(d.message||'授权结果无效');
+    showToast('登录成功，已导入账号池','success');
+    closeModal('modal-add');load();
+  }catch(e){
+    setLoginStatus(e.message||'完成授权失败',true);
+    btn.disabled=false;
+  }
 }
 function setLoginStatus(text,isErr){
   const el=document.getElementById('login-status');
@@ -328,8 +328,7 @@ function setLoginStatus(text,isErr){
   el.classList.toggle('live-dot',!isErr);
   el.style.color=isErr?'var(--error)':'';
 }
-function stopLoginPoll(){if(_loginTimer){clearInterval(_loginTimer);_loginTimer=null;}}
-function cancelLogin(){stopLoginPoll();closeModal('modal-add');}
+function cancelLogin(){closeModal('modal-add');}
 function copyLoginUrl(){navigator.clipboard.writeText(_loginUrl).then(()=>showToast('已复制','success')).catch(()=>showToast('复制失败','error'));}
 function openLoginUrl(){if(_loginUrl)window.open(_loginUrl,'_blank','noopener');}
 
@@ -402,7 +401,7 @@ function fmtDate(d){if(!d)return'—';const dt=new Date(d*1000);return isNaN(dt)
 function openModal(id){document.getElementById(id).classList.add('open');}
 function closeModal(id){document.getElementById(id).classList.remove('open');}
 function openConfirm(title,body,cb){_cb=async()=>{closeModal('modal-confirm');await cb();};document.getElementById('confirm-title').textContent=title;document.getElementById('confirm-body').innerHTML=body;openModal('modal-confirm');}
-document.querySelectorAll('.modal-overlay').forEach(el=>el.addEventListener('click',e=>{if(e.target===el){el.classList.remove('open');if(el.id==='modal-add')stopLoginPoll();}}));
+document.querySelectorAll('.modal-overlay').forEach(el=>el.addEventListener('click',e=>{if(e.target===el)el.classList.remove('open');}));
 </script>
 </body>
 </html>
