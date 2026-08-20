@@ -1,6 +1,8 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
-httpx>=0.27.0
+httpx[socks]>=0.28.0
 python-dotenv>=1.0.1
-# 验证码求解为无浏览器方案：使用 Node + jsdom（见 captcha_node/）。
-# 需安装 Node.js，并在 captcha_node 目录执行：npm install
+# 验证码求解：Node + jsdom 无痕方案见 captcha_node/；真实浏览器路径使用 cloakbrowser。
+# cloakbrowser 固定 0.5.7（兼容生产 Python 3.11；zcode-proxy 要求 >=3.13，不安装）。
+# 运行需 Chromium 系统库与 CLOAKBROWSER_CACHE_DIR，见 Dockerfile；浏览器二进制由镜像构建期预下载。
+cloakbrowser==0.5.7

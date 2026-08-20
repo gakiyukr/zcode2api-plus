@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zcode2api · 人机验证</title>
+  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+</head>
+<body>
+<div id="admin-header" data-active="/admin/captcha"></div>
+
+<main class="admin-main">
+  <div class="page-hd">
+    <div>
+      <div class="page-title">人机验证</div>
+      <div class="page-sub">自动求解被风控拦截时，在真实浏览器手动完成阿里云无痕验证，结果供 JWT 账号请求复用</div>
+    </div>
+  </div>
+
+  <div class="table-card" style="max-width:640px;padding:24px">
+    <div class="dialog-help" id="cap-status">正在加载验证配置…</div>
+    <div id="cap" style="margin:16px 0"></div>
+    <button id="btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px">开始验证</button>
+    <div class="dialog-help" id="cap-hint" style="margin-top:14px"></div>
+  </div>
+</main>
+
+<script src="https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"></script>
+<script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/header.js?v={{APP_VERSION}}"></script>
+<script>
+(async()=>{
+  await renderAdminHeader();
+  const key=await adminKey.get();
+  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  const status=document.getElementById('cap-status');
+  const hint=document.getElementById('cap-hint');
+  if(typeof window.initAliyunCaptcha!=='function'){
+    status.textContent='阿里云验证 SDK 加载失败，请检查网络后刷新页面。';
+    return;
+  }
+  let cfg;
+  try{
+    cfg=await api('GET','/captcha/config');
+  }catch(e){
+    status.textContent='加载验证配置失败: '+e.message;
+    return;
+  }
+  status.textContent=`验证配置：scene=${cfg.sceneId||'-'} · region=${cfg.region||'-'} · ${cfg.enabled?'已启用':'未启用'}`;
+  hint.textContent='点击「开始验证」，将在真实浏览器中完成验证；如果出现滑块，请在弹窗中手动完成。';
+  let started=false;
+  document.getElementById('btn').addEventListener('click',()=>{
+    if(started)return;
+    started=true;
+    hint.textContent='正在发起验证；如果弹出滑块，请在真实浏览器中完成后等待结果…';
+    window.initAliyunCaptcha({
+      SceneId:cfg.sceneId, mode:'popup', region:cfg.region, prefix:cfg.prefix,
+      element:'#cap', button:'#btn', captchaLogoImg:'', showErrorTip:false,
+      getInstance:(inst)=>{
+        try{ (inst.startTracelessVerification||inst.show).call(inst); }
+        catch(e){ showToast('启动验证失败: '+e.message,'error'); started=false; }
+      },
+      success:async(param)=>{
+        try{
+          await api('POST','/captcha/submit',{verify_param:param});
+          showToast('验证结果已提交，约 45 秒内供 JWT 请求使用','success');
+          hint.textContent='已提交。验证码是短期结果，过期后请重新完成验证。';
+        }catch(e){ showToast('提交失败: '+e.message,'error'); }
+        started=false;
+      },
+      fail:(err)=>{ showToast('验证失败: '+((err&&err.message)||JSON.stringify(err)||'unknown'),'error'); hint.textContent='验证未通过，可再次点击「开始验证」重试。'; started=false; },
+      onError:(err)=>{ showToast('验证初始化失败: '+((err&&err.message)||'unknown'),'error'); started=false; },
+    });
+  });
+})();
+</script>
+</body>
+</html>

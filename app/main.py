@@ -12,7 +12,7 @@ from . import settings
 from . import logs
 from .captcha import captcha_manager
 from .quota import monitor
-from .routes import admin_api, gateway, pages
+from .routes import admin_api, gateway, pages, async_pool
 
 # 修正 Windows 中文控制台可能出现的乱码
 for _stream in (sys.stdout, sys.stderr):
@@ -52,6 +52,11 @@ def create_app() -> FastAPI:
     app.include_router(pages.router)
     app.include_router(admin_api.router)
     app.include_router(gateway.router)
+    
+    # 条件挂载 async 路由
+    if settings.ASYNC_ENABLED:
+        app.include_router(async_pool.router)
+    
     return app
 
 

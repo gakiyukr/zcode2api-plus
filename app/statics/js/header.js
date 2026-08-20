@@ -8,6 +8,7 @@ async function renderAdminHeader(){
   const nav=[
     ['/admin/accounts','账号池'],
     ['/admin/settings','设置'],
+    ['/admin/captcha','验证'],
   ].map(([href,label])=>
     `<a href="${href}" class="admin-nav-link${href===active?' active':''}">${label}</a>`
   ).join('');

@@ -89,6 +89,10 @@
           <span class="dialog-label">提供商</span>
           <select class="input" id="add-provider"><option value="zai">Z.AI (Coding Plan)</option><option value="bigmodel">BigModel</option></select>
         </div>
+        <div class="dialog-field">
+          <span class="dialog-label">代理</span>
+          <input class="input" id="add-proxy" placeholder="socks5://user:pass@host:port 或 http://host:port">
+        </div>
       </div>
       <div class="dialog-actions">
         <button onclick="closeModal('modal-add')" class="dialog-btn">取消</button>
@@ -130,6 +134,7 @@
     <div class="dialog-body">
       <div class="dialog-field"><span class="dialog-label">名称</span><input class="input" id="edit-name"></div>
       <div class="dialog-field"><span class="dialog-label">Token</span><input class="input" id="edit-token" placeholder="留空则不修改"></div>
+      <div class="dialog-field"><span class="dialog-label">代理</span><input class="input" id="edit-proxy" placeholder="socks5://user:pass@host:port 或 http://host:port"></div>
     </div>
     <div class="dialog-actions">
       <button onclick="closeModal('modal-edit')" class="dialog-btn">取消</button>
@@ -218,7 +223,7 @@ function rowHtml(a){
   const isDisabled=a.status==='disabled';
   const loading=refreshing.has(a.id);
   return `<tr>
-    <td><span class="tok">${esc(a.token_masked)}</span><div style="font-size:11px;color:#aaa;margin-top:2px">${esc(a.name)}</div></td>
+    <td><span class="tok">${esc(a.token_masked)}</span><div style="font-size:11px;color:#aaa;margin-top:2px">${esc(a.name)}</div>${a.proxy_url?`<div style="font-size:11px;color:#aaa;margin-top:2px">代理已启用</div>`:''}</td>
     <td class="table-center">${a.provider}</td>
     <td class="table-center"><span class="badge badge-${a.mode}">${isJwt?'JWT':'Key'}</span></td>
     <td class="table-center"><span class="badge badge-${a.status}">${STATUS_LABEL[a.status]||a.status}</span></td>
@@ -257,6 +262,7 @@ function shortModel(n){return String(n).replace(/^GLM[- ]?/i,'GLM-').slice(0,10)
 /* ── Actions ── */
 function openAdd(){
   document.getElementById('add-tokens').value='';
+  document.getElementById('add-proxy').value='';
   switchAddTab('paste');
   resetLoginPane();
   openModal('modal-add');
@@ -264,10 +270,11 @@ function openAdd(){
 async function doAdd(){
   const tokens=document.getElementById('add-tokens').value;
   const provider=document.getElementById('add-provider').value;
+  const proxy_url=document.getElementById('add-proxy').value.trim();
   const list=tokens.split('\n').map(s=>s.trim()).filter(Boolean);
   if(!list.length)return showToast('请输入至少一个 Token','error');
   try{
-    const d=await api('POST','/accounts',{provider,tokens:list});
+    const d=await api('POST','/accounts',{provider,tokens:list,...(proxy_url&&{proxy_url})});
     closeModal('modal-add');
     showToast(`新增 ${d.count} 个账号`,'success');
     load();
@@ -337,13 +344,15 @@ function openEdit(id){
   _editId=id;
   document.getElementById('edit-name').value=a.name;
   document.getElementById('edit-token').value='';
+  document.getElementById('edit-proxy').value=a.proxy_url||'';
   openModal('modal-edit');
 }
 async function doEdit(){
   const name=document.getElementById('edit-name').value.trim();
   const token=document.getElementById('edit-token').value.trim();
+  const proxy_url=document.getElementById('edit-proxy').value;
   try{
-    await api('PUT','/accounts/'+_editId,{name,...(token&&{token})});
+    await api('PUT','/accounts/'+_editId,{name,proxy_url,...(token&&{token})});
     closeModal('modal-edit');showToast('已保存','success');load();
   }catch(e){showToast('保存失败: '+e.message,'error');}
 }

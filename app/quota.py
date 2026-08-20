@@ -12,6 +12,7 @@ import httpx
 
 from . import logs, settings
 from .models import Account, Status
+from .proxy import make_async_client
 from .store import store
 
 
@@ -40,7 +41,7 @@ async def _fetch_quota_once(account: Account) -> dict:
     account.last_checked_at = time.time()
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with make_async_client(account, timeout=20) as client:
             response = await client.get(
                 url,
                 headers=headers,

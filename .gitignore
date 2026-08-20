@@ -15,3 +15,4 @@ js-code/
 # 本机部署与反查临时文件
 /temp/
 /nginx.conf
+.pytest_cache/

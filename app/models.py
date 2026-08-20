@@ -51,6 +51,7 @@ class Account:
     last_checked_at: float | None = None
     cooling_until: float | None = None
     last_error: str | None = None
+    proxy_url: str | None = None  # 账号独立出站代理，空则直连
     created_at: float = field(default_factory=time.time)
 
     @staticmethod
@@ -109,6 +110,7 @@ class Account:
             "last_checked_at": self.last_checked_at,
             "cooling_until": self.cooling_until,
             "last_error": self.last_error,
+            "proxy_url": self.proxy_url,
             "created_at": self.created_at,
         }
 

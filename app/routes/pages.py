@@ -45,6 +45,11 @@ async def admin_settings():
     return _html("settings.html")
 
 
+@router.get("/admin/captcha", include_in_schema=False)
+async def admin_captcha():
+    return _html("captcha.html")
+
+
 @router.get("/meta", include_in_schema=False)
 async def meta():
     return {"version": settings.APP_VERSION}

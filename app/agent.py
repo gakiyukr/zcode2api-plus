@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from . import settings
+from .device_identity import get_device_mid
 from .models import Account
 
 # 透传客户端 header 时需要剔除的字段
@@ -18,6 +19,8 @@ _DROP_HEADERS = {
     "http-referer",
     "accept-encoding",
     "connection",
+    "x-aliyun-captcha-verify-param",
+    "x-aliyun-captcha-verify-region",
 }
 
 
@@ -25,6 +28,7 @@ def build_request(
     account: Account,
     body: dict,
     verify_param: str | None,
+    verify_region: str | None = None,
     incoming_headers: dict | None = None,
 ) -> tuple[str, dict]:
     """返回 (目标 URL, 请求头)。"""
@@ -56,8 +60,16 @@ def build_request(
         "X-ZCode-Agent": "glm",
         "HTTP-Referer": "https://zcode.z.ai/",
     }
+    
+    # 添加设备唯一标识
+    device_mid = get_device_mid()
+    if device_mid:
+        headers["X-Device-Mid"] = device_mid
+    
     if verify_param:
         headers["X-Aliyun-Captcha-Verify-Param"] = verify_param
+        if verify_region:
+            headers["X-Aliyun-Captcha-Verify-Region"] = verify_region
 
     for key, value in (incoming_headers or {}).items():
         lower = key.lower()

@@ -8,8 +8,10 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 from ..auth_admin import verify_admin_key
+from ..captcha import captcha_manager
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
+from ..proxy import normalize_proxy_url
 from ..quota import fetch_quota, refresh_accounts
 from ..store import store
 
@@ -78,10 +80,21 @@ async def add_accounts(payload: dict = Body(...)):
     if not tokens:
         raise HTTPException(400, "请输入至少一个 Token / API Key")
 
+    has_proxy = "proxy_url" in payload
+    proxy_url = None
+    if has_proxy:
+        try:
+            proxy_url = normalize_proxy_url(payload.get("proxy_url"))
+        except ValueError as err:
+            raise HTTPException(400, str(err)) from err
+
     added = []
     for tok in dict.fromkeys(tokens):  # 去重保序
         name = payload.get("name") or f"{provider}-{len(store.list_accounts(provider)) + 1}"
         acc = store.add_account(provider, name, tok)
+        if has_proxy:
+            acc.proxy_url = proxy_url
+            store.update_account(acc)
         added.append(acc.id)
     # 立即刷新一次额度（仅 zai jwt）
     fresh = [a for a in store.list_accounts(provider) if a.id in added and a.mode == "jwt"]
@@ -117,6 +130,11 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
         acc.api_key = None if acc.mode == "jwt" else secret
         acc.status = Status.ACTIVE
         acc.last_error = None
+    if "proxy_url" in payload:
+        try:
+            acc.proxy_url = normalize_proxy_url(payload.get("proxy_url"))
+        except ValueError as err:
+            raise HTTPException(400, str(err)) from err
     store.update_account(acc)
     return {"ok": True}
 
@@ -155,6 +173,25 @@ async def refresh_one(account_id: str):
     res = await fetch_quota(acc)
     updated = store.find_any(account_id) or acc
     return {"ok": "error" not in res, "result": res, "account": updated.public_view()}
+
+
+# ── 手动人机验证 ─────────────────────────────────────────────────────────────
+@router.get("/captcha/config")
+async def captcha_config():
+    return await captcha_manager.fetch_config()
+
+
+@router.post("/captcha/submit")
+async def captcha_submit(payload: dict = Body(...)):
+    param = (payload.get("verify_param") or "").strip()
+    if not param:
+        raise HTTPException(400, "verify_param 不能为空")
+    config = await captcha_manager.fetch_config()
+    try:
+        await captcha_manager.set_manual_param(param, config.get("region"))
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    return {"ok": True}
 
 
 # ── OAuth 登录（Z.AI）────────────────────────────────────────────────────────
