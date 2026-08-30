@@ -45,13 +45,18 @@ async def list_accounts():
     accounts = [a.public_view() for a in store.list_accounts()]
     stats = {"total": len(accounts), "active": 0, "exhausted": 0,
              "cooling": 0, "invalid": 0, "disabled": 0,
-             "calls": 0, "fail": 0}
+             "calls": 0, "fail": 0,
+             "tokens_in": 0, "tokens_out": 0, "tokens_cache": 0}
     for a in accounts:
         st = a["status"]
         if st in stats:
             stats[st] += 1
         stats["calls"] += a["use_count"]
         stats["fail"] += a["fail_count"]
+        total_tokens = a.get("total_tokens") or {}
+        stats["tokens_in"] += total_tokens.get("input") or 0
+        stats["tokens_out"] += total_tokens.get("output") or 0
+        stats["tokens_cache"] += (total_tokens.get("cache_creation") or 0) + (total_tokens.get("cache_read") or 0)
     return {"accounts": accounts, "stats": stats, "providers": list(PROVIDERS), "ts": now}
 
 
@@ -173,6 +178,17 @@ async def refresh_one(account_id: str):
     res = await fetch_quota(acc)
     updated = store.find_any(account_id) or acc
     return {"ok": "error" not in res, "result": res, "account": updated.public_view()}
+
+
+# ── 重置調度統計 ─────────────────────────────────────────────────────────────
+@router.post("/accounts/{account_id}/reset-stats")
+async def reset_account_stats(account_id: str):
+    acc = store.find_any(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    acc.reset_token_stats()
+    store.update_account(acc)
+    return {"ok": True}
 
 
 # ── 手动人机验证 ─────────────────────────────────────────────────────────────

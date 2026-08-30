@@ -43,6 +43,7 @@
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">正常</div><span class="stat-icon" style="color:#16a34a"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span></div><div class="stat-num" id="s-active" style="color:#16a34a">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">额度用完</div><span class="stat-icon" style="color:#8d6bbd"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:#8d6bbd">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">总额度（剩余）</div><span class="stat-icon" style="color:#4c9168"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:#4c9168">0</div></div>
+    <div class="stat-cell" id="s-tokens-cell"><div class="stat-top"><div class="stat-label">累計調度 Tokens（入+出）</div><span class="stat-icon" style="color:#4c76b2"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 17V7"/><path d="M9 17V9"/><path d="M14 17v-4"/><path d="M19 17V5"/></svg></span></div><div class="stat-num" id="s-tokens" style="color:#4c76b2">0</div></div>
   </div>
 
   <div class="section-head">
@@ -61,6 +62,7 @@
         <th style="min-width:220px">额度</th>
         <th class="table-center" style="width:60px">调用</th>
         <th class="table-center" style="width:60px">失败</th>
+        <th class="table-center" style="width:96px">Tokens</th>
         <th style="width:120px">最近使用</th>
         <th style="width:120px">操作</th>
       </tr></thead>
@@ -198,6 +200,9 @@ function renderStats(s){
   let totalRem=0;
   allAccounts.forEach(a=>{const q=a.quota||{};Object.values(q).forEach(w=>{totalRem+=Number(w.remaining)||0;});});
   set('s-quota',fmt(totalRem));
+  const tIn=Number(s.tokens_in)||0,tOut=Number(s.tokens_out)||0,tCache=Number(s.tokens_cache)||0;
+  set('s-tokens',fmtTokens(tIn+tOut));
+  document.getElementById('s-tokens-cell').title=`輸入 ${tIn.toLocaleString()} · 輸出 ${tOut.toLocaleString()} · 快取 ${tCache.toLocaleString()}`;
 }
 
 function renderFilters(){
@@ -214,7 +219,7 @@ function renderTable(){
   const items=curFilter==='all'?allAccounts:allAccounts.filter(a=>a.status===curFilter);
   document.getElementById('tbl-count').textContent=items.length;
   const tb=document.getElementById('tbody');
-  if(!items.length){tb.innerHTML='<tr><td colspan="9" class="empty-state">暂无账号，点击右上角「新增」添加</td></tr>';return;}
+  if(!items.length){tb.innerHTML='<tr><td colspan="10" class="empty-state">暂无账号，点击右上角「新增」添加</td></tr>';return;}
   tb.innerHTML=items.map(rowHtml).join('');
 }
 
@@ -230,9 +235,11 @@ function rowHtml(a){
     <td>${quotaCell(a)}</td>
     <td class="table-center" style="color:#8f8f8f">${a.use_count||0}</td>
     <td class="table-center" style="color:#9a9a9a">${a.fail_count||0}</td>
+    <td class="table-center">${tokensCell(a)}</td>
     <td style="font-size:12px;color:#9a9a9a">${fmtDate(a.last_used_at)}</td>
     <td><div class="row-actions">
       ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="刷新额度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>`:''}
+      <button onclick="resetStats('${a.id}')" class="row-icon-btn" title="重置 Token 統計"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 4v5h5"/><path d="M12 8v4l3 2"/></svg></button>
       <button onclick="toggleEnabled('${a.id}',${isDisabled})" class="row-icon-btn" title="${isDisabled?'恢复':'禁用'}">
         ${isDisabled?'<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 4v5h5"/></svg>':'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M8.5 8.5 15.5 15.5"/></svg>'}
       </button>
@@ -258,6 +265,17 @@ function quotaCell(a){
   }).join('')+'</div>';
 }
 function shortModel(n){return String(n).replace(/^GLM[- ]?/i,'GLM-').slice(0,10)||n;}
+
+function tokensCell(a){
+  const t=a.total_tokens||{};
+  const i=Number(t.input)||0,o=Number(t.output)||0,c=(Number(t.cache_creation)||0)+(Number(t.cache_read)||0);
+  if(!i&&!o&&!c)return '<span class="quota-empty">—</span>';
+  return `<div class="token-rows" title="輸入 ${i.toLocaleString()} · 輸出 ${o.toLocaleString()} · 快取 ${c.toLocaleString()}">
+    <div><span>入</span><b>${fmtTokens(i)}</b></div>
+    <div><span>出</span><b>${fmtTokens(o)}</b></div>
+    ${c?`<div><span>緩</span><b>${fmtTokens(c)}</b></div>`:''}
+  </div>`;
+}
 
 /* ── Actions ── */
 function openAdd(){
@@ -383,6 +401,14 @@ async function refreshAll(){
   catch(e){showToast('刷新失败: '+e.message,'error');}
 }
 
+async function resetStats(id){
+  const a=allAccounts.find(x=>x.id===id);
+  openConfirm('重置 Token 統計',`確認清零賬號 <code>${esc(a?a.token_masked:id)}</code> 的累計 Token 用量？此操作不可撤銷。`,async()=>{
+    try{await api('POST','/accounts/'+id+'/reset-stats');showToast('已重置統計','success');load();}
+    catch(e){showToast('重置失敗: '+e.message,'error');}
+  });
+}
+
 async function doExport(){
   try{
     const d=await api('GET','/export');
@@ -405,6 +431,7 @@ async function onImportFile(ev){
 /* ── Helpers ── */
 function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
 function fmt(n){n=Number(n)||0;return n>=10000?(n/1000).toFixed(1)+'k':n;}
+function fmtTokens(n){n=Number(n)||0;if(n>=1e9)return (n/1e9).toFixed(2)+'B';if(n>=1e6)return (n/1e6).toFixed(2)+'M';if(n>=1e3)return (n/1e3).toFixed(1)+'k';return String(n);}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function fmtDate(d){if(!d)return'—';const dt=new Date(d*1000);return isNaN(dt)?'—':dt.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
 function openModal(id){document.getElementById(id).classList.add('open');}

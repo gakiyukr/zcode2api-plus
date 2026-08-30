@@ -66,6 +66,15 @@ docker run -d --name zcode2api -p 3000:3000 \
 账号池页实时展示每个账号的状态（正常 / 额度用完 / 限流 / 异常 / 禁用）、各模型剩余额度、
 调用与失败次数。请求按 round-robin 分发，**某账号额度用完会自动切换到下一个账号**，并在 UI 中即时反映。
 
+## 賬號調度統計（Token）
+
+网关在每次成功回應的透传过程中解析上游 `usage`，为每个账号累计调度 token：
+
+- 统计口径：`輸入`（input_tokens）、`輸出`（output_tokens）、`快取`（cache_read + cache_creation），仅计入成功回應；串流中断不计量。
+- 支持 SSE（`message_start` / `message_delta`）与非串流 JSON 两种回應形态，解析在透传时顺带完成，不影响流式转发。
+- 查看入口：後台「账号池」概览卡（累計調度 Tokens）与明细表 Tokens 栏（悬停可见精确值）；CLI `python main.py accounts` 亦会显示。
+- 数据随账号持久化于 `data/accounts.db`；行内「重置 Token 統計」按钮可清零单个账号的累计值。
+
 ## 多账号轮询与换号
 
 - 在「账号池」粘贴 Coding Plan JWT（3 段点分）或 API Key，每行一个即可加入轮询。
@@ -144,6 +153,7 @@ python main.py export [file] / import <file>       # 导出 / 导入账号
 │   ├── quota.py           # 额度查询 + 后台用量监控
 │   ├── oauth.py           # Z.AI OAuth 登录流程
 │   ├── auth_admin.py      # 后台 / 网关鉴权
+│   ├── usage.py           # Token 调度统计（UsageCollector：解析上游 usage）
 │   ├── logs.py            # 彩色终端日志
 │   ├── routes/            # gateway / admin_api / pages
 │   └── statics/           # app.css, auth.js, toast.js, header.js, admin/*.html

@@ -24,6 +24,7 @@ from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
 from ..proxy import make_async_client
 from ..store import store
+from ..usage import UsageCollector
 from .gateway import MAX_CAPTCHA_RETRIES, _is_captcha_error, _normalize_body
 
 router = APIRouter()
@@ -105,9 +106,11 @@ async def _ticket_sse(ticket_id: str) -> AsyncIterator[str]:
     _tickets.pop(ticket_id, None)
 
 
-async def _forward_sse(resp, queue) -> None:
-    """把上游 SSE 行转成 ticket chunk 事件。"""
+async def _forward_sse(resp, queue, account) -> None:
+    """把上游 SSE 行转成 ticket chunk 事件，并累计賬號 token 用量。"""
+    usage = UsageCollector(is_sse=True)
     async for line in resp.aiter_lines():
+        usage.feed_line(line)
         if line.startswith("data: "):
             chunk_data = line[6:]
             if chunk_data.strip() == "[DONE]":
@@ -116,6 +119,9 @@ async def _forward_sse(resp, queue) -> None:
                 await queue.put({"type": "chunk", "data": json.loads(chunk_data)})
             except json.JSONDecodeError:
                 pass
+    usage.finish()
+    account.accumulate_tokens(usage.as_dict())
+    store.update_account(account)
     await queue.put({"type": "done"})
 
 
@@ -177,7 +183,7 @@ async def _process_ticket(ticket_id: str):
                 async with make_async_client(account, timeout=httpx.Timeout(180)) as client:
                     async with client.stream("POST", url, headers=headers, content=actual_payload) as resp:
                         if resp.status_code == 200:
-                            await _forward_sse(resp, queue)
+                            await _forward_sse(resp, queue, account)
                             return
 
                         text = (await resp.aread()).decode("utf-8", "ignore")

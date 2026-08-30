@@ -120,7 +120,8 @@ def cmd_accounts(args: list[str]) -> None:
     print(c(f"\n--- 账号列表 ({provider or '全部'}) ---", "cyan"))
     for a in accounts:
         st = a.effective_status()
-        print(f"{a.id}  {a.provider}  {a.mode}  {st}  {a.name}")
+        tokens = f"  tok(in/out): {a.total_input_tokens:,}/{a.total_output_tokens:,}"
+        print(f"{a.id}  {a.provider}  {a.mode}  {st}  {a.name}{tokens}")
 
 
 def cmd_remove_account(args: list[str]) -> None:

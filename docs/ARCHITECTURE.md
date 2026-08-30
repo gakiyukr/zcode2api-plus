@@ -95,6 +95,7 @@ graph TD
 | Account Store | `app/store.py` | SQLite 持久化 + 内存账号表 + round-robin 游标 + 设置(meta) |
 | Account Model | `app/models.py` | `Account` 数据类、`Status` 状态、可选中判定、脱敏视图 |
 | Request Builder | `app/agent.py` | 按凭证选上游端点、组装请求头(含 `X-Aliyun-Captcha-Verify-Param`) |
+| Usage Collector | `app/usage.py` | 从成功回應(SSE `message_start`/`message_delta` 或 JSON)解析 usage,累計到账号的调度 token 统计 |
 | Quota Monitor | `app/quota.py` | 单账号额度查询 + 状态判定 + 后台周期刷新任务 |
 | Captcha Manager | `app/captcha.py` | 拉取验证码配置、调用 Node 求解器、缓存/并发去重/重试 |
 | Captcha Solver | `captcha_node/solver.js` | jsdom 模拟浏览器跑阿里云无痕 SDK,输出 `verifyParam` |
@@ -161,6 +162,9 @@ sequenceDiagram
 
 关键常量(`app/routes/gateway.py`):`MAX_CAPTCHA_RETRIES = 3`、`MAX_ACCOUNT_ATTEMPTS = 5`。
 流式透传使用 `httpx.stream` + `StreamingResponse`,读超时设为 `None` 以支持长连接 SSE。
+透传过程中 `UsageCollector`(`app/usage.py`)顺带解析回應的 `usage` 字段
+(SSE 取 `message_start` 的输入侧与 `message_delta` 的累计输出,JSON 取顶层 `usage`),
+回應完整结束后累計到 `Account.total_*_tokens` 并落库,供后台「賬號調度統計」展示。
 
 ---
 

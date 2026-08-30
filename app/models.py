@@ -47,6 +47,11 @@ class Account:
 
     use_count: int = 0
     fail_count: int = 0
+    # 累計調度 token 用量（僅計成功回應，由 UsageCollector 餵入）
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cache_creation_tokens: int = 0
+    total_cache_read_tokens: int = 0
     last_used_at: float | None = None
     last_checked_at: float | None = None
     cooling_until: float | None = None
@@ -82,6 +87,20 @@ class Account:
             return bool(self.cooling_until and now >= self.cooling_until)
         return True
 
+    def accumulate_tokens(self, usage: dict) -> None:
+        """累加一次成功回應的 token 用量（鍵與 UsageCollector.as_dict 一致）。"""
+        self.total_input_tokens += int(usage.get("input") or 0)
+        self.total_output_tokens += int(usage.get("output") or 0)
+        self.total_cache_creation_tokens += int(usage.get("cache_creation") or 0)
+        self.total_cache_read_tokens += int(usage.get("cache_read") or 0)
+
+    def reset_token_stats(self) -> None:
+        """清零累計 token 用量。"""
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cache_creation_tokens = 0
+        self.total_cache_read_tokens = 0
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -106,6 +125,12 @@ class Account:
             "plan": self.plan,
             "use_count": self.use_count,
             "fail_count": self.fail_count,
+            "total_tokens": {
+                "input": self.total_input_tokens,
+                "output": self.total_output_tokens,
+                "cache_creation": self.total_cache_creation_tokens,
+                "cache_read": self.total_cache_read_tokens,
+            },
             "last_used_at": self.last_used_at,
             "last_checked_at": self.last_checked_at,
             "cooling_until": self.cooling_until,

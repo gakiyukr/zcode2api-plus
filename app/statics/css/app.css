@@ -134,6 +134,12 @@ tr:hover td{background:#fdfdfd}
 .quota-reset{font-size:11px;color:#b0a99c;margin-top:1px}
 .quota-empty{font-size:12px;color:#bbb}
 
+/* Token 調度統計列 */
+.token-rows{display:inline-flex;flex-direction:column;gap:2px;font-size:11px;font-variant-numeric:tabular-nums;text-align:left}
+.token-rows div{display:flex;justify-content:space-between;gap:10px;min-width:72px}
+.token-rows span{color:#9a9a9a}
+.token-rows b{font-weight:500;color:#4a4a4a}
+
 /* Row actions */
 .row-actions{display:flex;align-items:center;gap:10px}
 .row-icon-btn{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;color:#9a9a9a;transition:color .15s}

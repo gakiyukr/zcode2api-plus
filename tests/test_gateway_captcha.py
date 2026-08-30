@@ -143,5 +143,56 @@ class GatewayCaptchaRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account.status, "active")
 
 
+class _UsageResponse:
+    status_code = 200
+    headers = httpx.Headers({"content-type": "application/json"})
+    body = b'{"id":"msg_1","usage":{"input_tokens":11,"output_tokens":22}}'
+
+    async def aiter_bytes(self):
+        yield self.body
+
+
+class _UsageContext:
+    def __init__(self):
+        self.response = _UsageResponse()
+
+    async def __aenter__(self):
+        return self.response
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _UsageClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def stream(self, *args, **kwargs):
+        return _UsageContext()
+
+    async def aclose(self):
+        pass
+
+
+class GatewayTokenStatsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_success_stream_accumulates_token_usage(self):
+        account = Account.create("zai", "tokens", "header.payload.signature")
+        with (
+            patch.object(gateway.captcha_manager, "get_verify_param", AsyncMock(return_value=CaptchaToken("token", "sgp"))),
+            patch.object(gateway.httpx, "AsyncClient", _UsageClient),
+            patch.object(gateway.store, "update_account") as update,
+            patch.object(gateway.asyncio, "create_task", side_effect=lambda coroutine: coroutine.close()),
+        ):
+            response = await gateway._try_account("req", account, {}, b"{}", {}, None, True)
+            chunks = [chunk async for chunk in response.body_iterator]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(chunks, [_UsageResponse.body])
+        usage = account.public_view()["total_tokens"]
+        self.assertEqual(usage["input"], 11)
+        self.assertEqual(usage["output"], 22)
+        update.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()

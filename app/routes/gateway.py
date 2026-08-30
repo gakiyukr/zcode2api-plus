@@ -23,6 +23,7 @@ from ..models import Account, Status
 from ..proxy import make_async_client
 from ..quota import fetch_quota
 from ..store import store
+from ..usage import UsageCollector
 
 router = APIRouter()
 
@@ -351,12 +352,18 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
         asyncio.create_task(_safe_refresh(account))
 
         content_type = resp.headers.get("content-type", "application/json")
+        # 調度統計：透傳時順手解析 usage；串流中斷則 usage 不完整，不計入
+        usage = UsageCollector(is_sse="text/event-stream" in content_type)
 
         async def _body_iter():
             try:
                 async for chunk in resp.aiter_bytes():
+                    usage.feed(chunk)
                     yield chunk
-                logs.req_ok(req_id)
+                usage.finish()
+                account.accumulate_tokens(usage.as_dict())
+                store.update_account(account)
+                logs.req_ok(req_id, usage.output_tokens)
             except Exception as err:  # noqa: BLE001
                 logs.req_err(req_id, f"流传输中断: {err}")
             finally:
