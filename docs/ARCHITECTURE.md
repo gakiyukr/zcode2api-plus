@@ -1,8 +1,8 @@
 # 架构概览（Architecture）
 
-本文件描述 **zcode2api** 的整体架构、核心组件、请求流程与关键设计决策。
+本文件描述 **zcode2api-plus** 的整体架构、核心组件、请求流程与关键设计决策。
 
-> zcode2api 是一个网关:对外暴露标准 **Anthropic Messages API**(`/v1/messages`),
+> zcode2api-plus 是一个网关:对外暴露标准 **Anthropic Messages API**(`/v1/messages`),
 > 对内将请求转发到 **ZCode (zcode.z.ai) Coding Plan** 上游,并提供多账号轮询、
 > 额度用完自动换号、实时用量监控、后台管理 UI 与鉴权,以及阿里云无痕验证自动续期。
 
@@ -30,7 +30,7 @@ graph TD
         UI["后台管理 UI（浏览器）"]
     end
 
-    subgraph App["zcode2api（FastAPI 单进程）"]
+    subgraph App["zcode2api-plus（FastAPI 单进程）"]
         direction TB
         GW["Gateway 网关<br/>/v1/messages · /v1/models"]
         ADMIN["Admin API<br/>/admin/api/*"]
@@ -322,7 +322,7 @@ meta(      key PK, value )      # admin_key / gateway_key / quota_refresh_interv
 
 欢迎提交 **Issue** 反馈问题、提出需求,或直接发起 **Pull Request** 改进代码与文档:
 
-- **提问题 / 报 Bug**:在仓库 [Issues](https://github.com/yuanhhs/zcode2api/issues) 中描述复现步骤、
+- **提问题 / 报 Bug**:在仓库 [Issues](https://github.com/gakiyukr/zcode2api-plus/issues) 中描述复现步骤、
   期望行为与实际行为(如涉及上游返回,请脱敏后附上结构,**切勿泄露你的 JWT / API Key**)。
 - **提交 PR**:Fork → 新建分支 → 提交(遵循 `feat:` / `fix:` / `docs:` 等约定式提交)→ 发起 PR 并说明动机与测试方式。
 - **改进方向举例**:额度字段的真实结构校正、上游模型动态拉取、更稳健的耗尽/限流判定、求解器健壮性、测试覆盖。

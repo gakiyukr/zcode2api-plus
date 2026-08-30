@@ -1,4 +1,4 @@
-# zcode2api
+# zcode2api-plus
 
 将 ZCode (zcode.z.ai) Coding Plan 额度转为标准 Anthropic Messages API，支持多账号轮询、
 额度用完自动换号、实时用量监控、后台管理 UI 与鉴权，以及阿里云无痕验证自动续期。
@@ -27,13 +27,13 @@ docker compose up -d --build
 # 账号 / 设置持久化在宿主机 ./data 目录；停止：docker compose down
 
 # 方式二：docker 原生命令
-docker build -t zcode2api:latest .
-docker run -d --name zcode2api \
+docker build -t zcode2api-plus:latest .
+docker run -d --name zcode2api-plus \
   -p 3000:3000 \
   -v "$(pwd)/data:/data" \
   -e ZCODE_ADMIN_KEY=zcode \
   --restart unless-stopped \
-  zcode2api:latest
+  zcode2api-plus:latest
 ```
 
 - 数据卷:容器内 `/data`(对应 `ZCODE_DATA_DIR`)存放 `accounts.db`,务必挂载到宿主机以持久化。
@@ -48,9 +48,9 @@ docker run -d --name zcode2api \
 
 ```bash
 # 拉取并运行已发布镜像（tag: latest 或 sha-xxxxxxx）
-docker run -d --name zcode2api -p 3000:3000 \
+docker run -d --name zcode2api-plus -p 3000:3000 \
   -v "$(pwd)/data:/data" -e ZCODE_ADMIN_KEY=zcode \
-  ghcr.io/yuanhhs/zcode2api:latest
+  ghcr.io/gakiyukr/zcode2api-plus:latest
 ```
 
 > 首次发布后,GHCR 上的包默认可能为私有;如需公开拉取,请到仓库 **Packages → 该包 → Package settings → Change visibility** 设为 Public。
@@ -163,7 +163,7 @@ python main.py export [file] / import <file>       # 导出 / 导入账号
 ├── Dockerfile             # 镜像（Python + Node）
 ├── docker-compose.yml     # 一键部署
 ├── .dockerignore
-├── .github/workflows/     # docker-build.yml（仅构建验证，不推送 Docker Hub）
+├── .github/workflows/     # docker-build.yml（push 自动构建并发布镜像到 GHCR）
 ├── docs/ARCHITECTURE.md   # 架构概览
 ├── requirements.txt
 └── .env.example
@@ -181,6 +181,7 @@ python main.py export [file] / import <file>       # 导出 / 导入账号
 
 ## 致谢
 
+- 基于 [yuanhhs/zcode2api](https://github.com/yuanhhs/zcode2api) 修改（AGPL-3.0）
 - UI 设计参考:[chenyme/grok2api](https://github.com/chenyme/grok2api)
 - 社区:[linux.do](https://linux.do)
 

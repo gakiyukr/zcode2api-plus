@@ -143,7 +143,7 @@ def cmd_set_admin_key(args: list[str]) -> None:
 
 
 def cmd_status() -> None:
-    print(c("\n--- zcode2api 状态 ---", "cyan"))
+    print(c("\n--- zcode2api-plus 状态 ---", "cyan"))
     print(f"数据库      : {c(str(settings.DB_PATH), 'blue')}")
     print(f"默认端口    : {c(str(settings.PORT), 'blue')}")
     print(f"后台密码    : {'已设置' if store.admin_key() else c('未设置', 'yellow')}")
