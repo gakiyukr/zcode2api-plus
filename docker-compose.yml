@@ -1,8 +1,8 @@
 services:
-  zcode2api:
+  zcode2api-plus:
     build: .
-    image: zcode2api:latest
-    container_name: zcode2api
+    image: zcode2api-plus:latest
+    container_name: zcode2api-plus
     ports:
       - "127.0.0.1:3000:3000"
     volumes:

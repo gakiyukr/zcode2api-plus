@@ -1,4 +1,4 @@
-# zcode2api — Python(FastAPI) + Node(jsdom 无痕验证求解器) + cloakbrowser(真实浏览器运行时)
+# zcode2api-plus — Python(FastAPI) + Node(jsdom 无痕验证求解器) + cloakbrowser(真实浏览器运行时)
 # 运行期同时需要 Python 与 Node：网关用 Python，验证码求解以 Node 子进程方式运行；
 # cloakbrowser 提供真实 Chromium（与生产 Python 3.11 对齐；zcode-proxy 需 >=3.13 故不安装）。
 FROM python:3.11-slim

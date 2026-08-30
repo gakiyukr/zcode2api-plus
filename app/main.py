@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI):
     monitor.start()
     base = f"http://{_display_host()}:{settings.PORT}"
     logs.banner([
-        f"{logs._B}{logs._MAG}zcode2api{logs._R} {logs._DIM}v{settings.APP_VERSION} · Python{logs._R}",
+        f"{logs._B}{logs._MAG}zcode2api-plus{logs._R} {logs._DIM}v{settings.APP_VERSION} · Python{logs._R}",
         f"{logs._DIM}后台管理{logs._R}  {logs._C}{base}/admin/login{logs._R}",
         f"{logs._DIM}对话端点{logs._R}  {logs._C}{base}/v1/messages{logs._R}",
     ])
@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="zcode2api", version=settings.APP_VERSION, lifespan=lifespan)
+    app = FastAPI(title="zcode2api-plus", version=settings.APP_VERSION, lifespan=lifespan)
 
     app.mount("/static", StaticFiles(directory=str(settings.STATIC_DIR)), name="static")
 

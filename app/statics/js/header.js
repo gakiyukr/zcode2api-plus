@@ -18,7 +18,7 @@ async function renderAdminHeader(){
         <div class="admin-brand-wrap">
           <span class="admin-brand">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></svg>
-            zcode2api
+            zcode2api-plus
           </span>
         </div>
         <nav class="admin-nav">${nav}</nav>
