@@ -80,9 +80,6 @@ def _load_zcode_system():
 
 
 def _detect_provider(body: dict, headers) -> str:
-    model = body.get("model") or ""
-    if model.startswith("bigmodel/") or headers.get("x-provider") == "bigmodel":
-        return "bigmodel"
     return "zai"
 
 

@@ -43,11 +43,6 @@ def build_request(
             auth = {"x-api-key": account.api_key}
         else:
             raise RuntimeError("账号缺少有效凭证")
-    elif provider == "bigmodel":
-        target_url = settings.UPSTREAM["bigmodel"]
-        if not account.api_key:
-            raise RuntimeError("BigModel 账号缺少 API Key")
-        auth = {"x-api-key": account.api_key}
     else:
         raise RuntimeError(f"未知提供商: {provider}")
 

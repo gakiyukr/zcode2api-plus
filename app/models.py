@@ -6,7 +6,7 @@ import secrets
 import time
 from dataclasses import asdict, dataclass, field
 
-PROVIDERS = ("zai", "bigmodel")
+PROVIDERS = ("zai",)
 
 
 class Status:

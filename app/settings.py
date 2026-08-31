@@ -109,10 +109,6 @@ UPSTREAM = {
         "ZAI_FALLBACK_URL",
         "https://api.z.ai/api/anthropic/v1/messages",
     ),
-    "bigmodel": os.getenv(
-        "BIGMODEL_UPSTREAM_URL",
-        "https://open.bigmodel.cn/api/anthropic/v1/messages",
-    ),
 }
 
 # ZCode 计费 / 额度查询端点

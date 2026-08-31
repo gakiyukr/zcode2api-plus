@@ -111,7 +111,7 @@ Coding Plan（JWT）模式调用 `zcode.z.ai` 上游时需要阿里云无痕验�
 python main.py serve [--port 3000]                 # 启动服务
 python main.py login zai [--no-browser]            # OAuth 登录 Z.AI 并自动入池
 python main.py add-account zai <name> <jwt|key>    # 添加轮询账号
-python main.py accounts [zai|bigmodel]             # 查看账号列表
+python main.py accounts [zai]                      # 查看账号列表
 python main.py remove-account <provider> <id|name> # 删除账号
 python main.py quota                               # 查看各账号实时额度
 python main.py status                              # 查看配置概览
