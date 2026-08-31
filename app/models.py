@@ -27,6 +27,33 @@ def _account_id(name: str) -> str:
     return f"{safe}-{secrets.token_hex(4)}"
 
 
+def _plan_text(plan: dict) -> str:
+    """從官方方案資料取出可供辨識的名稱。"""
+    if not isinstance(plan, dict):
+        return ""
+    for key in ("plan_name", "display_name", "show_name", "name", "title", "plan_type", "plan_id"):
+        value = plan.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _is_trial_plan(plan: dict) -> bool:
+    """辨識官方回傳的體驗、試用或免費方案，缺少標記時以方案名稱補判。"""
+    if not isinstance(plan, dict):
+        return False
+    markers = ("trial", "free", "experience", "體驗", "试用", "試用")
+    for key, value in plan.items():
+        normalized = str(key).replace("_", "").replace("-", "").lower()
+        if normalized in {"istrial", "trial", "isfree", "free", "isexperience", "trialplan"} and value is True:
+            return True
+        if isinstance(value, (dict, list)) and _is_trial_plan(value if isinstance(value, dict) else {"items": value}):
+            return True
+        if any(marker in str(value or "").lower() for marker in markers):
+            return True
+    return False
+
+
 @dataclass
 class Account:
     """单个可轮询的账号凭证 + 运行时状态。"""
@@ -35,6 +62,7 @@ class Account:
     name: str
     provider: str
     mode: str  # "jwt" | "apiKey"
+    email: str | None = None
     jwt_token: str | None = None
     api_key: str | None = None
     enabled: bool = True
@@ -117,6 +145,7 @@ class Account:
         return {
             "id": self.id,
             "name": self.name,
+            "email": self.email,
             "provider": self.provider,
             "mode": self.mode,
             "token_masked": masked,
@@ -124,6 +153,8 @@ class Account:
             "status": self.effective_status(),
             "quota": self.quota,
             "plan": self.plan,
+            "plan_name": _plan_text(self.plan),
+            "plan_is_trial": _is_trial_plan(self.plan),
             "use_count": self.use_count,
             "fail_count": self.fail_count,
             "total_tokens": {

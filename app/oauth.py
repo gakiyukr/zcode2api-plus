@@ -22,6 +22,47 @@ _REGISTERED_REDIRECT_URI = (
 )
 
 
+def extract_user_email(user: object) -> str | None:
+    """從 OAuth 使用者資料遞迴取出郵箱，兼容不同版本的欄位命名。"""
+    keys = {"email", "emailaddress", "mail", "useremail"}
+
+    def walk(value: object, depth: int = 0) -> str | None:
+        if depth > 3:
+            return None
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = str(key).replace("_", "").replace("-", "").lower()
+                if normalized in keys and isinstance(item, str) and "@" in item:
+                    candidate = item.strip()
+                    if candidate:
+                        return candidate
+            for item in value.values():
+                found = walk(item, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = walk(item, depth + 1)
+                if found:
+                    return found
+        return None
+
+    return walk(user)
+
+
+def extract_jwt_email(token: str) -> str | None:
+    """在 OAuth 使用者欄位缺失時，從 JWT 非驗證解析郵箱聲明作為備援。"""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        padding = "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(parts[1] + padding).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return extract_user_email(claims)
+
+
 class ZaiAuthFlow:
     def __init__(self) -> None:
         self.redirect_uri = _REGISTERED_REDIRECT_URI
@@ -107,6 +148,7 @@ class ZaiAuthFlow:
             "token": zcode_jwt,
             "zai": {"access_token": access_token} if access_token else {},
             "user": data.get("user") or {},
+            "email": extract_user_email(data.get("user") or {}) or extract_jwt_email(zcode_jwt),
         }
 
     async def exchange_api_key(self, access_token: str) -> str:

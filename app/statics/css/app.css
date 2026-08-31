@@ -114,6 +114,12 @@ tr:hover td{background:#fdfdfd}
 .badge-disabled{color:#6f675d;background:#f1ece4}
 .badge-jwt{color:#4c76b2;background:#f1f6fc}
 .badge-apiKey{color:#6d6d6d;background:#f7f7f7}
+.badge-trial{color:#b45309;background:#fff7ed;border:1px solid #fed7aa}
+
+/* 帳號辨識資訊 */
+.account-identity{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:3px;max-width:260px}
+.account-identity strong{font-size:11px;color:#344054;font-weight:600;overflow-wrap:anywhere}
+.account-identity small{font-size:10px;color:#98a2b3;overflow-wrap:anywhere}
 
 /* Quota pills */
 .quota-cell{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
@@ -125,8 +131,9 @@ tr:hover td{background:#fdfdfd}
 .q-bar-fill{height:100%;background:#4c9168;border-radius:999px}
 
 /* Quota expanded rows (展开为进度条) */
-.quota-rows{display:flex;flex-direction:column;gap:7px;min-width:220px;max-width:300px}
-.quota-row{display:grid;grid-template-columns:58px minmax(60px,1fr) auto;align-items:center;gap:10px}
+.quota-plan-badge{margin-bottom:6px}
+.quota-rows{display:flex;flex-direction:column;gap:7px;min-width:300px;max-width:380px}
+.quota-row{display:grid;grid-template-columns:minmax(120px,max-content) minmax(60px,1fr) auto;align-items:center;gap:10px}
 .quota-row-name{font-size:11px;font-weight:600;color:#6a6a6a;white-space:nowrap}
 .quota-row-track{height:6px;border-radius:999px;background:#eef0ee;overflow:hidden}
 .quota-row-fill{height:100%;border-radius:999px;transition:width .3s}

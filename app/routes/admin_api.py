@@ -13,7 +13,7 @@ from .. import settings
 from ..auth_admin import verify_admin_key
 from ..captcha import captcha_manager
 from ..models import PROVIDERS, Status
-from ..oauth import ZaiAuthFlow
+from ..oauth import ZaiAuthFlow, extract_user_email
 from ..proxy import make_async_client, normalize_proxy_url
 from ..quota import fetch_quota, refresh_accounts
 from ..store import store
@@ -504,7 +504,15 @@ def _find_login_flow(state: str) -> tuple[str | None, ZaiAuthFlow | None]:
 async def _save_oauth_account(flow: ZaiAuthFlow, data: dict):
     zcode_jwt = data.get("token")
     access_token = (data.get("zai") or {}).get("access_token")
-    account = store.add_account("zai", "oauth-login", zcode_jwt) if zcode_jwt else None
+    user = data.get("user") or {}
+    email = (data.get("email") or extract_user_email(user) or "").strip() or None
+    account_name = email or "oauth-login"
+    account = store.add_account("zai", account_name, zcode_jwt) if zcode_jwt else None
+    if account is not None and email:
+        account.email = email
+        if account.name == "oauth-login":
+            account.name = email
+        store.update_account(account)
     if access_token:
         try:
             api_key = await flow.exchange_api_key(access_token)
@@ -513,6 +521,10 @@ async def _save_oauth_account(flow: ZaiAuthFlow, data: dict):
                 store.update_account(account)
             else:
                 account = store.add_account("zai", "oauth-login", api_key)
+                if email:
+                    account.email = email
+                    account.name = email
+                    store.update_account(account)
         except Exception:  # noqa: BLE001 - 兑换失败不影响 JWT 已入池
             pass
     if account is None:
