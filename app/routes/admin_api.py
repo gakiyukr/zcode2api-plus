@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import time
 import os
 
@@ -65,7 +66,13 @@ def _account_snapshot() -> tuple[list[dict], dict]:
 @router.get("/accounts")
 async def list_accounts():
     accounts, stats = _account_snapshot()
-    return {"accounts": accounts, "stats": stats, "providers": list(PROVIDERS), "ts": time.time()}
+    return {
+        "accounts": accounts,
+        "stats": stats,
+        "providers": list(PROVIDERS),
+        "proxies": store.list_proxy_profiles(),
+        "ts": time.time(),
+    }
 
 
 @router.get("/status")
@@ -82,10 +89,8 @@ async def status_info():
 
 @router.get("/proxies")
 async def list_proxies():
-    """列出命名代理出口與帳號指派狀態。"""
-    profiles = store.list_proxy_profiles()
-    accounts = [a.public_view() for a in store.list_accounts()]
-    return {"profiles": profiles, "accounts": accounts}
+    """列出可供帳號選用的命名代理線路。"""
+    return {"profiles": store.list_proxy_profiles()}
 
 
 @router.post("/proxies")
@@ -122,6 +127,99 @@ async def delete_proxy(profile_id: str):
     return {"ok": True}
 
 
+def _parse_ip_lookup(payload: dict) -> dict:
+    """將不同 IP 查詢服務的欄位整理成穩定的管理 API 格式。"""
+    connection = payload.get("connection") or {}
+    ip = str(payload.get("ip") or "").strip()
+    if not ip:
+        raise ValueError("查詢服務未回傳 IP")
+    asn = payload.get("asn") or payload.get("asn_num") or connection.get("asn")
+    asn_text = str(asn or "").strip().upper()
+    if asn_text and not asn_text.startswith("AS"):
+        asn_text = f"AS{asn_text}"
+    operator = str(
+        payload.get("asn_organization")
+        or payload.get("asn_org")
+        or payload.get("company_name")
+        or payload.get("organization")
+        or payload.get("isp")
+        or connection.get("org")
+        or connection.get("isp")
+        or ""
+    ).strip()
+    return {
+        "ip": ip,
+        "asn": asn_text,
+        "operator": operator,
+        "country": str(payload.get("country") or "").strip(),
+        "country_code": str(payload.get("country_code") or payload.get("cc") or "").strip().upper(),
+    }
+
+
+def _parse_as_lookup(raw: str) -> tuple[str, str]:
+    """解析備援 ASN 查詢的 CSV 回應。"""
+    rows = list(csv.reader([raw.strip()]))
+    if not rows or len(rows[0]) < 2:
+        raise ValueError("ASN 查詢服務回應格式無效")
+    row = rows[0]
+    asn = str(row[1] or "").strip().upper()
+    if not asn:
+        raise ValueError("ASN 查詢服務未回傳 ASN")
+    if not asn.startswith("AS"):
+        asn = f"AS{asn}"
+    operator = str(row[3] if len(row) > 3 else "").strip()
+    return asn, operator
+
+
+async def _probe_egress(proxy_url: str | None = None) -> dict:
+    """經指定出口查詢公網資訊；主服務失敗時自動切換備援。"""
+    providers = (
+        ("ip.sb", "https://api.ip.sb/geoip"),
+        ("ipwho.is", "https://ipwho.is/"),
+        ("ipapi.is", "https://api.ipapi.is/"),
+    )
+    started = time.monotonic()
+    last_error: Exception | None = None
+    async with make_async_client(
+        proxy_url=proxy_url,
+        timeout=12.0,
+        follow_redirects=True,
+        headers={"User-Agent": "zcode2api-plus/2.0"},
+    ) as client:
+        for source, url in providers:
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+                result = _parse_ip_lookup(response.json() or {})
+                if not result["asn"]:
+                    try:
+                        as_response = await client.get(
+                            "https://api.hackertarget.com/aslookup/",
+                            params={"q": result["ip"]},
+                        )
+                        as_response.raise_for_status()
+                        result["asn"], as_operator = _parse_as_lookup(as_response.text)
+                        if not result["operator"]:
+                            result["operator"] = as_operator
+                    except Exception:  # noqa: BLE001 - ASN 補查失敗時仍應保留 IP 結果
+                        pass
+                result.update({
+                    "ok": True,
+                    "source": source,
+                    "latency_ms": round((time.monotonic() - started) * 1000),
+                })
+                return result
+            except Exception as err:  # noqa: BLE001 - 備援服務需涵蓋連線與格式錯誤
+                last_error = err
+    error_name = type(last_error).__name__ if last_error else "UnknownError"
+    raise HTTPException(502, f"出口查詢失敗（所有 IP 查詢服務均無回應，{error_name}）")
+
+
+@router.post("/proxies/test-current")
+async def test_current_proxy():
+    return await _probe_egress()
+
+
 @router.post("/proxies/{profile_id}/test")
 async def test_proxy(profile_id: str):
     profile = next(
@@ -129,15 +227,7 @@ async def test_proxy(profile_id: str):
     )
     if profile is None:
         raise HTTPException(404, "代理配置不存在")
-    started = time.monotonic()
-    try:
-        async with make_async_client(proxy_url=profile["url"], timeout=12.0) as client:
-            response = await client.get("https://api.ipify.org", params={"format": "json"})
-            response.raise_for_status()
-            ip = str((response.json() or {}).get("ip") or "").strip()
-    except Exception as err:  # noqa: BLE001 - 對管理員回報精簡的連線錯誤
-        raise HTTPException(502, f"代理連線失敗: {err}") from err
-    return {"ok": True, "ip": ip, "latency_ms": round((time.monotonic() - started) * 1000)}
+    return await _probe_egress(profile["url"])
 
 
 @router.post("/proxies/assign")
@@ -257,7 +347,14 @@ async def add_accounts(payload: dict = Body(...)):
     if not tokens:
         raise HTTPException(400, "请输入至少一个 Token / API Key")
 
-    has_proxy = "proxy_url" in payload
+    has_profile = "proxy_id" in payload
+    profile_id = payload.get("proxy_id") or None
+    if profile_id and not any(
+        p.get("id") == profile_id for p in store.list_proxy_profiles()
+    ):
+        raise HTTPException(400, "代理配置不存在")
+
+    has_proxy = "proxy_url" in payload and not has_profile
     proxy_url = None
     if has_proxy:
         try:
@@ -269,7 +366,9 @@ async def add_accounts(payload: dict = Body(...)):
     for tok in dict.fromkeys(tokens):  # 去重保序
         name = payload.get("name") or f"{provider}-{len(store.list_accounts(provider)) + 1}"
         acc = store.add_account(provider, name, tok)
-        if has_proxy:
+        if has_profile:
+            store.assign_proxy_profile(acc.id, profile_id)
+        elif has_proxy:
             acc.proxy_url = proxy_url
             store.update_account(acc)
         added.append(acc.id)
@@ -297,6 +396,12 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
     acc = store.find_any(account_id)
     if not acc:
         raise HTTPException(404, "账号不存在")
+    has_profile = "proxy_id" in payload
+    profile_id = payload.get("proxy_id") or None
+    if profile_id and not any(
+        p.get("id") == profile_id for p in store.list_proxy_profiles()
+    ):
+        raise HTTPException(400, "代理配置不存在")
     if "name" in payload and payload["name"]:
         acc.name = payload["name"].strip()
     secret = payload.get("token") or payload.get("secret")
@@ -307,7 +412,7 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
         acc.api_key = None if acc.mode == "jwt" else secret
         acc.status = Status.ACTIVE
         acc.last_error = None
-    if "proxy_url" in payload:
+    if "proxy_url" in payload and not has_profile:
         try:
             proxy_url = normalize_proxy_url(payload.get("proxy_url"))
         except ValueError as err:
@@ -316,6 +421,8 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
             acc.proxy_id = None
         acc.proxy_url = proxy_url
     store.update_account(acc)
+    if has_profile:
+        store.assign_proxy_profile(acc.id, profile_id)
     return {"ok": True}
 
 

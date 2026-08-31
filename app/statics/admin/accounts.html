@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-Hant">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>zcode2api-plus · 账号池</title>
+  <title>zcode2api-plus · 帳號池</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
 </head>
@@ -13,22 +13,22 @@
 <main class="admin-main">
   <div class="page-hd">
     <div>
-      <div class="page-title">账号池</div>
-      <div class="page-sub">多账号轮询 · 额度用完自动切换下一个账号 · 实时用量监控</div>
+      <div class="page-title">帳號池</div>
+      <div class="page-sub">多帳號輪詢 · 額度用完自動切換下一個帳號 · 即時用量監控</div>
     </div>
     <div class="page-actions">
-      <span class="live-dot" id="live-dot">实时监控中</span>
+      <span class="live-dot" id="live-dot">即時監控中</span>
       <button onclick="openImport()" class="page-action-btn">
         <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-        导入
+        匯入
       </button>
       <button onclick="doExport()" class="page-action-btn">
         <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
-        导出
+        匯出
       </button>
       <button onclick="refreshAll()" class="page-action-btn" id="btn-refresh-all">
         <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg>
-        刷新额度
+        重新整理額度
       </button>
       <button onclick="openAdd()" class="page-action-btn page-action-btn-primary">
         <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" fill="none"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -37,17 +37,17 @@
     </div>
   </div>
 
-  <div class="section-head"><div class="section-title">账户概览</div></div>
+  <div class="section-head"><div class="section-title">帳號概覽</div></div>
   <div class="stat-grid">
-    <div class="stat-cell"><div class="stat-top"><div class="stat-label">账户总数</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 19a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4"/><circle cx="12" cy="8" r="4"/></svg></span></div><div class="stat-num" id="s-total">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">帳號總數</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 19a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4"/><circle cx="12" cy="8" r="4"/></svg></span></div><div class="stat-num" id="s-total">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">正常</div><span class="stat-icon" style="color:#16a34a"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span></div><div class="stat-num" id="s-active" style="color:#16a34a">0</div></div>
-    <div class="stat-cell"><div class="stat-top"><div class="stat-label">额度用完</div><span class="stat-icon" style="color:#8d6bbd"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:#8d6bbd">0</div></div>
-    <div class="stat-cell"><div class="stat-top"><div class="stat-label">总额度（剩余）</div><span class="stat-icon" style="color:#4c9168"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:#4c9168">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">額度用完</div><span class="stat-icon" style="color:#8d6bbd"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:#8d6bbd">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">總額度（剩餘）</div><span class="stat-icon" style="color:#4c9168"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:#4c9168">0</div></div>
     <div class="stat-cell" id="s-tokens-cell"><div class="stat-top"><div class="stat-label">累計調度 Tokens（入+出）</div><span class="stat-icon" style="color:#4c76b2"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 17V7"/><path d="M9 17V9"/><path d="M14 17v-4"/><path d="M19 17V5"/></svg></span></div><div class="stat-num" id="s-tokens" style="color:#4c76b2">0</div></div>
   </div>
 
   <div class="section-head">
-    <div class="section-title">账户明细 <span class="section-count-badge" id="tbl-count">0</span></div>
+    <div class="section-title">帳號明細 <span class="section-count-badge" id="tbl-count">0</span></div>
     <div class="section-meta" id="last-updated"></div>
   </div>
 
@@ -58,10 +58,11 @@
       <thead><tr>
         <th>Token</th><th class="table-center" style="width:88px">提供商</th>
         <th class="table-center" style="width:72px">类型</th>
-        <th class="table-center" style="width:80px">状态</th>
-        <th style="min-width:220px">额度</th>
-        <th class="table-center" style="width:60px">调用</th>
-        <th class="table-center" style="width:60px">失败</th>
+        <th class="table-center" style="width:80px">狀態</th>
+        <th style="width:150px">出口線路</th>
+        <th style="min-width:220px">額度</th>
+        <th class="table-center" style="width:60px">呼叫</th>
+        <th class="table-center" style="width:60px">失敗</th>
         <th class="table-center" style="width:96px">Tokens</th>
         <th style="width:120px">最近使用</th>
         <th style="width:120px">操作</th>
@@ -74,56 +75,56 @@
 <!-- Add modal -->
 <div class="modal-overlay" id="modal-add">
   <div class="modal">
-    <div class="modal-title">新增账号</div>
+    <div class="modal-title">新增帳號</div>
     <div class="filter-bar" style="margin-bottom:16px">
-      <button class="filter-chip active" id="tab-paste" onclick="switchAddTab('paste')">粘贴凭证</button>
-      <button class="filter-chip" id="tab-login" onclick="switchAddTab('login')">授权登录</button>
+      <button class="filter-chip active" id="tab-paste" onclick="switchAddTab('paste')">貼上憑證</button>
+      <button class="filter-chip" id="tab-login" onclick="switchAddTab('login')">授權登入</button>
     </div>
 
-    <!-- 粘贴凭证 -->
+    <!-- 貼上憑證 -->
     <div id="add-pane-paste">
       <div class="dialog-body">
         <div>
-          <div class="dialog-help">每行一个 Coding Plan JWT 或 API Key，已存在的会自动跳过</div>
-          <textarea class="input" id="add-tokens" rows="7" placeholder="粘贴 JWT / API Key，每行一个..."></textarea>
+          <div class="dialog-help">每行一個 Coding Plan JWT 或 API Key，已存在的會自動跳過</div>
+          <textarea class="input" id="add-tokens" rows="7" placeholder="貼上 JWT / API Key，每行一個..."></textarea>
         </div>
         <div class="dialog-field">
           <span class="dialog-label">提供商</span>
           <select class="input" id="add-provider"><option value="zai">Z.AI (Coding Plan)</option></select>
         </div>
         <div class="dialog-field">
-          <span class="dialog-label">代理</span>
-          <input class="input" id="add-proxy" placeholder="socks5://user:pass@host:port 或 http://host:port">
+          <span class="dialog-label">出口線路</span>
+          <select class="input" id="add-proxy-id"></select>
         </div>
       </div>
       <div class="dialog-actions">
         <button onclick="closeModal('modal-add')" class="dialog-btn">取消</button>
-        <button onclick="doAdd()" class="dialog-btn dialog-btn-primary">添加</button>
+        <button onclick="doAdd()" class="dialog-btn dialog-btn-primary">新增</button>
       </div>
     </div>
 
-    <!-- 授权登录 -->
+    <!-- 授權登入 -->
     <div id="add-pane-login" style="display:none">
       <div class="dialog-body">
-        <div class="dialog-help">Z.AI 只允许 ZCode 官方回调地址，需要在登录完成后复制一次浏览器地址，不需要提供账号密码。</div>
+        <div class="dialog-help">Z.AI 只允許 ZCode 官方回呼地址，需要在登入完成後複製一次瀏覽器地址，不需要提供帳號密碼。</div>
         <div id="login-idle">
-          <button onclick="startLogin()" id="login-start-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px">开始登录</button>
+          <button onclick="startLogin()" id="login-start-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px">開始登入</button>
         </div>
         <div id="login-active" style="display:none">
-          <div class="dialog-help" style="margin-bottom:6px">1. 打开授权页并完成 Z.AI 登录：</div>
+          <div class="dialog-help" style="margin-bottom:6px">1. 開啟授權頁並完成 Z.AI 登入：</div>
           <div style="display:flex;gap:8px;align-items:center">
             <input class="input" id="login-url" readonly style="font-size:12px">
-            <button onclick="copyLoginUrl()" class="dialog-btn">复制</button>
-            <button onclick="openLoginUrl()" class="dialog-btn dialog-btn-primary">打开</button>
+            <button onclick="copyLoginUrl()" class="dialog-btn">複製</button>
+            <button onclick="openLoginUrl()" class="dialog-btn dialog-btn-primary">開啟</button>
           </div>
-          <div class="dialog-help" style="margin:16px 0 6px">2. 页面显示“登录已完成”后，复制该页面浏览器地址栏里的完整地址并粘贴到这里：</div>
+          <div class="dialog-help" style="margin:16px 0 6px">2. 頁面顯示「登入已完成」後，複製該頁面瀏覽器網址列的完整地址並貼到這裡：</div>
           <textarea class="input" id="login-callback-url" rows="3" placeholder="https://zcode.z.ai/app/oauth/login?... 或 zcode://oauth/callback?..."></textarea>
-          <button onclick="completeLogin()" id="login-complete-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px;margin-top:10px">3. 完成导入</button>
-          <div id="login-status" style="margin-top:14px">等待完成授权并粘贴回调地址…</div>
+          <button onclick="completeLogin()" id="login-complete-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px;margin-top:10px">3. 完成匯入</button>
+          <div id="login-status" style="margin-top:14px">等待完成授權並貼上回呼地址…</div>
         </div>
       </div>
       <div class="dialog-actions">
-        <button onclick="cancelLogin()" class="dialog-btn">关闭</button>
+        <button onclick="cancelLogin()" class="dialog-btn">關閉</button>
       </div>
     </div>
   </div>
@@ -132,15 +133,15 @@
 <!-- Edit modal -->
 <div class="modal-overlay" id="modal-edit">
   <div class="modal">
-    <div class="modal-title">编辑账号</div>
+    <div class="modal-title">編輯帳號</div>
     <div class="dialog-body">
-      <div class="dialog-field"><span class="dialog-label">名称</span><input class="input" id="edit-name"></div>
-      <div class="dialog-field"><span class="dialog-label">Token</span><input class="input" id="edit-token" placeholder="留空则不修改"></div>
-      <div class="dialog-field"><span class="dialog-label">代理</span><input class="input" id="edit-proxy" placeholder="socks5://user:pass@host:port 或 http://host:port"></div>
+      <div class="dialog-field"><span class="dialog-label">名稱</span><input class="input" id="edit-name"></div>
+      <div class="dialog-field"><span class="dialog-label">Token</span><input class="input" id="edit-token" placeholder="留空則不修改"></div>
+      <div class="dialog-field"><span class="dialog-label">出口線路</span><select class="input" id="edit-proxy-id"></select></div>
     </div>
     <div class="dialog-actions">
       <button onclick="closeModal('modal-edit')" class="dialog-btn">取消</button>
-      <button onclick="doEdit()" class="dialog-btn dialog-btn-primary">保存</button>
+      <button onclick="doEdit()" class="dialog-btn dialog-btn-primary">儲存</button>
     </div>
   </div>
 </div>
@@ -148,11 +149,11 @@
 <!-- Confirm modal -->
 <div class="modal-overlay" id="modal-confirm">
   <div class="modal" style="max-width:400px">
-    <div class="modal-title" id="confirm-title">确认</div>
+    <div class="modal-title" id="confirm-title">確認</div>
     <div id="confirm-body" class="dialog-help"></div>
     <div class="dialog-actions">
       <button onclick="closeModal('modal-confirm')" class="dialog-btn">取消</button>
-      <button onclick="_cb&&_cb()" class="dialog-btn dialog-btn-danger">确认</button>
+      <button onclick="_cb&&_cb()" class="dialog-btn dialog-btn-danger">確認</button>
     </div>
   </div>
 </div>
@@ -163,10 +164,10 @@
 <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/header.js?v={{APP_VERSION}}"></script>
 <script>
-let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null;
+let allAccounts=[],proxyProfiles=[],curFilter='all',_cb=null,_editId='',_timer=null;
 const refreshing=new Set();
 
-const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'异常',disabled:'禁用'};
+const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'異常',disabled:'停用'};
 
 (async()=>{
   await renderAdminHeader();
@@ -186,11 +187,12 @@ async function load(silent){
   try{
     const d=await api('GET','/accounts');
     allAccounts=d.accounts||[];
+    proxyProfiles=d.proxies||[];
     renderStats(d.stats||{});
     renderFilters();
     renderTable();
     document.getElementById('last-updated').textContent='更新于 '+new Date().toLocaleTimeString();
-  }catch(e){ if(!silent)showToast('加载失败: '+e.message,'error'); }
+  }catch(e){ if(!silent)showToast('載入失敗：'+e.message,'error'); }
 }
 
 function renderStats(s){
@@ -208,7 +210,7 @@ function renderStats(s){
 function renderFilters(){
   const counts={all:allAccounts.length,exhausted:0,disabled:0};
   allAccounts.forEach(a=>{counts[a.status]=(counts[a.status]||0)+1;});
-  const chips=[['all','全部'],['exhausted','用完'],['disabled','禁用']];
+  const chips=[['all','全部'],['exhausted','用完'],['disabled','停用']];
   document.getElementById('filter-bar').innerHTML=chips.map(([k,l])=>
     `<button class="filter-chip${curFilter===k?' active':''}" onclick="setFilter('${k}')">${l}<span class="filter-chip-count">${counts[k]||0}</span></button>`
   ).join('');
@@ -219,7 +221,7 @@ function renderTable(){
   const items=curFilter==='all'?allAccounts:allAccounts.filter(a=>a.status===curFilter);
   document.getElementById('tbl-count').textContent=items.length;
   const tb=document.getElementById('tbody');
-  if(!items.length){tb.innerHTML='<tr><td colspan="10" class="empty-state">暂无账号，点击右上角「新增」添加</td></tr>';return;}
+  if(!items.length){tb.innerHTML='<tr><td colspan="11" class="empty-state">尚無帳號，請點擊右上角「新增」</td></tr>';return;}
   tb.innerHTML=items.map(rowHtml).join('');
 }
 
@@ -228,23 +230,24 @@ function rowHtml(a){
   const isDisabled=a.status==='disabled';
   const loading=refreshing.has(a.id);
   return `<tr>
-    <td><span class="tok">${esc(a.token_masked)}</span><div style="font-size:11px;color:#aaa;margin-top:2px">${esc(a.name)}</div>${a.proxy_url?`<div style="font-size:11px;color:#aaa;margin-top:2px">代理已启用</div>`:''}</td>
+    <td><span class="tok">${esc(a.token_masked)}</span><div style="font-size:11px;color:#aaa;margin-top:2px">${esc(a.name)}</div></td>
     <td class="table-center">${a.provider}</td>
     <td class="table-center"><span class="badge badge-${a.mode}">${isJwt?'JWT':'Key'}</span></td>
     <td class="table-center"><span class="badge badge-${a.status}">${STATUS_LABEL[a.status]||a.status}</span></td>
+    <td>${proxyCell(a)}</td>
     <td>${quotaCell(a)}</td>
     <td class="table-center" style="color:#8f8f8f">${a.use_count||0}</td>
     <td class="table-center" style="color:#9a9a9a">${a.fail_count||0}</td>
     <td class="table-center">${tokensCell(a)}</td>
     <td style="font-size:12px;color:#9a9a9a">${fmtDate(a.last_used_at)}</td>
     <td><div class="row-actions">
-      ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="刷新额度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>`:''}
+      ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="重新整理額度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>`:''}
       <button onclick="resetStats('${a.id}')" class="row-icon-btn" title="重置 Token 統計"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 4v5h5"/><path d="M12 8v4l3 2"/></svg></button>
-      <button onclick="toggleEnabled('${a.id}',${isDisabled})" class="row-icon-btn" title="${isDisabled?'恢复':'禁用'}">
+      <button onclick="toggleEnabled('${a.id}',${isDisabled})" class="row-icon-btn" title="${isDisabled?'恢復':'停用'}">
         ${isDisabled?'<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 4v5h5"/></svg>':'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M8.5 8.5 15.5 15.5"/></svg>'}
       </button>
-      <button onclick="openEdit('${a.id}')" class="row-icon-btn" title="编辑"><svg viewBox="0 0 24 24"><path d="m4 20 4.5-1 9.5-9.5-3.5-3.5L5 15.5z"/><path d="m13.5 5.5 3.5 3.5"/></svg></button>
-      <button onclick="doDelete('${a.id}')" class="row-icon-btn row-icon-danger" title="删除"><svg viewBox="0 0 24 24"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button>
+      <button onclick="openEdit('${a.id}')" class="row-icon-btn" title="編輯"><svg viewBox="0 0 24 24"><path d="m4 20 4.5-1 9.5-9.5-3.5-3.5L5 15.5z"/><path d="m13.5 5.5 3.5 3.5"/></svg></button>
+      <button onclick="doDelete('${a.id}')" class="row-icon-btn row-icon-danger" title="刪除"><svg viewBox="0 0 24 24"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button>
     </div></td>
   </tr>`;
 }
@@ -252,7 +255,7 @@ function rowHtml(a){
 function quotaCell(a){
   const q=a.quota||{};
   const keys=Object.keys(q);
-  if(!keys.length)return a.mode==='jwt'?'<span class="quota-empty">未获取</span>':'<span class="quota-empty">—</span>';
+  if(!keys.length)return a.mode==='jwt'?'<span class="quota-empty">未取得</span>':'<span class="quota-empty">—</span>';
   return '<div class="quota-rows">'+keys.map(k=>{
     const w=q[k]||{};const rem=Number(w.remaining)||0,tot=Number(w.total)||0;
     const pct=tot>0?Math.max(0,Math.min(100,Math.round(rem/tot*100))):0;
@@ -277,10 +280,29 @@ function tokensCell(a){
   </div>`;
 }
 
+function proxyCell(a){
+  if(!a.proxy_url)return '<span class="account-route account-route-direct"><i></i>直連</span>';
+  const profile=proxyProfiles.find(p=>p.id===a.proxy_id);
+  return `<span class="account-route"><i></i>${esc(profile?.name||'舊版自訂代理')}</span>`;
+}
+
+function fillProxySelect(id,selectedId='',legacy=false){
+  const el=document.getElementById(id);
+  const legacyOption=legacy?'<option value="__legacy__">舊版自訂代理（保持不變）</option>':'';
+  el.innerHTML='<option value="">直連（不使用代理）</option>'+legacyOption+proxyProfiles.map(p=>
+    `<option value="${esc(p.id)}">${esc(p.name)} · ${proxyScheme(p.url)}</option>`
+  ).join('');
+  el.value=legacy&&!selectedId?'__legacy__':(selectedId||'');
+}
+
+function proxyScheme(url){
+  return String(url||'').split(':')[0].toLowerCase().startsWith('socks')?'SOCKS5':'HTTP';
+}
+
 /* ── Actions ── */
 function openAdd(){
   document.getElementById('add-tokens').value='';
-  document.getElementById('add-proxy').value='';
+  fillProxySelect('add-proxy-id');
   switchAddTab('paste');
   resetLoginPane();
   openModal('modal-add');
@@ -288,18 +310,18 @@ function openAdd(){
 async function doAdd(){
   const tokens=document.getElementById('add-tokens').value;
   const provider=document.getElementById('add-provider').value;
-  const proxy_url=document.getElementById('add-proxy').value.trim();
+  const proxy_id=document.getElementById('add-proxy-id').value||null;
   const list=tokens.split('\n').map(s=>s.trim()).filter(Boolean);
-  if(!list.length)return showToast('请输入至少一个 Token','error');
+  if(!list.length)return showToast('請輸入至少一個 Token','error');
   try{
-    const d=await api('POST','/accounts',{provider,tokens:list,...(proxy_url&&{proxy_url})});
+    const d=await api('POST','/accounts',{provider,tokens:list,proxy_id});
     closeModal('modal-add');
-    showToast(`新增 ${d.count} 个账号`,'success');
+    showToast(`新增 ${d.count} 個帳號`,'success');
     load();
-  }catch(e){showToast('添加失败: '+e.message,'error');}
+  }catch(e){showToast('新增失敗：'+e.message,'error');}
 }
 
-/* ── 授权登录 ── */
+/* ── 授權登入 ── */
 let _loginUrl='', _loginFlowId='';
 function switchAddTab(tab){
   document.getElementById('tab-paste').classList.toggle('active',tab==='paste');
@@ -324,26 +346,26 @@ async function startLogin(){
     document.getElementById('login-url').value=_loginUrl;
     document.getElementById('login-idle').style.display='none';
     document.getElementById('login-active').style.display='';
-    setLoginStatus('等待完成授权并粘贴回调地址…',false);
+    setLoginStatus('等待完成授權並貼上回呼地址…',false);
     try{window.open(_loginUrl,'_blank','noopener');}catch{}
   }catch(e){
-    showToast('发起登录失败: '+e.message,'error');
+    showToast('發起登入失敗：'+e.message,'error');
     btn.disabled=false;
   }
 }
 async function completeLogin(){
   const callbackUrl=document.getElementById('login-callback-url').value.trim();
-  if(!_loginFlowId)return showToast('请先开始登录','error');
-  if(!callbackUrl)return showToast('请粘贴登录完成页的完整地址','error');
+  if(!_loginFlowId)return showToast('請先開始登入','error');
+  if(!callbackUrl)return showToast('請貼上登入完成頁的完整地址','error');
   const btn=document.getElementById('login-complete-btn');
-  btn.disabled=true;setLoginStatus('正在校验并导入账号…',false);
+  btn.disabled=true;setLoginStatus('正在驗證並匯入帳號…',false);
   try{
     const d=await api('POST','/login/complete/'+encodeURIComponent(_loginFlowId),{callback_url:callbackUrl});
-    if(d.status!=='ready')throw new Error(d.message||'授权结果无效');
-    showToast('登录成功，已导入账号池','success');
+    if(d.status!=='ready')throw new Error(d.message||'授權結果無效');
+    showToast('登入成功，已匯入帳號池','success');
     closeModal('modal-add');load();
   }catch(e){
-    setLoginStatus(e.message||'完成授权失败',true);
+    setLoginStatus(e.message||'完成授權失敗',true);
     btn.disabled=false;
   }
 }
@@ -354,7 +376,7 @@ function setLoginStatus(text,isErr){
   el.style.color=isErr?'var(--error)':'';
 }
 function cancelLogin(){closeModal('modal-add');}
-function copyLoginUrl(){navigator.clipboard.writeText(_loginUrl).then(()=>showToast('已复制','success')).catch(()=>showToast('复制失败','error'));}
+function copyLoginUrl(){navigator.clipboard.writeText(_loginUrl).then(()=>showToast('已複製','success')).catch(()=>showToast('複製失敗','error'));}
 function openLoginUrl(){if(_loginUrl)window.open(_loginUrl,'_blank','noopener');}
 
 function openEdit(id){
@@ -362,43 +384,45 @@ function openEdit(id){
   _editId=id;
   document.getElementById('edit-name').value=a.name;
   document.getElementById('edit-token').value='';
-  document.getElementById('edit-proxy').value=a.proxy_url||'';
+  fillProxySelect('edit-proxy-id',a.proxy_id,Boolean(a.proxy_url&&!a.proxy_id));
   openModal('modal-edit');
 }
 async function doEdit(){
   const name=document.getElementById('edit-name').value.trim();
   const token=document.getElementById('edit-token').value.trim();
-  const proxy_url=document.getElementById('edit-proxy').value;
+  const selectedProxy=document.getElementById('edit-proxy-id').value;
+  const payload={name,...(token&&{token})};
+  if(selectedProxy!=='__legacy__')payload.proxy_id=selectedProxy||null;
   try{
-    await api('PUT','/accounts/'+_editId,{name,proxy_url,...(token&&{token})});
-    closeModal('modal-edit');showToast('已保存','success');load();
-  }catch(e){showToast('保存失败: '+e.message,'error');}
+    await api('PUT','/accounts/'+_editId,payload);
+    closeModal('modal-edit');showToast('已儲存','success');load();
+  }catch(e){showToast('儲存失敗：'+e.message,'error');}
 }
 
 function doDelete(id){
   const a=allAccounts.find(x=>x.id===id);
-  openConfirm('删除账号',`确认删除 <code>${esc(a?a.token_masked:id)}</code>？此操作不可撤销。`,async()=>{
-    try{await api('DELETE','/accounts',[id]);showToast('已删除','success');load();}
-    catch(e){showToast('删除失败: '+e.message,'error');}
+  openConfirm('刪除帳號',`確認刪除 <code>${esc(a?a.token_masked:id)}</code>？此操作無法復原。`,async()=>{
+    try{await api('DELETE','/accounts',[id]);showToast('已刪除','success');load();}
+    catch(e){showToast('刪除失敗：'+e.message,'error');}
   });
 }
 
 async function toggleEnabled(id,enable){
   try{await api('POST','/accounts/'+id+'/enabled',{enabled:enable});load();}
-  catch(e){showToast('操作失败: '+e.message,'error');}
+  catch(e){showToast('操作失敗：'+e.message,'error');}
 }
 
 async function refreshOne(id){
   if(refreshing.has(id))return;
   refreshing.add(id);renderTable();
-  try{await api('POST','/accounts/'+id+'/refresh');showToast('额度已刷新','success');}
-  catch(e){showToast('刷新失败: '+e.message,'error');}
+  try{await api('POST','/accounts/'+id+'/refresh');showToast('額度已重新整理','success');}
+  catch(e){showToast('重新整理失敗：'+e.message,'error');}
   finally{refreshing.delete(id);await load();}
 }
 async function refreshAll(){
-  showToast('正在刷新全部额度…','info');
-  try{const d=await api('POST','/accounts/refresh',{all:true});showToast(`刷新完成：成功 ${d.summary.ok}，失败 ${d.summary.fail}`,'success');load();}
-  catch(e){showToast('刷新失败: '+e.message,'error');}
+  showToast('正在重新整理全部額度…','info');
+  try{const d=await api('POST','/accounts/refresh',{all:true});showToast(`重新整理完成：成功 ${d.summary.ok}，失敗 ${d.summary.fail}`,'success');load();}
+  catch(e){showToast('重新整理失敗：'+e.message,'error');}
 }
 
 async function resetStats(id){
@@ -415,7 +439,7 @@ async function doExport(){
     const a=document.createElement('a');
     a.href=URL.createObjectURL(new Blob([JSON.stringify(d,null,2)],{type:'application/json'}));
     a.download='zcode-accounts.json';a.click();
-  }catch(e){showToast('导出失败: '+e.message,'error');}
+  }catch(e){showToast('匯出失敗：'+e.message,'error');}
 }
 function openImport(){document.getElementById('import-file').click();}
 async function onImportFile(ev){
@@ -423,8 +447,8 @@ async function onImportFile(ev){
   try{
     const payload=JSON.parse(await file.text());
     const d=await api('POST','/import',payload);
-    showToast(`导入 ${d.count} 个账号`,'success');load();
-  }catch(e){showToast('导入失败: '+e.message,'error');}
+    showToast(`匯入 ${d.count} 個帳號`,'success');load();
+  }catch(e){showToast('匯入失敗：'+e.message,'error');}
   ev.target.value='';
 }
 

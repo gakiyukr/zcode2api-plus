@@ -10,6 +10,7 @@ from pathlib import Path
 from app import settings
 from app.models import Account
 from app.proxy import ALLOWED_SCHEMES, make_async_client, normalize_proxy_url
+from app.routes.admin_api import _parse_as_lookup, _parse_ip_lookup
 from app.store import Store
 
 
@@ -230,3 +231,55 @@ class ProxyProfileStoreTests(unittest.TestCase):
             self.store.add_proxy_profile("固定出口", "http://127.0.0.1:8081")
         with self.assertRaisesRegex(ValueError, "代理配置不存在"):
             self.store.assign_proxy_profile(account.id, "proxy-missing")
+
+
+class IpLookupParsingTests(unittest.TestCase):
+    """出口探測必須統一整理不同查詢服務的 IP 與 ASN 欄位。"""
+
+    def test_parse_ip_sb_payload(self):
+        result = _parse_ip_lookup({
+            "ip": "203.0.113.10",
+            "asn": 64500,
+            "asn_organization": "Example Network",
+            "country": "Singapore",
+            "country_code": "SG",
+        })
+        self.assertEqual(result["ip"], "203.0.113.10")
+        self.assertEqual(result["asn"], "AS64500")
+        self.assertEqual(result["operator"], "Example Network")
+        self.assertEqual(result["country_code"], "SG")
+
+    def test_parse_ipwhois_payload(self):
+        result = _parse_ip_lookup({
+            "ip": "2001:db8::1",
+            "country": "Japan",
+            "country_code": "jp",
+            "connection": {"asn": 64501, "org": "Backup Network"},
+        })
+        self.assertEqual(result["ip"], "2001:db8::1")
+        self.assertEqual(result["asn"], "AS64501")
+        self.assertEqual(result["operator"], "Backup Network")
+        self.assertEqual(result["country_code"], "JP")
+
+    def test_missing_ip_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "未回傳 IP"):
+            _parse_ip_lookup({"asn": 64500})
+
+    def test_parse_ipapi_payload(self):
+        result = _parse_ip_lookup({
+            "ip": "203.0.113.20",
+            "asn_num": 64502,
+            "asn_org": "Third Network",
+            "company_name": "Fallback Company",
+            "cc": "DE",
+        })
+        self.assertEqual(result["asn"], "AS64502")
+        self.assertEqual(result["operator"], "Third Network")
+        self.assertEqual(result["country_code"], "DE")
+
+    def test_parse_as_lookup_csv(self):
+        asn, operator = _parse_as_lookup(
+            '"203.0.113.20","64503","203.0.113.0/24","Example ASN, TW"'
+        )
+        self.assertEqual(asn, "AS64503")
+        self.assertEqual(operator, "Example ASN, TW")
