@@ -13,7 +13,7 @@ from ..auth_admin import verify_admin_key
 from ..captcha import captcha_manager
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
-from ..proxy import normalize_proxy_url
+from ..proxy import make_async_client, normalize_proxy_url
 from ..quota import fetch_quota, refresh_accounts
 from ..store import store
 
@@ -78,6 +78,80 @@ async def status_info():
             for p in PROVIDERS
         },
     }
+
+
+@router.get("/proxies")
+async def list_proxies():
+    """列出命名代理出口與帳號指派狀態。"""
+    profiles = store.list_proxy_profiles()
+    accounts = [a.public_view() for a in store.list_accounts()]
+    return {"profiles": profiles, "accounts": accounts}
+
+
+@router.post("/proxies")
+async def add_proxy(payload: dict = Body(...)):
+    try:
+        profile = store.add_proxy_profile(
+            payload.get("name", ""), payload.get("url", ""), payload.get("enabled", True)
+        )
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    return profile
+
+
+@router.put("/proxies/{profile_id}")
+async def update_proxy(profile_id: str, payload: dict = Body(...)):
+    try:
+        profile = store.update_proxy_profile(
+            profile_id,
+            payload.get("name", ""),
+            payload.get("url", ""),
+            payload.get("enabled", True),
+        )
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    if profile is None:
+        raise HTTPException(404, "代理配置不存在")
+    return profile
+
+
+@router.delete("/proxies/{profile_id}")
+async def delete_proxy(profile_id: str):
+    if not store.delete_proxy_profile(profile_id):
+        raise HTTPException(404, "代理配置不存在")
+    return {"ok": True}
+
+
+@router.post("/proxies/{profile_id}/test")
+async def test_proxy(profile_id: str):
+    profile = next(
+        (p for p in store.list_proxy_profiles() if p.get("id") == profile_id), None
+    )
+    if profile is None:
+        raise HTTPException(404, "代理配置不存在")
+    started = time.monotonic()
+    try:
+        async with make_async_client(proxy_url=profile["url"], timeout=12.0) as client:
+            response = await client.get("https://api.ipify.org", params={"format": "json"})
+            response.raise_for_status()
+            ip = str((response.json() or {}).get("ip") or "").strip()
+    except Exception as err:  # noqa: BLE001 - 對管理員回報精簡的連線錯誤
+        raise HTTPException(502, f"代理連線失敗: {err}") from err
+    return {"ok": True, "ip": ip, "latency_ms": round((time.monotonic() - started) * 1000)}
+
+
+@router.post("/proxies/assign")
+async def assign_proxy(payload: dict = Body(...)):
+    account_id = str(payload.get("account_id") or "").strip()
+    profile_id = payload.get("proxy_id") or None
+    if not account_id:
+        raise HTTPException(400, "缺少帳號 ID")
+    try:
+        if not store.assign_proxy_profile(account_id, profile_id):
+            raise HTTPException(404, "帳號不存在")
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    return {"ok": True}
 
 
 def _memory_snapshot() -> dict:
@@ -235,9 +309,12 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
         acc.last_error = None
     if "proxy_url" in payload:
         try:
-            acc.proxy_url = normalize_proxy_url(payload.get("proxy_url"))
+            proxy_url = normalize_proxy_url(payload.get("proxy_url"))
         except ValueError as err:
             raise HTTPException(400, str(err)) from err
+        if proxy_url != acc.proxy_url:
+            acc.proxy_id = None
+        acc.proxy_url = proxy_url
     store.update_account(acc)
     return {"ok": True}
 

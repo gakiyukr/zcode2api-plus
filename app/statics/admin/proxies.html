@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zcode2api-plus · 代理設定</title>
+  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+</head>
+<body>
+<div id="admin-header" data-active="/admin/proxies"></div>
+<main class="admin-main proxy-main">
+  <div class="page-hd">
+    <div><div class="page-title">代理設定</div><div class="page-sub">管理 HTTP／SOCKS5 出口，並指派給指定帳號</div></div>
+    <div class="page-actions"><span class="live-dot">已連線</span><button class="page-action-btn page-action-btn-primary" onclick="openProxyModal()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>新增代理</button></div>
+  </div>
+  <section class="proxy-layout">
+    <article class="dashboard-panel proxy-profiles-panel">
+      <div class="panel-heading"><div><div class="panel-title">代理出口</div><div class="panel-subtitle">命名後可重複指派給多個帳號</div></div><span class="panel-badge" id="proxy-count">0 個出口</span></div>
+      <div class="proxy-profile-list" id="proxy-profile-list"></div>
+    </article>
+    <article class="dashboard-panel proxy-help-panel">
+      <div class="panel-heading"><div><div class="panel-title">連線格式</div><div class="panel-subtitle">支援帶認證的代理</div></div></div>
+      <div class="proxy-format-list"><div><span class="proxy-format-mark">HTTP</span><code>http://host:port</code></div><div><span class="proxy-format-mark proxy-format-socks">S5</span><code>socks5://host:port</code></div><div><span class="proxy-format-mark proxy-format-auth">AUTH</span><code>http://user:pass@host:port</code></div></div>
+      <div class="proxy-note">帳號未指派代理時會直接連線；修改出口後，已指派帳號會立即使用新地址。</div>
+    </article>
+  </section>
+  <section class="dashboard-panel proxy-assign-panel">
+    <div class="panel-heading"><div><div class="panel-title">帳號代理指派</div><div class="panel-subtitle">每個帳號可使用不同代理出口</div></div><button class="page-action-btn" onclick="loadProxies()" title="重新整理"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg>重新整理</button></div>
+    <div class="proxy-assign-table-wrap"><table class="proxy-assign-table"><thead><tr><th>帳號</th><th>模式</th><th>目前出口</th><th>指派代理</th><th>連線方式</th></tr></thead><tbody id="proxy-assign-list"></tbody></table></div>
+  </section>
+</main>
+<div class="modal-overlay" id="proxy-modal"><div class="modal proxy-modal"><div class="modal-title" id="proxy-modal-title">新增代理出口</div><div class="dialog-body"><div class="dialog-field"><span class="dialog-label">名稱</span><input class="input" id="proxy-name" placeholder="例如：香港出口 1"></div><div class="dialog-field"><span class="dialog-label">地址</span><input class="input" id="proxy-url" placeholder="http://host:port 或 socks5://host:port" autocomplete="off"></div><div class="proxy-modal-hint">僅接受 HTTP、HTTPS、SOCKS4、SOCKS5 代理地址，可包含 user:pass 認證。</div></div><div class="dialog-actions"><button onclick="closeProxyModal()" class="dialog-btn">取消</button><button onclick="saveProxy()" class="dialog-btn dialog-btn-primary" id="proxy-save-btn">儲存</button></div></div></div>
+<script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/header.js?v={{APP_VERSION}}"></script>
+<script>
+let profiles=[],accounts=[],editingId='';
+(async()=>{await renderAdminHeader();const key=await adminKey.get();if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';loadProxies()})();
+async function loadProxies(){try{const d=await api('GET','/proxies');profiles=d.profiles||[];accounts=d.accounts||[];renderProfiles();renderAssignments()}catch(e){showToast('載入代理設定失敗：'+e.message,'error')}}
+function renderProfiles(){const el=document.getElementById('proxy-profile-list');document.getElementById('proxy-count').textContent=profiles.length+' 個出口';el.innerHTML=profiles.map(p=>`<div class="proxy-profile-row"><span class="proxy-profile-icon"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="11" cy="17" r="2"/></svg></span><span class="proxy-profile-copy"><strong>${esc(p.name)}</strong><small>${esc(maskUrl(p.url))}</small><em id="proxy-result-${p.id}"></em></span><span class="proxy-profile-scheme">${scheme(p.url)}</span><span class="proxy-profile-status ${p.enabled?'is-enabled':'is-disabled'}"><i></i>${p.enabled?'啟用':'停用'}</span><span class="proxy-profile-actions"><button class="row-icon-btn" onclick="testProxy('${p.id}')" title="測試出口"><svg viewBox="0 0 24 24"><path d="M4 12h3l2-5 4 10 2-5h5"/></svg></button><button class="row-icon-btn" onclick="editProxy('${p.id}')" title="編輯"><svg viewBox="0 0 24 24"><path d="m4 20 4.5-1 9.5-9.5-3.5-3.5L5 15.5z"/><path d="m13.5 5.5 3.5 3.5"/></svg></button><button class="row-icon-btn row-icon-danger" onclick="deleteProxy('${p.id}')" title="刪除"><svg viewBox="0 0 24 24"><path d="M5 7h14M9 7V4h6v3M8 10v7M12 10v7M16 10v7M7 7l1 13h8l1-13"/></svg></button></span></div>`).join('')||'<div class="proxy-empty">尚未建立代理出口</div>'}
+function renderAssignments(){const el=document.getElementById('proxy-assign-list');el.innerHTML=accounts.map(a=>{const current=profiles.find(p=>p.id===a.proxy_id),custom=a.proxy_url&&!a.proxy_id;return`<tr><td><strong>${esc(a.name)}</strong><small>${esc(a.token_masked)}</small></td><td><span class="badge badge-${a.mode}">${a.mode==='jwt'?'JWT':'API Key'}</span></td><td>${current?`<span class="assigned-proxy"><i></i>${esc(current.name)}</span>`:custom?'<span class="assigned-proxy"><i></i>自訂代理</span>':'<span class="direct-proxy">直連</span>'}</td><td><select class="input proxy-select" onchange="assignProxy('${a.id}',this.value)">${custom?'<option value="__custom__" selected disabled>帳號自訂代理</option>':''}<option value="">直連（不使用代理）</option>${profiles.map(p=>`<option value="${esc(p.id)}" ${a.proxy_id===p.id?'selected':''}>${esc(p.name)} · ${scheme(p.url)}</option>`).join('')}</select></td><td><span class="proxy-url-short">${a.proxy_url?esc(maskUrl(a.proxy_url)):'—'}</span></td></tr>`}).join('')||'<tr><td colspan="5" class="empty-state">尚無帳號，請先到帳號池新增</td></tr>'}
+function openProxyModal(){editingId='';document.getElementById('proxy-modal-title').textContent='新增代理出口';document.getElementById('proxy-name').value='';document.getElementById('proxy-url').value='';document.getElementById('proxy-modal').classList.add('open')}
+function editProxy(id){const p=profiles.find(x=>x.id===id);if(!p)return;editingId=id;document.getElementById('proxy-modal-title').textContent='編輯代理出口';document.getElementById('proxy-name').value=p.name;document.getElementById('proxy-url').value=p.url;document.getElementById('proxy-modal').classList.add('open')}
+function closeProxyModal(){document.getElementById('proxy-modal').classList.remove('open')}
+async function saveProxy(){const name=document.getElementById('proxy-name').value.trim(),url=document.getElementById('proxy-url').value.trim();if(!url)return showToast('請輸入代理地址','error');const id=editingId,btn=document.getElementById('proxy-save-btn');btn.disabled=true;try{await api(id?'PUT':'POST',id?'/proxies/'+encodeURIComponent(id):'/proxies',{name,url,enabled:true});closeProxyModal();showToast(id?'代理已更新':'代理已建立','success');await loadProxies()}catch(e){showToast('儲存失敗：'+e.message,'error')}finally{btn.disabled=false}}
+async function deleteProxy(id){const p=profiles.find(x=>x.id===id);if(!p||!confirm('刪除代理「'+p.name+'」並取消所有帳號指派？'))return;try{await api('DELETE','/proxies/'+encodeURIComponent(id));showToast('代理已刪除','success');loadProxies()}catch(e){showToast('刪除失敗：'+e.message,'error')}}
+async function testProxy(id){const el=document.getElementById('proxy-result-'+id);if(el){el.className='is-testing';el.textContent='正在測試出口…'}try{const d=await api('POST','/proxies/'+encodeURIComponent(id)+'/test');if(el){el.className='is-success';el.textContent=`出口 ${d.ip||'未知'} · ${d.latency_ms} ms`}showToast('代理連線正常','success')}catch(e){if(el){el.className='is-error';el.textContent=e.message}showToast('代理測試失敗：'+e.message,'error')}}
+async function assignProxy(accountId,proxyId){try{await api('POST','/proxies/assign',{account_id:accountId,proxy_id:proxyId||null});showToast(proxyId?'代理已指派':'已切換為直連','success');await loadProxies()}catch(e){showToast('指派失敗：'+e.message,'error');loadProxies()}}
+function scheme(url){const s=String(url||'').split(':')[0].toLowerCase();return s.startsWith('socks')?'SOCKS5':'HTTP'}function maskUrl(url){return String(url||'').replace(/\/\/([^@/]+)@/,'//***@')}function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+document.getElementById('proxy-modal').addEventListener('click',e=>{if(e.target.id==='proxy-modal')closeProxyModal()});
+</script>
+</body>
+</html>

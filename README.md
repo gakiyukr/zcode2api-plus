@@ -64,6 +64,7 @@ docker run -d --name zcode2api-plus -p 3000:3000 \
 | `/admin/usage` | 用量分析：Token 組成、帳號調度分布與累計排行 |
 | `/admin/monitor` | 運維監控：服務健康、請求品質、CPU／記憶體與元件狀態 |
 | `/admin/accounts` | 账号池：新增/导入/导出、启用禁用、**实时额度与状态监控**（每 5 秒刷新）|
+| `/admin/proxies` | 代理設定：管理 HTTP／SOCKS5 出口並指派給指定帳號 |
 | `/admin/settings` | 后台密码、网关 API Key |
 
 账号池页实时展示每个账号的状态（正常 / 额度用完 / 限流 / 异常 / 禁用）、各模型剩余额度、

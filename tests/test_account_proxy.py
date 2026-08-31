@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 
+from app import settings
 from app.models import Account
 from app.proxy import ALLOWED_SCHEMES, make_async_client, normalize_proxy_url
+from app.store import Store
 
 
 def _account(**extra) -> Account:
@@ -149,6 +153,7 @@ class AccountProxyTests(unittest.TestCase):
         finally:
             asyncio.run(client.aclose())
 
+
     def test_make_async_client_uses_account_proxy_url(self):
         """未传显式 proxy_url 时使用 account.proxy_url。"""
         url = "http://10.0.0.1:3128"
@@ -174,3 +179,54 @@ class AccountProxyTests(unittest.TestCase):
             self.assertNotIn("10.0.0.1", blob)
         finally:
             asyncio.run(client.aclose())
+
+
+class ProxyProfileStoreTests(unittest.TestCase):
+    """命名代理出口必須持久化，並與帳號指派保持一致。"""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self._old_data_dir = settings.DATA_DIR
+        self._old_db_path = settings.DB_PATH
+        settings.DATA_DIR = Path(self._temp.name)
+        settings.DB_PATH = settings.DATA_DIR / "accounts.db"
+        self.store = Store()
+
+    def tearDown(self):
+        settings.DATA_DIR = self._old_data_dir
+        settings.DB_PATH = self._old_db_path
+        self._temp.cleanup()
+
+    def test_profile_assignment_update_and_delete(self):
+        """出口的新增、指派、修改與刪除會同步反映到帳號。"""
+        account = self.store.add_account("zai", "account-1", "fake-api-key")
+        profile = self.store.add_proxy_profile("香港出口", "socks5://127.0.0.1:1080")
+
+        self.assertTrue(self.store.assign_proxy_profile(account.id, profile["id"]))
+        self.assertEqual(account.proxy_id, profile["id"])
+        self.assertEqual(account.proxy_url, "socks5://127.0.0.1:1080")
+
+        updated = self.store.update_proxy_profile(
+            profile["id"], "香港出口", "http://127.0.0.1:8080"
+        )
+        self.assertIsNotNone(updated)
+        self.assertEqual(account.proxy_url, "http://127.0.0.1:8080")
+
+        reloaded = Store()
+        restored = reloaded.find_any(account.id)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.proxy_id, profile["id"])
+        self.assertEqual(restored.proxy_url, "http://127.0.0.1:8080")
+
+        self.assertTrue(reloaded.delete_proxy_profile(profile["id"]))
+        self.assertIsNone(restored.proxy_id)
+        self.assertIsNone(restored.proxy_url)
+
+    def test_duplicate_name_and_missing_profile_are_rejected(self):
+        """代理名稱不可重複，帳號不可指派到不存在的出口。"""
+        account = self.store.add_account("zai", "account-1", "fake-api-key")
+        self.store.add_proxy_profile("固定出口", "http://127.0.0.1:8080")
+        with self.assertRaisesRegex(ValueError, "代理名稱已存在"):
+            self.store.add_proxy_profile("固定出口", "http://127.0.0.1:8081")
+        with self.assertRaisesRegex(ValueError, "代理配置不存在"):
+            self.store.assign_proxy_profile(account.id, "proxy-missing")

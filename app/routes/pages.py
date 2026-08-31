@@ -50,6 +50,11 @@ async def admin_monitor():
     return _html("monitor.html")
 
 
+@router.get("/admin/proxies", include_in_schema=False)
+async def admin_proxies():
+    return _html("proxies.html")
+
+
 @router.get("/admin/accounts", include_in_schema=False)
 async def admin_accounts():
     return _html("accounts.html")

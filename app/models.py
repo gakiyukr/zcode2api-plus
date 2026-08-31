@@ -57,6 +57,7 @@ class Account:
     cooling_until: float | None = None
     last_error: str | None = None
     proxy_url: str | None = None  # 账号独立出站代理，空则直连
+    proxy_id: str | None = None   # 代理設定頁中的命名出口
     created_at: float = field(default_factory=time.time)
 
     @staticmethod
@@ -136,6 +137,7 @@ class Account:
             "cooling_until": self.cooling_until,
             "last_error": self.last_error,
             "proxy_url": self.proxy_url,
+            "proxy_id": self.proxy_id,
             "created_at": self.created_at,
         }
 

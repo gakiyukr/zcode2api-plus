@@ -10,6 +10,7 @@ async function renderAdminHeader(){
     {href:'/admin/usage',label:'用量分析',group:'總覽',icon:'<path d="M4 19V5M4 19h16"/><path d="m7 15 3-4 3 2 5-7"/>'},
     {href:'/admin/monitor',label:'運維監控',group:'營運',icon:'<path d="M4 19V5M4 19h16"/><path d="M8 16v-4M12 16V8M16 16v-7"/>'},
     {href:'/admin/accounts',label:'帳號池',group:'營運',icon:'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>'},
+    {href:'/admin/proxies',label:'代理設定',group:'營運',icon:'<path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="11" cy="17" r="2"/>'},
     {href:'/admin/captcha',label:'驗證中心',group:'營運',icon:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 9h8M8 13h5M8 17h3"/>'},
     {href:'/admin/settings',label:'系統設定',group:'設定',icon:'<path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="m19.4 15 .1.1a2 2 0 0 1-2.8 2.8l-.1-.1a2 2 0 0 0-3.4 1.4v.2a2 2 0 0 1-4 0v-.2a2 2 0 0 0-3.4-1.4l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A2 2 0 0 0 3.7 11H3.5a2 2 0 0 1 0-4h.2a2 2 0 0 0 1.4-3.4L5 3.5a2 2 0 1 1 2.8-2.8l.1.1A2 2 0 0 0 11.3 1V.8a2 2 0 0 1 4 0V1a2 2 0 0 0 3.4 1.4l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A2 2 0 0 0 22.9 8h.2a2 2 0 0 1 0 4h-.2a2 2 0 0 0-3.5 3Z"/>'}
   ];

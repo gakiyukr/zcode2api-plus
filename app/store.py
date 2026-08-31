@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
 import time
@@ -153,6 +154,83 @@ class Store:
             return max(0, int(self.get_setting("quota_refresh_interval", settings.QUOTA_REFRESH_INTERVAL)))
         except (TypeError, ValueError):
             return settings.QUOTA_REFRESH_INTERVAL
+
+    # ── 代理設定 ────────────────────────────────────────────────────────────
+    def list_proxy_profiles(self) -> list[dict]:
+        """讀取命名代理出口；設定以 JSON 儲存在 meta 表中。"""
+        raw = self.get_setting("proxy_profiles", "[]")
+        try:
+            profiles = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(profiles, list):
+            return []
+        return [p for p in profiles if isinstance(p, dict) and p.get("id") and p.get("url")]
+
+    def save_proxy_profiles(self, profiles: list[dict]) -> None:
+        self.set_setting("proxy_profiles", json.dumps(profiles, ensure_ascii=False))
+
+    def add_proxy_profile(self, name: str, url: str, enabled: bool = True) -> dict:
+        from .proxy import normalize_proxy_url
+
+        normalized = normalize_proxy_url(url)
+        if not normalized:
+            raise ValueError("代理 URL 不能為空")
+        name = (name or "").strip() or f"代理-{len(self.list_proxy_profiles()) + 1}"
+        profiles = self.list_proxy_profiles()
+        if any(p.get("name") == name for p in profiles):
+            raise ValueError("代理名稱已存在")
+        profile = {"id": f"proxy-{secrets.token_hex(4)}", "name": name,
+                   "url": normalized, "enabled": bool(enabled)}
+        profiles.append(profile)
+        self.save_proxy_profiles(profiles)
+        return profile
+
+    def update_proxy_profile(self, profile_id: str, name: str, url: str, enabled: bool = True) -> dict | None:
+        from .proxy import normalize_proxy_url
+
+        normalized = normalize_proxy_url(url)
+        if not normalized:
+            raise ValueError("代理 URL 不能為空")
+        profiles = self.list_proxy_profiles()
+        target = next((p for p in profiles if p["id"] == profile_id), None)
+        if target is None:
+            return None
+        name = (name or "").strip() or target["name"]
+        if any(p["id"] != profile_id and p.get("name") == name for p in profiles):
+            raise ValueError("代理名稱已存在")
+        target.update({"name": name, "url": normalized, "enabled": bool(enabled)})
+        self.save_proxy_profiles(profiles)
+        for account in self.list_accounts():
+            if account.proxy_id == profile_id:
+                account.proxy_url = normalized
+                self.update_account(account)
+        return target
+
+    def delete_proxy_profile(self, profile_id: str) -> bool:
+        profiles = self.list_proxy_profiles()
+        remaining = [p for p in profiles if p.get("id") != profile_id]
+        if len(remaining) == len(profiles):
+            return False
+        self.save_proxy_profiles(remaining)
+        for account in self.list_accounts():
+            if account.proxy_id == profile_id:
+                account.proxy_id = None
+                account.proxy_url = None
+                self.update_account(account)
+        return True
+
+    def assign_proxy_profile(self, account_id: str, profile_id: str | None) -> bool:
+        account = self.find_any(account_id)
+        if account is None:
+            return False
+        profile = next((p for p in self.list_proxy_profiles() if p.get("id") == profile_id), None) if profile_id else None
+        if profile_id and profile is None:
+            raise ValueError("代理配置不存在")
+        account.proxy_id = profile_id
+        account.proxy_url = profile["url"] if profile else None
+        self.update_account(account)
+        return True
 
     # ── 账号读取 ─────────────────────────────────────────────────────────────
     def list_accounts(self, provider: str | None = None) -> list[Account]:
