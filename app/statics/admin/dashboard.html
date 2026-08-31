@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zcode2api-plus · 儀表板</title>
+  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+</head>
+<body>
+<div id="admin-header" data-active="/admin/dashboard"></div>
+
+<main class="admin-main dashboard-main">
+  <div class="page-hd dashboard-heading">
+    <div>
+      <div class="page-title">儀表板</div>
+      <div class="page-sub">帳號池與網關的即時運行概況</div>
+    </div>
+    <div class="page-actions">
+      <span class="live-dot" id="dashboard-live">即時資料</span>
+      <button class="page-action-btn" id="dashboard-refresh" onclick="loadDashboard()" title="重新整理">
+        <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg>
+        重新整理
+      </button>
+    </div>
+  </div>
+
+  <section class="dashboard-metrics" aria-label="網關指標">
+    <article class="metric-card">
+      <div class="metric-icon metric-blue"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg></div>
+      <div><div class="metric-label">帳號總數</div><div class="metric-value" id="m-accounts">0</div><div class="metric-detail"><span id="m-active">0</span> 個正常</div></div>
+    </article>
+    <article class="metric-card">
+      <div class="metric-icon metric-green"><svg viewBox="0 0 24 24"><path d="M4 19h16M6 16V8M10 16V5M14 16v-6M18 16V3"/></svg></div>
+      <div><div class="metric-label">可用帳號池</div><div class="metric-value" id="m-pool">0</div><div class="metric-detail" id="m-providers">0 個提供商</div></div>
+    </article>
+    <article class="metric-card">
+      <div class="metric-icon metric-violet"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="m8 12 2.5 2.5L16 9"/></svg></div>
+      <div><div class="metric-label">累計呼叫</div><div class="metric-value" id="m-calls">0</div><div class="metric-detail"><span id="m-failed">0</span> 次失敗</div></div>
+    </article>
+    <article class="metric-card">
+      <div class="metric-icon metric-amber"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 16 0 8 8 0 1 0-16 0"/><path d="M8.5 12.5 11 15l5-6"/></svg></div>
+      <div><div class="metric-label">請求成功率</div><div class="metric-value" id="m-success">--</div><div class="metric-detail">按累計呼叫計算</div></div>
+    </article>
+    <article class="metric-card">
+      <div class="metric-icon metric-cyan"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg></div>
+      <div><div class="metric-label">累計 Token</div><div class="metric-value" id="m-tokens">0</div><div class="metric-detail" id="m-token-split">輸入 0 · 輸出 0</div></div>
+    </article>
+    <article class="metric-card">
+      <div class="metric-icon metric-rose"><svg viewBox="0 0 24 24"><path d="M3 17h18M5 13l4-4 3 3 6-7 1 8"/></svg></div>
+      <div><div class="metric-label">剩餘額度</div><div class="metric-value" id="m-quota">0</div><div class="metric-detail" id="m-quota-models">0 個額度項目</div></div>
+    </article>
+  </section>
+
+  <section class="dashboard-grid dashboard-grid-wide">
+    <article class="dashboard-panel provider-panel">
+      <div class="panel-heading"><div><div class="panel-title">提供商概況</div><div class="panel-subtitle">帳號、請求與 Token 分布</div></div><span class="panel-badge" id="provider-count">0 個提供商</span></div>
+      <div class="provider-table" id="provider-table"></div>
+    </article>
+    <article class="dashboard-panel health-panel">
+      <div class="panel-heading"><div><div class="panel-title">帳號健康</div><div class="panel-subtitle">目前帳號狀態分布</div></div></div>
+      <div class="health-layout">
+        <div class="health-donut" id="health-donut"><div><strong id="health-total">0</strong><span>帳號</span></div></div>
+        <div class="health-legend" id="health-legend"></div>
+      </div>
+    </article>
+  </section>
+
+  <section class="dashboard-grid">
+    <article class="dashboard-panel token-panel">
+      <div class="panel-heading"><div><div class="panel-title">Token 組成</div><div class="panel-subtitle">累計用量分布</div></div><strong class="panel-total" id="token-total">0</strong></div>
+      <div class="token-composition" id="token-composition"></div>
+    </article>
+    <article class="dashboard-panel activity-panel">
+      <div class="panel-heading"><div><div class="panel-title">最近活動</div><div class="panel-subtitle">依最後使用時間排序</div></div><a href="/admin/accounts" class="panel-link">查看全部</a></div>
+      <div class="activity-list" id="activity-list"></div>
+    </article>
+  </section>
+
+  <section class="dashboard-panel gateway-panel">
+    <div class="panel-heading"><div><div class="panel-title">網關資訊</div><div class="panel-subtitle">目前服務端點與運行設定</div></div><span class="gateway-online"><span class="runtime-dot"></span>Online</span></div>
+    <div class="gateway-details">
+      <div class="gateway-endpoint"><span>Messages API</span><code id="gateway-endpoint"></code></div>
+      <div class="gateway-meta"><span>API 鑑權<strong id="gateway-auth">--</strong></span><span>額度更新<strong id="gateway-interval">--</strong></span><span>資料更新<strong id="dashboard-updated">--</strong></span></div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/header.js?v={{APP_VERSION}}"></script>
+<script>
+const STATUS_LABEL={active:'正常',exhausted:'額度用完',cooling:'冷卻中',invalid:'憑證異常',disabled:'已停用'};
+const STATUS_COLOR={active:'#22c55e',exhausted:'#a855f7',cooling:'#f59e0b',invalid:'#ef4444',disabled:'#94a3b8'};
+
+(async()=>{
+  await renderAdminHeader();
+  const key=await adminKey.get();
+  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  await loadDashboard();
+  setInterval(()=>{if(!document.hidden)loadDashboard(true);},10000);
+})();
+
+async function loadDashboard(silent=false){
+  const btn=document.getElementById('dashboard-refresh');
+  btn.classList.add('is-loading');btn.disabled=true;
+  try{
+    const [accountsData,statusData,settingsData]=await Promise.all([
+      api('GET','/accounts'),api('GET','/status'),api('GET','/settings')
+    ]);
+    renderDashboard(accountsData,statusData,settingsData);
+  }catch(err){if(!silent)showToast('儀表板載入失敗：'+err.message,'error');}
+  finally{btn.classList.remove('is-loading');btn.disabled=false;}
+}
+
+function renderDashboard(data,status,settings){
+  const accounts=data.accounts||[],stats=data.stats||{};
+  const calls=Number(stats.calls)||0,failed=Number(stats.fail)||0;
+  const input=Number(stats.tokens_in)||0,output=Number(stats.tokens_out)||0,cache=Number(stats.tokens_cache)||0;
+  const tokens=input+output+cache;
+  const quota=quotaSummary(accounts);
+  setText('m-accounts',fmt(stats.total));setText('m-active',fmt(stats.active));
+  setText('m-pool',fmt(Object.values(status.quota_pool||{}).reduce((n,v)=>n+(Number(v)||0),0)));
+  setText('m-providers',`${(data.providers||[]).length} 個提供商`);
+  setText('m-calls',fmt(calls));setText('m-failed',fmt(failed));
+  setText('m-success',calls?`${Math.max(0,(calls-failed)/calls*100).toFixed(1)}%`:'--');
+  setText('m-tokens',fmtCompact(tokens));setText('m-token-split',`輸入 ${fmtCompact(input)} · 輸出 ${fmtCompact(output)}`);
+  setText('m-quota',fmtCompact(quota.remaining));setText('m-quota-models',`${quota.items} 個額度項目`);
+  renderProviders(accounts,data.providers||[]);
+  renderHealth(stats);
+  renderTokens(input,output,cache);
+  renderActivity(accounts);
+  setText('gateway-endpoint',location.origin+'/v1/messages');
+  setText('gateway-auth',status.gateway_key_set?'已啟用':'未啟用');
+  setText('gateway-interval',settings.quota_refresh_interval?`${settings.quota_refresh_interval} 秒`:'手動');
+  setText('dashboard-updated',new Date().toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit',second:'2-digit'}));
+}
+
+function renderProviders(accounts,providers){
+  const rows=providers.map(provider=>{
+    const items=accounts.filter(a=>a.provider===provider);
+    const calls=items.reduce((n,a)=>n+(Number(a.use_count)||0),0);
+    const tokens=items.reduce((n,a)=>n+accountTokens(a),0);
+    const available=items.filter(a=>a.status==='active').length;
+    return `<div class="provider-row">
+      <div class="provider-name"><span class="provider-mark">${esc(provider.slice(0,1).toUpperCase())}</span><span><strong>${esc(provider)}</strong><small>${available} 個可用</small></span></div>
+      <div><span>帳號</span><strong>${fmt(items.length)}</strong></div>
+      <div><span>呼叫</span><strong>${fmt(calls)}</strong></div>
+      <div><span>Token</span><strong>${fmtCompact(tokens)}</strong></div>
+      <div class="provider-health"><span>狀態</span><strong class="${available?'text-success':'text-muted'}">${available?'可用':'無可用帳號'}</strong></div>
+    </div>`;
+  }).join('');
+  document.getElementById('provider-table').innerHTML=rows||'<div class="dashboard-empty">尚無提供商資料</div>';
+  setText('provider-count',`${providers.length} 個提供商`);
+}
+
+function renderHealth(stats){
+  const keys=['active','exhausted','cooling','invalid','disabled'];
+  const values=keys.map(k=>Number(stats[k])||0),total=values.reduce((a,b)=>a+b,0);
+  let cursor=0;
+  const stops=[];
+  keys.forEach((key,i)=>{const start=cursor;cursor+=total?values[i]/total*100:0;if(values[i])stops.push(`${STATUS_COLOR[key]} ${start}% ${cursor}%`);});
+  document.getElementById('health-donut').style.background=stops.length?`conic-gradient(${stops.join(',')})`:'#eef2f6';
+  setText('health-total',fmt(total));
+  document.getElementById('health-legend').innerHTML=keys.filter((_,i)=>values[i]).map((key,i)=>{
+    const value=Number(stats[key])||0;
+    return `<div><span class="legend-dot" style="background:${STATUS_COLOR[key]}"></span><span>${STATUS_LABEL[key]}</span><strong>${value}</strong></div>`;
+  }).join('')||'<div class="dashboard-empty">尚無帳號資料</div>';
+}
+
+function renderTokens(input,output,cache){
+  const parts=[['輸入',input,'#3b82f6'],['輸出',output,'#10b981'],['快取',cache,'#8b5cf6']];
+  const total=parts.reduce((n,p)=>n+p[1],0);
+  setText('token-total',fmtCompact(total));
+  document.getElementById('token-composition').innerHTML=parts.map(([label,value,color])=>{
+    const pct=total?value/total*100:0;
+    return `<div class="token-part"><div><span><i style="background:${color}"></i>${label}</span><strong>${fmtCompact(value)}</strong></div><div class="token-track"><span style="width:${pct}%;background:${color}"></span></div><small>${pct.toFixed(1)}%</small></div>`;
+  }).join('');
+}
+
+function renderActivity(accounts){
+  const items=[...accounts].sort((a,b)=>(b.last_used_at||b.created_at||0)-(a.last_used_at||a.created_at||0)).slice(0,5);
+  document.getElementById('activity-list').innerHTML=items.map(a=>`
+    <a class="activity-row" href="/admin/accounts">
+      <span class="activity-status" style="background:${STATUS_COLOR[a.status]||STATUS_COLOR.disabled}"></span>
+      <span class="activity-copy"><strong>${esc(a.name||a.provider)}</strong><small>${esc(a.provider)} · ${a.mode==='jwt'?'JWT':'API Key'}</small></span>
+      <span class="activity-time">${relativeTime(a.last_used_at||a.created_at)}</span>
+    </a>`).join('')||'<div class="dashboard-empty">尚無帳號活動</div>';
+}
+
+function quotaSummary(accounts){
+  let remaining=0,items=0;
+  accounts.forEach(a=>Object.values(a.quota||{}).forEach(q=>{remaining+=Number(q.remaining)||0;items++;}));
+  return{remaining,items};
+}
+function accountTokens(a){const t=a.total_tokens||{};return(Number(t.input)||0)+(Number(t.output)||0)+(Number(t.cache_creation)||0)+(Number(t.cache_read)||0);}
+function relativeTime(ts){if(!ts)return'尚未使用';const sec=Math.max(0,Date.now()/1000-ts);if(sec<60)return'剛剛';if(sec<3600)return`${Math.floor(sec/60)} 分鐘前`;if(sec<86400)return`${Math.floor(sec/3600)} 小時前`;return`${Math.floor(sec/86400)} 天前`;}
+function fmt(value){return Number(value||0).toLocaleString('zh-TW');}
+function fmtCompact(value){const n=Number(value)||0;if(n>=1e9)return(n/1e9).toFixed(1)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return fmt(n);}
+function setText(id,value){document.getElementById(id).textContent=value;}
+function esc(value){const el=document.createElement('span');el.textContent=String(value??'');return el.innerHTML;}
+</script>
+</body>
+</html>

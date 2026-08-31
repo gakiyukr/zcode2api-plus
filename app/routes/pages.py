@@ -27,12 +27,17 @@ async def root():
 
 @router.get("/admin", include_in_schema=False)
 async def admin_root():
-    return RedirectResponse("/admin/login")
+    return RedirectResponse("/admin/dashboard")
 
 
 @router.get("/admin/login", include_in_schema=False)
 async def admin_login():
     return _html("login.html")
+
+
+@router.get("/admin/dashboard", include_in_schema=False)
+async def admin_dashboard():
+    return _html("dashboard.html")
 
 
 @router.get("/admin/accounts", include_in_schema=False)
