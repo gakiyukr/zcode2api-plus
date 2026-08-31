@@ -1,4 +1,4 @@
-"""页面路由：登录、账号管理、设置。"""
+"""頁面路由：登入、控制台、用量分析、運維監控與設定。"""
 
 from __future__ import annotations
 
@@ -38,6 +38,16 @@ async def admin_login():
 @router.get("/admin/dashboard", include_in_schema=False)
 async def admin_dashboard():
     return _html("dashboard.html")
+
+
+@router.get("/admin/usage", include_in_schema=False)
+async def admin_usage():
+    return _html("usage.html")
+
+
+@router.get("/admin/monitor", include_in_schema=False)
+async def admin_monitor():
+    return _html("monitor.html")
 
 
 @router.get("/admin/accounts", include_in_schema=False)

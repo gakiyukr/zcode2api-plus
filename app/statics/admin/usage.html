@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zcode2api-plus · 用量分析</title>
+  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+</head>
+<body>
+<div id="admin-header" data-active="/admin/usage"></div>
+
+<main class="admin-main analytics-main">
+  <div class="page-hd">
+    <div>
+      <div class="page-title">用量分析</div>
+      <div class="page-sub">查看模型、Token 與帳號調度的累計使用狀況</div>
+    </div>
+    <div class="page-actions">
+      <span class="live-dot" id="usage-live">即時資料</span>
+      <button class="page-action-btn" id="usage-refresh" onclick="loadUsage()" title="重新整理">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg>
+        重新整理
+      </button>
+    </div>
+  </div>
+
+  <section class="analytics-metrics">
+    <article class="metric-card"><div class="metric-icon metric-blue"><svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h16"/><path d="m7 15 3-4 3 2 5-7"/></svg></div><div><div class="metric-label">累計請求</div><div class="metric-value" id="u-calls">0</div><div class="metric-detail">成功 <span id="u-success">--</span></div></div></article>
+    <article class="metric-card"><div class="metric-icon metric-cyan"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg></div><div><div class="metric-label">累計 Token</div><div class="metric-value" id="u-tokens">0</div><div class="metric-detail">輸入 <span id="u-input">0</span> · 輸出 <span id="u-output">0</span></div></div></article>
+    <article class="metric-card"><div class="metric-icon metric-violet"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg></div><div><div class="metric-label">活躍帳號</div><div class="metric-value" id="u-active">0</div><div class="metric-detail">總帳號 <span id="u-total">0</span></div></div></article>
+    <article class="metric-card"><div class="metric-icon metric-amber"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg></div><div><div class="metric-label">失敗請求</div><div class="metric-value" id="u-fail">0</div><div class="metric-detail">目前累計</div></div></article>
+  </section>
+
+  <section class="analytics-grid analytics-grid-wide">
+    <article class="dashboard-panel usage-chart-panel">
+      <div class="panel-heading"><div><div class="panel-title">Token 使用趨勢</div><div class="panel-subtitle">依帳號累計調度量彙總</div></div><span class="panel-badge">累計資料</span></div>
+      <div class="usage-chart" id="usage-chart"></div>
+      <div class="chart-legend"><span><i class="legend-input"></i>輸入</span><span><i class="legend-output"></i>輸出</span><span><i class="legend-cache"></i>快取</span></div>
+    </article>
+    <article class="dashboard-panel model-panel">
+      <div class="panel-heading"><div><div class="panel-title">帳號調度分布</div><div class="panel-subtitle">依請求數排序</div></div></div>
+      <div class="usage-donut-wrap"><div class="usage-donut" id="usage-donut"><div><strong id="donut-total">0</strong><span>請求</span></div></div><div class="usage-donut-legend" id="usage-donut-legend"></div></div>
+    </article>
+  </section>
+
+  <section class="dashboard-panel ranking-panel">
+    <div class="panel-heading"><div><div class="panel-title">帳號用量排行</div><div class="panel-subtitle">目前服務程序啟動後的累計調度</div></div><span class="panel-total" id="ranking-total">0</span></div>
+    <div class="usage-table-wrap"><table class="usage-table"><thead><tr><th>帳號</th><th>提供商</th><th>請求</th><th>失敗</th><th>Token</th><th>佔比</th></tr></thead><tbody id="usage-ranking"></tbody></table></div>
+  </section>
+</main>
+
+<script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/header.js?v={{APP_VERSION}}"></script>
+<script>
+(async()=>{await renderAdminHeader();const key=await adminKey.get();if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';loadUsage();setInterval(()=>{if(!document.hidden)loadUsage(true)},15000)})();
+async function loadUsage(silent=false){const btn=document.getElementById('usage-refresh');btn.disabled=true;btn.classList.add('is-loading');try{const d=await api('GET','/usage');renderUsage(d)}catch(e){if(!silent)showToast('載入用量失敗：'+e.message,'error')}finally{btn.disabled=false;btn.classList.remove('is-loading')}}
+function renderUsage(d){const s=d.summary||{},ranking=d.ranking||[],calls=Number(s.calls)||0,input=Number(s.tokens_in)||0,output=Number(s.tokens_out)||0,cache=Number(s.tokens_cache)||0,total=input+output+cache;set('u-calls',fmt(calls));set('u-success',calls?((calls-(Number(s.fail)||0))/calls*100).toFixed(1)+'%':'--');set('u-tokens',compact(total));set('u-input',compact(input));set('u-output',compact(output));set('u-active',fmt(s.active));set('u-total',fmt(s.total));set('u-fail',fmt(s.fail));set('ranking-total',fmt(calls));renderChart(ranking,input,output,cache);renderDonut(ranking,calls);document.getElementById('usage-live').title='更新於 '+new Date().toLocaleTimeString('zh-TW')}
+function renderChart(rows,input,output,cache){const total=input+output+cache;if(!total){document.getElementById('usage-chart').innerHTML='<div class="usage-empty-chart">尚無 Token 調度資料</div>';return}const max=Math.max(input,output,cache,1),parts=[['輸入',input,'#3b82f6'],['輸出',output,'#10b981'],['快取',cache,'#8b5cf6']];document.getElementById('usage-chart').innerHTML=parts.map(p=>`<div class="usage-chart-row"><div><span>${p[0]}</span><strong>${compact(p[1])}</strong></div><div class="usage-chart-track"><i style="width:${Math.max(2,p[1]/max*100)}%;background:${p[2]}"></i></div><small>${(p[1]/total*100).toFixed(1)}%</small></div>`).join('')+'<div class="usage-sparkline"><svg viewBox="0 0 600 120" preserveAspectRatio="none" aria-hidden="true"><path d="M0 94 C55 72 78 83 126 60 S205 80 252 45 S336 77 386 38 S458 66 516 24 S566 45 600 18"/><path d="M0 110 C70 100 110 104 162 91 S254 103 304 74 S389 95 436 71 S530 84 600 57"/></svg></div>'}
+function renderDonut(rows,total){const top=rows.slice(0,5),palette=['#3b82f6','#10b981','#8b5cf6','#f59e0b','#94a3b8'];let cursor=0,stops=[];top.forEach((r,i)=>{const pct=total?Number(r.requests)/total*100:0;stops.push(`${palette[i]} ${cursor}% ${cursor+pct}%`);cursor+=pct});stops.push(`#e9edf3 ${cursor}% 100%`);document.getElementById('usage-donut').style.background=`conic-gradient(${stops.join(',')})`;set('donut-total',fmt(total));document.getElementById('usage-donut-legend').innerHTML=top.map((r,i)=>`<div><i style="background:${palette[i]}"></i><span>${esc(r.name)}</span><strong>${total?(r.requests/total*100).toFixed(1):'0'}%</strong></div>`).join('')||'<div class="dashboard-empty">尚無用量資料</div>';const tbody=document.getElementById('usage-ranking');tbody.innerHTML=rows.map(r=>{const pct=total?r.requests/total*100:0;return`<tr><td><strong>${esc(r.name)}</strong></td><td><span class="badge badge-active">${esc(r.provider)}</span></td><td>${fmt(r.requests)}</td><td>${fmt(r.errors)}</td><td>${compact(r.tokens)}</td><td><div class="rank-bar"><i style="width:${pct}%"></i></div><small>${pct.toFixed(1)}%</small></td></tr>`}).join('')||'<tr><td colspan="6" class="empty-state">尚無帳號用量資料</td></tr>'}
+function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v}function fmt(v){return Number(v||0).toLocaleString('zh-TW')}function compact(v){const n=Number(v)||0;if(n>=1e9)return(n/1e9).toFixed(2)+'B';if(n>=1e6)return(n/1e6).toFixed(2)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return fmt(n)}function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+</script>
+</body>
+</html>

@@ -5,7 +5,7 @@
   python main.py serve [--port 3000]        启动网关 + 后台 UI
   python main.py login zai [--no-browser]   通过 OAuth 登录 Z.AI 并自动加入账号池
   python main.py add-account zai <name> <jwt|key>   添加轮询账号
-  python main.py accounts [zai|bigmodel]    查看账号列表
+  python main.py accounts [zai]             查看账号列表
   python main.py remove-account <provider> <id|name>
   python main.py quota                      查看各账号实时额度
   python main.py status                     查看配置概览
@@ -104,7 +104,7 @@ async def cmd_login(args: list[str]) -> None:
 # ── 账号管理 ─────────────────────────────────────────────────────────────────
 def cmd_add_account(args: list[str]) -> None:
     if len(args) < 3:
-        print(c("格式: python cli.py add-account <zai|bigmodel> <name> <jwt|key>", "red"))
+        print(c("格式: python cli.py add-account <zai> <name> <jwt|key>", "red"))
         return
     provider, name, secret = args[0], args[1], args[2]
     acc = store.add_account(provider, name, secret)
@@ -112,7 +112,7 @@ def cmd_add_account(args: list[str]) -> None:
 
 
 def cmd_accounts(args: list[str]) -> None:
-    provider = args[0] if args and args[0] in ("zai", "bigmodel") else None
+    provider = args[0] if args and args[0] in ("zai",) else None
     accounts = store.list_accounts(provider)
     if not accounts:
         print("无账号")
@@ -148,7 +148,7 @@ def cmd_status() -> None:
     print(f"默认端口    : {c(str(settings.PORT), 'blue')}")
     print(f"后台密码    : {'已设置' if store.admin_key() else c('未设置', 'yellow')}")
     print(f"网关 API Key: {'已设置' if store.gateway_key() else '未设置（不校验）'}")
-    for p in ("zai", "bigmodel"):
+    for p in ("zai",):
         accounts = store.list_accounts(p)
         active = sum(1 for a in accounts if a.is_selectable())
         print(f"{p:9s}  : {len(accounts)} 个账号，{active} 个可用")

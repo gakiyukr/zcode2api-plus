@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zcode2api-plus · 運維監控</title>
+  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+</head>
+<body>
+<div id="admin-header" data-active="/admin/monitor"></div>
+
+<main class="admin-main monitor-main">
+  <div class="page-hd">
+    <div><div class="page-title">運維監控</div><div class="page-sub">服務健康、資源用量與請求品質</div></div>
+    <div class="page-actions"><span class="live-dot" id="monitor-live">監控中</span><button class="page-action-btn" id="monitor-refresh" onclick="loadMonitor()" title="重新整理"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg>重新整理</button></div>
+  </div>
+
+  <section class="monitor-hero dashboard-panel">
+    <div class="monitor-hero-head"><div><div class="panel-title">服務健康</div><div class="panel-subtitle" id="monitor-updated">等待資料</div></div><span class="service-state service-state-online" id="overall-state"><i></i>運行正常</span></div>
+    <div class="monitor-health-grid">
+      <div class="monitor-health-ring"><div class="health-ring" id="health-ring"><strong id="health-score">100</strong><span>健康分</span></div><div class="monitor-ring-caption">最近狀態</div></div>
+      <div class="monitor-stat-grid">
+        <div class="monitor-kpi"><span>請求數</span><strong id="r-total">0</strong><small>累計調度</small></div>
+        <div class="monitor-kpi"><span>成功率</span><strong class="text-success" id="r-success">--</strong><small>依回應結果計算</small></div>
+        <div class="monitor-kpi"><span>平均 QPS</span><strong id="r-qps">0</strong><small>程序啟動後平均</small></div>
+        <div class="monitor-kpi"><span>程序運行</span><strong id="r-uptime">--</strong><small id="r-started">服務啟動後</small></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="monitor-grid">
+    <article class="dashboard-panel"><div class="panel-heading"><div><div class="panel-title">請求品質</div><div class="panel-subtitle">閘道與上游帳號池</div></div><span class="panel-badge" id="request-badge">穩定</span></div><div class="quality-list"><div><span>失敗請求</span><strong id="r-errors">0</strong></div><div><span>失敗率</span><strong id="r-error-rate">0%</strong></div><div><span>可用帳號</span><strong id="a-active">0</strong></div><div><span>額度耗盡</span><strong id="a-exhausted">0</strong></div></div></article>
+    <article class="dashboard-panel"><div class="panel-heading"><div><div class="panel-title">主機資源</div><div class="panel-subtitle">執行服務的主機即時資訊</div></div><span class="panel-badge" id="resource-badge">讀取中</span></div><div class="resource-list"><div class="resource-row"><div class="resource-label"><span>CPU</span><strong id="cpu-value">--</strong></div><div class="resource-track"><i id="cpu-bar"></i></div><small id="cpu-detail">-- 核心</small></div><div class="resource-row"><div class="resource-label"><span>記憶體</span><strong id="memory-value">--</strong></div><div class="resource-track"><i id="memory-bar"></i></div><small id="memory-detail">--</small></div></div></article>
+  </section>
+
+  <section class="dashboard-panel services-panel"><div class="panel-heading"><div><div class="panel-title">服務元件</div><div class="panel-subtitle">目前程序內的核心模組狀態</div></div><span class="panel-badge" id="service-count">0 個元件</span></div><div class="service-list" id="service-list"></div></section>
+
+  <section class="monitor-grid monitor-grid-bottom">
+    <article class="dashboard-panel"><div class="panel-heading"><div><div class="panel-title">帳號池健康</div><div class="panel-subtitle">提供商：Z.AI</div></div><a class="panel-link" href="/admin/accounts">管理帳號</a></div><div class="account-health"><div class="account-health-bar"><i id="account-active-bar"></i></div><div class="account-health-legend"><span><i class="legend-online"></i>正常 <strong id="a-active-2">0</strong></span><span><i class="legend-warning"></i>冷卻 <strong id="a-cooling">0</strong></span><span><i class="legend-danger"></i>異常 <strong id="a-invalid">0</strong></span></div></div></article>
+    <article class="dashboard-panel"><div class="panel-heading"><div><div class="panel-title">運行資訊</div><div class="panel-subtitle">環境與版本</div></div></div><div class="runtime-details"><div><span>應用版本</span><strong id="app-version">--</strong></div><div><span>CPU 核心</span><strong id="cpu-count">--</strong></div><div><span>額度輪詢</span><strong id="quota-interval">--</strong></div><div><span>服務狀態</span><strong class="text-success">Online</strong></div></div></article>
+  </section>
+</main>
+
+<script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/header.js?v={{APP_VERSION}}"></script>
+<script>
+(async()=>{await renderAdminHeader();const key=await adminKey.get();if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';loadMonitor();setInterval(()=>{if(!document.hidden)loadMonitor(true)},10000)})();
+async function loadMonitor(silent=false){const btn=document.getElementById('monitor-refresh');btn.disabled=true;btn.classList.add('is-loading');try{const d=await api('GET','/monitor');renderMonitor(d)}catch(e){if(!silent)showToast('載入監控資料失敗：'+e.message,'error')}finally{btn.disabled=false;btn.classList.remove('is-loading')}}
+function renderMonitor(d){const r=d.requests||{},a=d.accounts||{},sys=d.system||{},mem=sys.memory||{},success=r.success_rate;set('r-total',fmt(r.total));set('r-success',success==null?'--':success.toFixed(2)+'%');set('r-qps',Number(r.average_qps||0).toFixed(3));set('r-uptime',duration(d.uptime_sec));set('r-errors',fmt(r.errors));set('r-error-rate',r.total?((r.errors||0)/r.total*100).toFixed(2)+'%':'0%');set('a-active',fmt(a.active));set('a-active-2',fmt(a.active));set('a-cooling',fmt(a.cooling));set('a-invalid',fmt(a.invalid));set('a-exhausted',fmt(a.exhausted));set('cpu-count',fmt(sys.cpu_count));set('app-version','v{{APP_VERSION}}');set('quota-interval','背景輪詢');set('monitor-updated','最近更新：'+new Date(d.ts*1000).toLocaleTimeString('zh-TW'));const cpuPct=sys.load_1m!=null&&sys.cpu_count?Math.min(100,sys.load_1m/sys.cpu_count*100):0;set('cpu-value',sys.load_1m==null?'--':sys.load_1m.toFixed(2));set('cpu-detail',fmt(sys.cpu_count)+' 核心 · 負載');setBar('cpu-bar',cpuPct);set('memory-value',mem.used_percent==null?'--':mem.used_percent.toFixed(1)+'%');set('memory-detail',mem.total_mb==null?'主機資訊不可用':`${mem.total_mb.toFixed(0)} MB 總量 · ${mem.available_mb.toFixed(0)} MB 可用`);setBar('memory-bar',mem.used_percent||0);const health=success==null?100:Math.max(0,Math.min(100,success));set('health-score',Math.round(health));document.getElementById('health-ring').style.setProperty('--health',health*3.6+'deg');const bad=(a.invalid||0)+(a.exhausted||0);document.getElementById('overall-state').className='service-state '+(bad?'service-state-warn':'service-state-online');document.getElementById('overall-state').innerHTML=`<i></i>${bad?'需要留意':'運行正常'}`;set('request-badge',bad?'需要留意':'穩定');set('resource-badge',mem.used_percent!=null?'正常':'受限');const total=a.total||0;setBar('account-active-bar',total?Math.max(0,a.active/total*100):0);renderServices(d.services||[]);}
+function renderServices(items){set('service-count',items.length+' 個元件');document.getElementById('service-list').innerHTML=items.map(s=>`<div class="service-row"><span class="service-icon"><svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h16"/><path d="M8 16v-4M12 16V8M16 16v-7"/></svg></span><span class="service-copy"><strong>${esc(s.name)}</strong><small>${esc(s.detail||'')}</small></span><span class="service-state ${s.status==='online'?'service-state-online':'service-state-standby'}"><i></i>${s.status==='online'?'運行中':'待命'}</span></div>`).join('')||'<div class="dashboard-empty">尚無服務資料</div>'}
+function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v}function setBar(id,v){const e=document.getElementById(id);if(e)e.style.width=Math.max(0,Math.min(100,Number(v)||0))+'%'}function fmt(v){return Number(v||0).toLocaleString('zh-TW')}function duration(sec){sec=Number(sec)||0;if(sec<60)return sec+' 秒';if(sec<3600)return Math.floor(sec/60)+' 分鐘';if(sec<86400)return Math.floor(sec/3600)+' 小時';return Math.floor(sec/86400)+' 天'}function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+</script>
+</body>
+</html>

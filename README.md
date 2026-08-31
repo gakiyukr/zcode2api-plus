@@ -60,6 +60,9 @@ docker run -d --name zcode2api-plus -p 3000:3000 \
 | 页面 | 说明 |
 |------|------|
 | `/admin/login` | 后台登录（Bearer 密钥鉴权，凭证加密存于浏览器 localStorage）|
+| `/admin/dashboard` | 儀表板：帳號池、提供商、額度與即時活動總覽 |
+| `/admin/usage` | 用量分析：Token 組成、帳號調度分布與累計排行 |
+| `/admin/monitor` | 運維監控：服務健康、請求品質、CPU／記憶體與元件狀態 |
 | `/admin/accounts` | 账号池：新增/导入/导出、启用禁用、**实时额度与状态监控**（每 5 秒刷新）|
 | `/admin/settings` | 后台密码、网关 API Key |
 

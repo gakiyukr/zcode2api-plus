@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import time
+import os
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
+from .. import settings
 from ..auth_admin import verify_admin_key
 from ..captcha import captcha_manager
 from ..models import PROVIDERS, Status
@@ -16,6 +18,8 @@ from ..quota import fetch_quota, refresh_accounts
 from ..store import store
 
 router = APIRouter(prefix="/admin/api", dependencies=[Depends(verify_admin_key)])
+
+_STARTED_AT = time.time()
 
 # 以不可预测的 flow_id/state 关联后台发起的 OAuth 会话。
 _login_flows: dict[str, ZaiAuthFlow] = {}
@@ -39,9 +43,7 @@ async def verify():
 
 
 # ── 账号列表 + 概览统计 ──────────────────────────────────────────────────────
-@router.get("/accounts")
-async def list_accounts():
-    now = time.time()
+def _account_snapshot() -> tuple[list[dict], dict]:
     accounts = [a.public_view() for a in store.list_accounts()]
     stats = {"total": len(accounts), "active": 0, "exhausted": 0,
              "cooling": 0, "invalid": 0, "disabled": 0,
@@ -57,7 +59,13 @@ async def list_accounts():
         stats["tokens_in"] += total_tokens.get("input") or 0
         stats["tokens_out"] += total_tokens.get("output") or 0
         stats["tokens_cache"] += (total_tokens.get("cache_creation") or 0) + (total_tokens.get("cache_read") or 0)
-    return {"accounts": accounts, "stats": stats, "providers": list(PROVIDERS), "ts": now}
+    return accounts, stats
+
+
+@router.get("/accounts")
+async def list_accounts():
+    accounts, stats = _account_snapshot()
+    return {"accounts": accounts, "stats": stats, "providers": list(PROVIDERS), "ts": time.time()}
 
 
 @router.get("/status")
@@ -69,6 +77,96 @@ async def status_info():
             p: sum(1 for a in store.list_accounts(p) if a.is_selectable())
             for p in PROVIDERS
         },
+    }
+
+
+def _memory_snapshot() -> dict:
+    """讀取主機記憶體；非 Linux 環境回傳空值以保持 API 可用。"""
+    meminfo = {}
+    try:
+        for line in open("/proc/meminfo", encoding="utf-8"):
+            key, value = line.split(":", 1)
+            meminfo[key] = int(value.strip().split()[0])
+    except (OSError, ValueError):
+        return {"total_mb": None, "available_mb": None, "used_percent": None}
+    total = meminfo.get("MemTotal", 0)
+    available = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
+    used_percent = round((total - available) / total * 100, 1) if total else None
+    return {
+        "total_mb": round(total / 1024, 1) if total else None,
+        "available_mb": round(available / 1024, 1) if available else None,
+        "used_percent": used_percent,
+    }
+
+
+@router.get("/monitor")
+async def monitor_info():
+    """提供控制台使用的服務、主機與帳號池健康資料。"""
+    _accounts, stats = _account_snapshot()
+    uptime = max(0, time.time() - _STARTED_AT)
+    try:
+        load_1m = round(os.getloadavg()[0], 2)
+    except (AttributeError, OSError):
+        load_1m = None
+    calls = stats["calls"]
+    fail = stats["fail"]
+    return {
+        "ts": time.time(),
+        "uptime_sec": round(uptime),
+        "system": {
+            "cpu_count": os.cpu_count() or 1,
+            "load_1m": load_1m,
+            "memory": _memory_snapshot(),
+        },
+        "requests": {
+            "total": calls,
+            "errors": fail,
+            "success_rate": round((calls - fail) / calls * 100, 2) if calls else None,
+            "average_qps": round(calls / uptime, 3) if uptime else 0,
+        },
+        "accounts": {
+            "total": stats["total"],
+            "active": stats["active"],
+            "cooling": stats["cooling"],
+            "exhausted": stats["exhausted"],
+            "invalid": stats["invalid"],
+            "disabled": stats["disabled"],
+        },
+        "services": [
+            {"name": "API Gateway", "status": "online", "detail": "Anthropic Messages"},
+            {"name": "額度監控", "status": "online", "detail": "背景輪詢"},
+            {
+                "name": "驗證瀏覽器",
+                "status": "online" if settings.CAPTCHA_BROWSER_ENABLED else "standby",
+                "detail": "Chromium" if settings.CAPTCHA_BROWSER_ENABLED else "按需啟用",
+            },
+        ],
+    }
+
+
+@router.get("/usage")
+async def usage_info():
+    """提供累計用量與帳號排行；歷史明細不足時不虛構時間序列。"""
+    accounts, stats = _account_snapshot()
+    ranking = sorted(
+        (
+            {
+                "name": a["name"],
+                "provider": a["provider"],
+                "requests": a["use_count"],
+                "errors": a["fail_count"],
+                "tokens": sum((a.get("total_tokens") or {}).values()),
+            }
+            for a in accounts
+        ),
+        key=lambda item: (item["requests"], item["tokens"]),
+        reverse=True,
+    )
+    return {
+        "ts": time.time(),
+        "window": "累計",
+        "summary": stats,
+        "ranking": ranking[:12],
     }
 
 
