@@ -42,7 +42,7 @@
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">帳號總數</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 19a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4"/><circle cx="12" cy="8" r="4"/></svg></span></div><div class="stat-num" id="s-total">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">正常</div><span class="stat-icon" style="color:#16a34a"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span></div><div class="stat-num" id="s-active" style="color:#16a34a">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">額度用完</div><span class="stat-icon" style="color:#8d6bbd"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:#8d6bbd">0</div></div>
-    <div class="stat-cell"><div class="stat-top"><div class="stat-label">總額度（剩餘）</div><span class="stat-icon" style="color:#4c9168"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:#4c9168">0</div></div>
+    <div class="stat-cell stat-cell-quota"><div class="stat-top"><div class="stat-label">總額度（剩餘）</div><span class="stat-icon" style="color:#4c9168"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:#4c9168">0</div><div class="stat-quota-progress" id="s-quota-progress" role="progressbar" aria-label="帳號池剩餘額度比例" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="s-quota-progress-fill"></span></div><div class="stat-quota-meta" id="s-quota-meta">尚無額度資料</div></div>
     <div class="stat-cell" id="s-tokens-cell"><div class="stat-top"><div class="stat-label">累計調度 Tokens（入+出）</div><span class="stat-icon" style="color:#4c76b2"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 17V7"/><path d="M9 17V9"/><path d="M14 17v-4"/><path d="M19 17V5"/></svg></span></div><div class="stat-num" id="s-tokens" style="color:#4c76b2">0</div></div>
   </div>
 
@@ -199,9 +199,20 @@ function renderStats(s){
   set('s-total',s.total||0);
   set('s-active',s.active||0);
   set('s-exhausted',s.exhausted||0);
-  let totalRem=0;
-  allAccounts.forEach(a=>{const q=a.quota||{};Object.values(q).forEach(w=>{totalRem+=Number(w.remaining)||0;});});
+  let totalRem=0,totalQuota=0;
+  allAccounts.forEach(a=>{const q=a.quota||{};Object.values(q).forEach(w=>{
+    totalRem+=Number(w.remaining)||0;
+    totalQuota+=Number(w.total)||0;
+  });});
   set('s-quota',fmt(totalRem));
+  const quotaPct=totalQuota>0?Math.max(0,Math.min(100,totalRem/totalQuota*100)):0;
+  const quotaProgress=document.getElementById('s-quota-progress');
+  const quotaFill=document.getElementById('s-quota-progress-fill');
+  quotaFill.style.width=quotaPct+'%';
+  quotaFill.style.background=quotaPct<=15?'#ef4444':quotaPct<=40?'#f59e0b':'#22c55e';
+  quotaProgress.setAttribute('aria-valuenow',quotaPct.toFixed(1));
+  quotaProgress.title=totalQuota?`剩餘 ${fmtTokens(totalRem)} / ${fmtTokens(totalQuota)}（${quotaPct.toFixed(1)}%）`:'尚無額度資料';
+  set('s-quota-meta',totalQuota?`${fmtTokens(totalRem)} / ${fmtTokens(totalQuota)} · ${quotaPct.toFixed(1)}%`:'尚無額度資料');
   const tIn=Number(s.tokens_in)||0,tOut=Number(s.tokens_out)||0,tCache=Number(s.tokens_cache)||0;
   set('s-tokens',fmtTokens(tIn+tOut));
   document.getElementById('s-tokens-cell').title=`輸入 ${tIn.toLocaleString()} · 輸出 ${tOut.toLocaleString()} · 快取 ${tCache.toLocaleString()}`;
