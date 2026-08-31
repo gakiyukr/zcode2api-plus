@@ -41,3 +41,10 @@ class AccountIdentityTests(unittest.TestCase):
         self.assertEqual(view["email"], "user@example.com")
         self.assertEqual(view["plan_name"], "Coding Plan")
         self.assertTrue(view["plan_is_trial"])
+
+    def test_trial_detection_handles_nested_entitlements(self):
+        """方案包含額度陣列時，體驗判斷不得遞迴失控。"""
+        account = Account.create("zai", "nested", "header.payload.signature")
+        account.plan = {"entitlements": [{"plan_type": "trial"}]}
+
+        self.assertTrue(account.public_view()["plan_is_trial"])

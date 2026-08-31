@@ -38,8 +38,12 @@ def _plan_text(plan: dict) -> str:
     return ""
 
 
-def _is_trial_plan(plan: dict) -> bool:
+def _is_trial_plan(plan: object, depth: int = 0) -> bool:
     """辨識官方回傳的體驗、試用或免費方案，缺少標記時以方案名稱補判。"""
+    if depth > 6:
+        return False
+    if isinstance(plan, list):
+        return any(_is_trial_plan(item, depth + 1) for item in plan)
     if not isinstance(plan, dict):
         return False
     markers = ("trial", "free", "experience", "體驗", "试用", "試用")
@@ -47,7 +51,7 @@ def _is_trial_plan(plan: dict) -> bool:
         normalized = str(key).replace("_", "").replace("-", "").lower()
         if normalized in {"istrial", "trial", "isfree", "free", "isexperience", "trialplan"} and value is True:
             return True
-        if isinstance(value, (dict, list)) and _is_trial_plan(value if isinstance(value, dict) else {"items": value}):
+        if isinstance(value, (dict, list)) and _is_trial_plan(value, depth + 1):
             return True
         if any(marker in str(value or "").lower() for marker in markers):
             return True

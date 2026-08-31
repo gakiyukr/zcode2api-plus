@@ -48,7 +48,7 @@
     </article>
     <article class="metric-card">
       <div class="metric-icon metric-rose"><svg viewBox="0 0 24 24"><path d="M3 17h18M5 13l4-4 3 3 6-7 1 8"/></svg></div>
-      <div><div class="metric-label">剩餘額度</div><div class="metric-value" id="m-quota">0</div><div class="metric-detail" id="m-quota-models">0 個額度項目</div></div>
+      <div><div class="metric-label">剩餘額度</div><div class="metric-value" id="m-quota">0</div><div class="metric-quota-progress" id="m-quota-progress" role="progressbar" aria-label="剩餘額度比例" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="m-quota-progress-fill"></span></div><div class="metric-detail" id="m-quota-models">尚無額度資料</div></div>
     </article>
   </section>
 
@@ -125,7 +125,7 @@ function renderDashboard(data,status,settings){
   setText('m-calls',fmt(calls));setText('m-failed',fmt(failed));
   setText('m-success',calls?`${Math.max(0,(calls-failed)/calls*100).toFixed(1)}%`:'--');
   setText('m-tokens',fmtCompact(tokens));setText('m-token-split',`輸入 ${fmtCompact(input)} · 輸出 ${fmtCompact(output)}`);
-  setText('m-quota',fmtCompact(quota.remaining));setText('m-quota-models',`${quota.items} 個額度項目`);
+  setText('m-quota',fmtCompact(quota.remaining));renderQuotaProgress(quota);
   renderProviders(accounts,data.providers||[]);
   renderHealth(stats);
   renderTokens(input,output,cache);
@@ -189,9 +189,23 @@ function renderActivity(accounts){
 }
 
 function quotaSummary(accounts){
-  let remaining=0,items=0;
-  accounts.forEach(a=>Object.values(a.quota||{}).forEach(q=>{remaining+=Number(q.remaining)||0;items++;}));
-  return{remaining,items};
+  let remaining=0,total=0,items=0;
+  accounts.forEach(a=>Object.values(a.quota||{}).forEach(q=>{
+    remaining+=Number(q.remaining)||0;
+    total+=Number(q.total)||0;
+    items++;
+  }));
+  return{remaining,total,items};
+}
+function renderQuotaProgress(quota){
+  const pct=quota.total>0?Math.max(0,Math.min(100,quota.remaining/quota.total*100)):0;
+  const progress=document.getElementById('m-quota-progress');
+  const fill=document.getElementById('m-quota-progress-fill');
+  fill.style.width=pct+'%';
+  fill.style.background=pct<=15?'#ef4444':pct<=40?'#f59e0b':'#22c55e';
+  progress.setAttribute('aria-valuenow',pct.toFixed(1));
+  progress.title=quota.total?`剩餘 ${fmtCompact(quota.remaining)} / ${fmtCompact(quota.total)}（${pct.toFixed(1)}%）`:'尚無額度資料';
+  setText('m-quota-models',quota.total?`${fmtCompact(quota.remaining)} / ${fmtCompact(quota.total)} · ${quota.items} 項`:'尚無額度資料');
 }
 function accountTokens(a){const t=a.total_tokens||{};return(Number(t.input)||0)+(Number(t.output)||0)+(Number(t.cache_creation)||0)+(Number(t.cache_read)||0);}
 function relativeTime(ts){if(!ts)return'尚未使用';const sec=Math.max(0,Date.now()/1000-ts);if(sec<60)return'剛剛';if(sec<3600)return`${Math.floor(sec/60)} 分鐘前`;if(sec<86400)return`${Math.floor(sec/3600)} 小時前`;return`${Math.floor(sec/86400)} 天前`;}
