@@ -93,6 +93,7 @@ class QuotaQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(daily["remaining"], 2_500_000)
         self.assertEqual(daily["period"], "daily")
         self.assertEqual(daily["period_end"], 1_788_191_999)
+        self.assertEqual(account.exhausted_models, [])
 
     async def test_zero_daily_balance_marks_account_exhausted(self):
         """所有官方餘額均為零時，帳號不可再參與輪詢。"""
@@ -109,6 +110,7 @@ class QuotaQueryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(account.status, Status.EXHAUSTED)
         self.assertEqual(account.last_error, "額度已用完")
+        self.assertEqual(account.exhausted_models, ["glm-5.3-flash"])
 
 
 if __name__ == "__main__":

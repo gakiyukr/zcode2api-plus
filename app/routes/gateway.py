@@ -177,6 +177,18 @@ def _mark(account: Account, status_value: str, error: str | None = None) -> None
     store.update_account(account)
 
 
+def _mark_model_exhausted(account: Account, model: object, error: str) -> None:
+    """只停用已耗盡的請求模型；所有已知模型皆耗盡時才停用整個帳號。"""
+    if not account.mark_model_exhausted(model):
+        _mark(account, Status.EXHAUSTED, error)
+        return
+    states = [account.model_availability(name) for name in account.quota]
+    account.status = Status.EXHAUSTED if states and all(state == "exhausted" for state in states) else Status.ACTIVE
+    account.cooling_until = None
+    account.last_error = error
+    store.update_account(account)
+
+
 def _last_user_text(body: dict) -> str:
     for msg in reversed(body.get("messages") or []):
         if not isinstance(msg, dict) or msg.get("role") != "user":
@@ -223,7 +235,7 @@ async def messages(request: Request):
     tried: set[str] = set()
 
     for _ in range(MAX_ACCOUNT_ATTEMPTS):
-        account = store.select(provider, skip_ids=tried)
+        account = store.select(provider, skip_ids=tried, model=body.get("model"))
         if account is None:
             break
         tried.add(account.id)
@@ -302,8 +314,9 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                 continue  # 同账号重试验证码
 
             if _is_exhausted(status_code, text):
-                _mark(account, Status.EXHAUSTED, "额度已用完")
-                logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
+                model = body.get("model")
+                _mark_model_exhausted(account, model, f"{model or '當前模型'} 額度已用完")
+                logs.warn(req_id, f"账号 {account.name} 的 {model or '當前模型'} 額度用完，切換下一個")
                 asyncio.create_task(_safe_refresh(account))
                 return _NEXT_ACCOUNT
 
@@ -331,6 +344,12 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                 logs.warn(req_id, f"账号 {account.name} 被限流 429，切换下一个")
                 return _NEXT_ACCOUNT
 
+            if status_code == 503:
+                account.fail_count += 1
+                _mark(account, Status.COOLING, "上游服務不可用 HTTP 503")
+                logs.warn(req_id, f"账号 {account.name} 上游返回 503，進入冷卻並切換下一個")
+                return _NEXT_ACCOUNT
+
             # 其它错误：直接回传客户端
             account.fail_count += 1
             store.update_account(account)
@@ -352,8 +371,9 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
             if str(code) == "1005":
                 await cm.__aexit__(None, None, None)
                 await client.aclose()
-                _mark(account, Status.EXHAUSTED, "每日額度已用完")
-                logs.warn(req_id, f"帳號 {account.name} 每日額度用完，切換下一個")
+                model = body.get("model")
+                _mark_model_exhausted(account, model, f"{model or '當前模型'} 每日額度已用完")
+                logs.warn(req_id, f"帳號 {account.name} 的 {model or '當前模型'} 每日額度用完，切換下一個")
                 asyncio.create_task(_safe_refresh(account))
                 return _NEXT_ACCOUNT
 

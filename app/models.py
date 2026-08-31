@@ -27,6 +27,14 @@ def _account_id(name: str) -> str:
     return f"{safe}-{secrets.token_hex(4)}"
 
 
+def normalize_model_name(model: object) -> str:
+    """統一模型名稱格式，供額度快照與請求模型穩定比對。"""
+    value = str(model or "").strip().lower().replace("_", "-").replace(" ", "-")
+    while "--" in value:
+        value = value.replace("--", "-")
+    return value
+
+
 def _plan_text(plan: dict) -> str:
     """從官方方案資料取出可供辨識的名稱。"""
     if not isinstance(plan, dict):
@@ -74,6 +82,7 @@ class Account:
 
     # 额度快照：{ model_show_name: {total, used, remaining, expires_at} }
     quota: dict = field(default_factory=dict)
+    exhausted_models: list[str] = field(default_factory=list)
     plan: dict = field(default_factory=dict)        # 当前激活方案
     usage: dict = field(default_factory=dict)       # 近期用量原始数据
 
@@ -120,6 +129,58 @@ class Account:
             return bool(self.cooling_until and now >= self.cooling_until)
         return True
 
+    def quota_for_model(self, model: object) -> dict | None:
+        """取得請求模型對應的額度；無法精確比對時回傳未知。"""
+        target = normalize_model_name(model)
+        if not target:
+            return None
+        for name, quota in self.quota.items():
+            if normalize_model_name(name) == target and isinstance(quota, dict):
+                return quota
+        return None
+
+    def model_availability(self, model: object) -> str:
+        """回傳 available、exhausted 或 unknown，避免把未知額度誤判為用完。"""
+        target = normalize_model_name(model)
+        if not target:
+            return "unknown"
+        if target in {normalize_model_name(name) for name in self.exhausted_models}:
+            return "exhausted"
+        quota = self.quota_for_model(target)
+        if quota is None or quota.get("remaining") is None:
+            return "unknown"
+        try:
+            return "available" if float(quota["remaining"]) > 0 else "exhausted"
+        except (TypeError, ValueError):
+            return "unknown"
+
+    def is_model_selectable(self, model: object, now: float | None = None) -> bool:
+        """帳號全局可用且指定模型未耗盡時才允許調度。"""
+        return self.is_selectable(now) and self.model_availability(model) != "exhausted"
+
+    def mark_model_exhausted(self, model: object) -> bool:
+        """記錄單一模型已耗盡；無模型名稱時無法安全建立標記。"""
+        target = normalize_model_name(model)
+        if not target:
+            return False
+        known = {normalize_model_name(name) for name in self.exhausted_models}
+        if target not in known:
+            self.exhausted_models.append(target)
+        return True
+
+    def sync_exhausted_models(self) -> None:
+        """以最新官方額度快照同步已耗盡模型，正額度模型會自動恢復。"""
+        exhausted = []
+        for model, quota in self.quota.items():
+            if not isinstance(quota, dict) or quota.get("remaining") is None:
+                continue
+            try:
+                if float(quota["remaining"]) <= 0:
+                    exhausted.append(normalize_model_name(model))
+            except (TypeError, ValueError):
+                continue
+        self.exhausted_models = list(dict.fromkeys(exhausted))
+
     def accumulate_tokens(self, usage: dict) -> None:
         """累加一次成功回應的 token 用量（鍵與 UsageCollector.as_dict 一致）。"""
         self.total_input_tokens += int(usage.get("input") or 0)
@@ -156,6 +217,7 @@ class Account:
             "enabled": self.enabled,
             "status": self.effective_status(),
             "quota": self.quota,
+            "exhausted_models": self.exhausted_models,
             "plan": self.plan,
             "plan_name": _plan_text(self.plan),
             "plan_is_trial": _is_trial_plan(self.plan),

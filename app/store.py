@@ -299,20 +299,31 @@ class Store:
             return True
 
     # ── 轮询选择 ─────────────────────────────────────────────────────────────
-    def select(self, provider: str, skip_ids: set[str] | None = None) -> Account | None:
-        """按 round-robin 选择下一个可用账号。用完 / 失效的自动跳过。"""
+    def select(
+        self,
+        provider: str,
+        skip_ids: set[str] | None = None,
+        model: str | None = None,
+    ) -> Account | None:
+        """按模型額度與 round-robin 選擇帳號，未知額度僅作後備。"""
         skip_ids = skip_ids or set()
         now = time.time()
         with self._lock:
-            pool = [
+            base_pool = [
                 a for a in self._accounts.get(provider, [])
                 if a.is_selectable(now) and a.id not in skip_ids
             ]
+            pool = base_pool
+            if model:
+                available = [a for a in base_pool if a.model_availability(model) == "available"]
+                unknown = [a for a in base_pool if a.model_availability(model) == "unknown"]
+                pool = available or unknown
             if not pool:
                 return None
-            idx = self._rotation.get(provider, 0) % len(pool)
+            rotation_key = f"{provider}:{model or '*'}"
+            idx = self._rotation.get(rotation_key, 0) % len(pool)
             account = pool[idx]
-            self._rotation[provider] = (idx + 1) % len(pool)
+            self._rotation[rotation_key] = (idx + 1) % len(pool)
             return account
 
     # ── 导入 / 导出 ─────────────────────────────────────────────────────────

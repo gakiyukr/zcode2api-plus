@@ -146,9 +146,13 @@ class GatewayCaptchaRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_SequenceClient.calls, 2)
         self.assertEqual(account.status, "active")
 
-    async def test_http_200_quota_error_marks_account_exhausted(self):
-        """上游以 HTTP 200 回傳 code 1005 時仍須切換帳號。"""
+    async def test_http_200_quota_error_marks_only_requested_model(self):
+        """上游以 HTTP 200 回傳 code 1005 時只耗盡請求模型。"""
         account = Account.create("zai", "quota", "header.payload.signature")
+        account.quota = {
+            "GLM-5.3": {"remaining": 1_000},
+            "GLM-5.3-Flash": {"remaining": 0},
+        }
         _SequenceClient.responses = [
             _SequenceResponse(200, '{"code":1005,"msg":"exceed quota limit"}'),
         ]
@@ -160,12 +164,31 @@ class GatewayCaptchaRetryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(gateway.asyncio, "create_task", side_effect=lambda coroutine: coroutine.close()),
         ):
             response = await gateway._try_account(
-                "req", account, {"stream": True}, b"{}", {}, None, False
+                "req", account, {"stream": True, "model": "GLM-5.3-Flash"}, b"{}", {}, None, False
             )
 
         self.assertIs(response, gateway._NEXT_ACCOUNT)
-        self.assertEqual(account.status, "exhausted")
-        self.assertEqual(account.last_error, "每日額度已用完")
+        self.assertEqual(account.status, "active")
+        self.assertEqual(account.last_error, "GLM-5.3-Flash 每日額度已用完")
+        self.assertEqual(account.exhausted_models, ["glm-5.3-flash"])
+
+    async def test_http_503_cools_account_and_switches(self):
+        """上游 503 時帳號應進入冷卻，避免重複調用同一出口。"""
+        account = Account.create("zai", "unavailable", "header.payload.signature")
+        _SequenceClient.responses = [_SequenceResponse(503, '{"message":"upstream unavailable"}')]
+        _SequenceClient.calls = 0
+
+        with (
+            patch.object(gateway.httpx, "AsyncClient", _SequenceClient),
+            patch.object(gateway.store, "update_account"),
+        ):
+            response = await gateway._try_account(
+                "req", account, {"stream": True, "model": "GLM-5.3"}, b"{}", {}, None, False
+            )
+
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "cooling")
+        self.assertGreater(account.cooling_until or 0, 0)
 
 
 class _UsageResponse:

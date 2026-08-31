@@ -119,6 +119,7 @@ async def _fetch_quota_once(account: Account) -> dict:
         return {"balance": payload, "error": account.last_error}
 
     account.quota = quota_map
+    account.sync_exhausted_models()
     remainings = [
         quota.get("remaining") for quota in quota_map.values()
         if quota.get("remaining") is not None
@@ -127,10 +128,14 @@ async def _fetch_quota_once(account: Account) -> dict:
         account.status = Status.EXHAUSTED
         account.last_error = "額度已用完"
     else:
-        if account.status in (Status.EXHAUSTED, Status.COOLING, Status.INVALID):
+        if account.status in (Status.EXHAUSTED, Status.INVALID):
             account.status = Status.ACTIVE
             account.cooling_until = None
-        account.last_error = None
+        elif account.status == Status.COOLING and account.cooling_until and account.cooling_until <= time.time():
+            account.status = Status.ACTIVE
+            account.cooling_until = None
+        if account.status != Status.COOLING:
+            account.last_error = None
 
     store.update_account(account)
     return {"balance": payload}

@@ -23,6 +23,7 @@ from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
 from ..proxy import make_async_client
+from ..models import Status
 from ..store import store
 from ..usage import UsageCollector
 from .gateway import MAX_CAPTCHA_RETRIES, _is_captcha_error, _normalize_body
@@ -135,15 +136,17 @@ async def _process_ticket(ticket_id: str):
     body = ticket["body"]
     retries = 0
     announced_ready = False
+    tried: set[str] = set()
 
     while retries <= settings.ASYNC_MAX_RETRIES:
-        account = store.select("zai")
+        account = store.select("zai", skip_ids=tried, model=body.get("model"))
         if not account or account.mode != "jwt":
             await queue.put({
                 "type": "error",
                 "data": {"error": {"message": "无可用 OAuth 账号", "type": "no_account"}},
             })
             return
+        tried.add(account.id)
 
         actual_body = _normalize_body(body.copy(), needs_zcode_system=True)
         actual_payload = json.dumps(actual_body).encode("utf-8")
@@ -199,6 +202,11 @@ async def _process_ticket(ticket_id: str):
                             continue
 
                         if resp.status_code in (429, 503):
+                            account.fail_count += 1
+                            account.status = Status.COOLING
+                            account.cooling_until = time.time() + settings.COOLING_SECONDS
+                            account.last_error = f"上游服務暫時不可用 HTTP {resp.status_code}"
+                            store.update_account(account)
                             network_retry = True
                             last_network_error = text
                             break
