@@ -340,6 +340,55 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                 status_code=status_code,
             )
 
+        content_type = resp.headers.get("content-type", "application/json")
+        buffered_body = None
+        if "application/json" in content_type:
+            buffered_body = await resp.aread()
+            text = buffered_body.decode("utf-8", "ignore")
+            response_data = _safe_json(text)
+            code = response_data.get("code") if isinstance(response_data, dict) else None
+
+            # ZCode 的業務錯誤有時仍使用 HTTP 200，不能當成 Anthropic 成功回應。
+            if str(code) == "1005":
+                await cm.__aexit__(None, None, None)
+                await client.aclose()
+                _mark(account, Status.EXHAUSTED, "每日額度已用完")
+                logs.warn(req_id, f"帳號 {account.name} 每日額度用完，切換下一個")
+                asyncio.create_task(_safe_refresh(account))
+                return _NEXT_ACCOUNT
+
+            if needs_captcha and str(code) == "3007":
+                await cm.__aexit__(None, None, None)
+                await client.aclose()
+                captcha_manager.invalidate()
+                logs.warn(req_id, f"帳號 {account.name} 驗證碼失效，刷新重試（第 {attempt + 1} 次）")
+                if attempt + 1 >= MAX_CAPTCHA_RETRIES:
+                    return _captcha_required(req_id, "上游連續拒絕驗證碼")
+                continue
+
+            if code not in (None, 0, "0"):
+                await cm.__aexit__(None, None, None)
+                await client.aclose()
+                account.fail_count += 1
+                store.update_account(account)
+                message = str(response_data.get("msg") or response_data.get("message") or text[:500])
+                logs.req_err(req_id, f"上游業務錯誤 code={code}（帳號 {account.name}）")
+                return JSONResponse(
+                    {"error": {"message": message, "type": "upstream_error", "code": code}},
+                    status_code=502,
+                )
+
+            if body.get("stream"):
+                await cm.__aexit__(None, None, None)
+                await client.aclose()
+                account.fail_count += 1
+                store.update_account(account)
+                logs.req_err(req_id, f"上游串流請求返回非 SSE JSON（帳號 {account.name}）")
+                return JSONResponse(
+                    {"error": {"message": "上游未返回有效的 SSE 串流", "type": "invalid_upstream_response"}},
+                    status_code=502,
+                )
+
         # 成功：记录用量并流式透传
         account.use_count += 1
         account.last_used_at = time.time()
@@ -348,15 +397,18 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
         store.update_account(account)
         asyncio.create_task(_safe_refresh(account))
 
-        content_type = resp.headers.get("content-type", "application/json")
         # 調度統計：透傳時順手解析 usage；串流中斷則 usage 不完整，不計入
         usage = UsageCollector(is_sse="text/event-stream" in content_type)
 
         async def _body_iter():
             try:
-                async for chunk in resp.aiter_bytes():
-                    usage.feed(chunk)
-                    yield chunk
+                if buffered_body is not None:
+                    usage.feed(buffered_body)
+                    yield buffered_body
+                else:
+                    async for chunk in resp.aiter_bytes():
+                        usage.feed(chunk)
+                        yield chunk
                 usage.finish()
                 account.accumulate_tokens(usage.as_dict())
                 store.update_account(account)

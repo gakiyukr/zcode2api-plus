@@ -260,14 +260,17 @@ function quotaCell(a){
     const w=q[k]||{};const rem=Number(w.remaining)||0,tot=Number(w.total)||0;
     const pct=tot>0?Math.max(0,Math.min(100,Math.round(rem/tot*100))):0;
     const color=rem<=0?'#c9c9cf':(pct<15?'#b0632a':'#4c9168');
-    return `<div class="quota-row">
+    const period=w.period==='daily'?'每日':'當期';
+    const reset=w.period_end?` · 重置 ${fmtReset(w.period_end)}`:'';
+    return `<div class="quota-row" title="${esc(`${k} · ${period}配額${reset}`)}">
       <span class="quota-row-name">${esc(shortModel(k))}</span>
       <span class="quota-row-track"><span class="quota-row-fill" style="width:${pct}%;background:${color}"></span></span>
-      <span class="quota-row-val">${fmt(rem)} / ${fmt(tot)}</span>
+      <span class="quota-row-val">${period} ${fmtTokens(rem)} / ${fmtTokens(tot)}</span>
     </div>`;
   }).join('')+'</div>';
 }
 function shortModel(n){return String(n).replace(/^GLM[- ]?/i,'GLM-').slice(0,10)||n;}
+function fmtReset(ts){return new Date(Number(ts)*1000).toLocaleString('zh-TW',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
 
 function tokensCell(a){
   const t=a.total_tokens||{};

@@ -32,9 +32,13 @@ class GatewayCaptchaClassificationTests(unittest.TestCase):
 class _Response:
     status_code = 200
     headers = httpx.Headers({"content-type": "application/json"})
+    body = b'{"ok":true}'
+
+    async def aread(self):
+        return self.body
 
     async def aiter_bytes(self):
-        yield b'{"ok":true}'
+        yield self.body
 
 
 class _Context:
@@ -142,11 +146,35 @@ class GatewayCaptchaRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_SequenceClient.calls, 2)
         self.assertEqual(account.status, "active")
 
+    async def test_http_200_quota_error_marks_account_exhausted(self):
+        """上游以 HTTP 200 回傳 code 1005 時仍須切換帳號。"""
+        account = Account.create("zai", "quota", "header.payload.signature")
+        _SequenceClient.responses = [
+            _SequenceResponse(200, '{"code":1005,"msg":"exceed quota limit"}'),
+        ]
+        _SequenceClient.calls = 0
+
+        with (
+            patch.object(gateway.httpx, "AsyncClient", _SequenceClient),
+            patch.object(gateway.store, "update_account"),
+            patch.object(gateway.asyncio, "create_task", side_effect=lambda coroutine: coroutine.close()),
+        ):
+            response = await gateway._try_account(
+                "req", account, {"stream": True}, b"{}", {}, None, False
+            )
+
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "exhausted")
+        self.assertEqual(account.last_error, "每日額度已用完")
+
 
 class _UsageResponse:
     status_code = 200
     headers = httpx.Headers({"content-type": "application/json"})
     body = b'{"id":"msg_1","usage":{"input_tokens":11,"output_tokens":22}}'
+
+    async def aread(self):
+        return self.body
 
     async def aiter_bytes(self):
         yield self.body

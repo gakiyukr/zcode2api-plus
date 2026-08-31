@@ -11,6 +11,7 @@ import time
 import httpx
 
 from . import logs, settings
+from .device_identity import get_device_mid
 from .models import Account, Status
 from .proxy import make_async_client
 from .store import store
@@ -21,6 +22,9 @@ def _auth_headers(account: Account) -> dict:
         "Content-Type": "application/json",
         "User-Agent": settings.USER_AGENT,
         "X-ZCode-App-Version": settings.ZCODE_CLIENT_VERSION,
+        "X-Platform": settings.ZCODE_CLIENT_PLATFORM,
+        "X-Device-Mid": get_device_mid(),
+        "HTTP-Referer": "https://zcode.z.ai/",
     }
     if account.mode == "jwt" and account.jwt_token:
         headers["Authorization"] = f"Bearer {account.jwt_token}"
@@ -45,7 +49,10 @@ async def _fetch_quota_once(account: Account) -> dict:
             response = await client.get(
                 url,
                 headers=headers,
-                params={"app_version": settings.ZCODE_CLIENT_VERSION},
+                params={
+                    "app_version": settings.ZCODE_CLIENT_VERSION,
+                    "platform": settings.ZCODE_CLIENT_PLATFORM,
+                },
             )
     except httpx.HTTPError as err:
         account.last_error = f"额度查询网络错误: {err}"
@@ -82,13 +89,26 @@ async def _fetch_quota_once(account: Account) -> dict:
     balances = data.get("balances") or []
     account.plan = plans[0] if plans else {}
 
+    # balance 僅提供當期數值；週期名稱需從同一方案的 entitlement 合併。
+    entitlements = {
+        entitlement.get("entitlement_id"): entitlement
+        for plan in plans
+        for entitlement in (plan.get("entitlements") or [])
+        if isinstance(entitlement, dict) and entitlement.get("entitlement_id")
+    }
+
     quota_map: dict = {}
     for balance in balances:
         name = balance.get("show_name") or balance.get("model") or "model"
+        entitlement = entitlements.get(balance.get("entitlement_id"), {})
         quota_map[name] = {
             "total": balance.get("total_units"),
             "used": balance.get("used_units"),
             "remaining": balance.get("remaining_units"),
+            "available": balance.get("available_units"),
+            "period": entitlement.get("period"),
+            "period_start": balance.get("period_start"),
+            "period_end": balance.get("period_end"),
             "expires_at": balance.get("expires_at"),
         }
 
@@ -105,7 +125,7 @@ async def _fetch_quota_once(account: Account) -> dict:
     ]
     if remainings and all((remaining or 0) <= 0 for remaining in remainings):
         account.status = Status.EXHAUSTED
-        account.last_error = "额度已用完"
+        account.last_error = "額度已用完"
     else:
         if account.status in (Status.EXHAUSTED, Status.COOLING, Status.INVALID):
             account.status = Status.ACTIVE
