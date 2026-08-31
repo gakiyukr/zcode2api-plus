@@ -115,6 +115,7 @@ tr:hover td{background:#fdfdfd}
 .badge-jwt{color:#4c76b2;background:#f1f6fc}
 .badge-apiKey{color:#6d6d6d;background:#f7f7f7}
 .badge-trial{color:#b45309;background:#fff7ed;border:1px solid #fed7aa}
+.badge-model-disabled{color:#b42318;background:#fef3f2;border:1px solid #fecdca}
 
 /* 帳號辨識資訊 */
 .account-identity{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:3px;max-width:260px}
@@ -180,6 +181,14 @@ tr:hover td{background:#fdfdfd}
 .dialog-help{font-size:12px;color:var(--fg-muted);margin-bottom:2px}
 .dialog-field{display:flex;align-items:center;gap:10px}
 .dialog-label{width:54px;font-size:13px;color:var(--fg-muted);flex:0 0 auto}
+.dialog-field-models{align-items:flex-start}
+.model-toggle-wrap{min-width:0;flex:1;width:100%}
+.model-toggle-list{width:100%;max-height:210px;padding:8px;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;border:1px solid var(--border);border-radius:7px;background:#f9fafb}
+.model-toggle{min-width:0;min-height:31px;padding:6px 8px;display:flex;align-items:center;gap:7px;border:1px solid #eaecf0;border-radius:6px;background:#fff;color:#475467;font-size:11px;cursor:pointer}
+.model-toggle:hover{border-color:#b2ccff;background:#f5f8ff}
+.model-toggle input{width:14px;height:14px;accent-color:#2563eb;flex:0 0 auto}
+.model-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.model-toggle-wrap .dialog-help{margin-top:7px;margin-bottom:0}
 .dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
 .dialog-btn{height:34px;padding:0 16px;border-radius:999px;background:#fafafa;color:#444;font-size:13px;font-weight:600}
 .dialog-btn:hover{background:#f3f3f3}
@@ -327,3 +336,4 @@ body{background:var(--bg);color:var(--fg);overflow-x:hidden}
 .proxy-current-bar{max-width:1440px;min-height:64px;margin:0 auto 16px;padding:12px 16px;display:grid;grid-template-columns:32px minmax(220px,auto) minmax(0,1fr);align-items:center;gap:12px;border:1px solid var(--border);border-radius:7px;background:#fff}.proxy-current-icon{width:31px;height:31px;border-radius:7px;background:#f2f4f7;color:#667085;display:flex;align-items:center;justify-content:center}.proxy-current-icon i{width:8px;height:8px;border-radius:50%;background:currentColor}.proxy-current-bar>div{min-width:0}.proxy-current-bar>div span,.proxy-current-bar>div strong{display:block}.proxy-current-bar>div span{font-size:9px;color:#98a2b3}.proxy-current-bar>div strong{margin-top:3px;color:#344054;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.proxy-current-bar>small{justify-self:end;color:#98a2b3;font-size:10px;text-align:right}.proxy-current-bar.is-testing .proxy-current-icon{background:#eff6ff;color:#2563eb}.proxy-current-bar.is-success .proxy-current-icon{background:#ecfdf3;color:#16a34a}.proxy-current-bar.is-error .proxy-current-icon{background:#fef2f2;color:#dc2626}.account-route{display:inline-flex;align-items:center;gap:6px;color:#2563eb;font-size:11px;white-space:nowrap}.account-route i{width:6px;height:6px;border-radius:50%;background:#22c55e}.account-route-direct{color:#667085}.account-route-direct i{background:#98a2b3}
 @media (max-width:960px){.proxy-layout{grid-template-columns:1fr}}
 @media (max-width:600px){.proxy-current-bar{grid-template-columns:32px minmax(0,1fr)}.proxy-current-bar>small{grid-column:2;justify-self:start;text-align:left}.proxy-profile-row{align-items:flex-start;flex-wrap:wrap;padding:12px 0}.proxy-profile-copy{min-width:calc(100% - 50px)}.proxy-profile-scheme{margin-left:43px}.proxy-profile-status{margin-left:auto}.proxy-profile-actions{margin-left:auto}.proxy-select{width:100%}}
+@media (max-width:600px){.model-toggle-list{grid-template-columns:1fr;max-height:250px}}

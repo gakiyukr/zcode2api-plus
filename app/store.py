@@ -334,7 +334,12 @@ class Store:
                 "exported_at": time.time(),
                 "providers": {
                     p: [
-                        {"name": a.name, "mode": a.mode, "secret": a.secret}
+                        {
+                            "name": a.name,
+                            "mode": a.mode,
+                            "secret": a.secret,
+                            "disabled_models": a.disabled_models,
+                        }
                         for a in self._accounts[p]
                     ]
                     for p in PROVIDERS
@@ -351,7 +356,11 @@ class Store:
                 secret = it.get("secret") or it.get("token") or it.get("jwtToken") or it.get("apiKey")
                 if not secret:
                     continue
-                self.add_account(provider, it.get("name", provider), secret)
+                account = self.add_account(provider, it.get("name", provider), secret)
+                disabled_models = it.get("disabled_models")
+                if isinstance(disabled_models, list):
+                    account.set_disabled_models(disabled_models)
+                    self.update_account(account)
                 count += 1
         return count
 

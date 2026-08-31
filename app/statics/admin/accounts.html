@@ -138,6 +138,7 @@
       <div class="dialog-field"><span class="dialog-label">名稱</span><input class="input" id="edit-name"></div>
       <div class="dialog-field"><span class="dialog-label">Token</span><input class="input" id="edit-token" placeholder="留空則不修改"></div>
       <div class="dialog-field"><span class="dialog-label">出口線路</span><select class="input" id="edit-proxy-id"></select></div>
+      <div class="dialog-field dialog-field-models"><span class="dialog-label">停用模型</span><div class="model-toggle-wrap"><div class="model-toggle-list" id="edit-disabled-models"></div><div class="dialog-help">勾選後，此帳號不會參與該模型的任何調度。</div></div></div>
     </div>
     <div class="dialog-actions">
       <button onclick="closeModal('modal-edit')" class="dialog-btn">取消</button>
@@ -164,7 +165,7 @@
 <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/header.js?v={{APP_VERSION}}"></script>
 <script>
-let allAccounts=[],proxyProfiles=[],curFilter='all',_cb=null,_editId='',_timer=null;
+let allAccounts=[],proxyProfiles=[],availableModels=[],curFilter='all',_cb=null,_editId='',_timer=null;
 const refreshing=new Set();
 
 const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'異常',disabled:'停用'};
@@ -188,6 +189,7 @@ async function load(silent){
     const d=await api('GET','/accounts');
     allAccounts=d.accounts||[];
     proxyProfiles=d.proxies||[];
+    availableModels=d.models||[];
     renderStats(d.stats||{});
     renderFilters();
     renderTable();
@@ -243,8 +245,10 @@ function rowHtml(a){
   const identity=a.email||a.name||'未命名帳號';
   const nameHint=a.email&&a.name&&a.name!==a.email?`<small>${esc(a.name)}</small>`:'';
   const trialBadge=a.plan_is_trial||isTrialPlan(a.plan)?'<span class="badge badge-trial">體驗套餐</span>':'';
+  const disabledCount=(a.disabled_models||[]).length;
+  const disabledBadge=disabledCount?`<span class="badge badge-model-disabled" title="${escAttr((a.disabled_models||[]).join('、'))}">停用 ${disabledCount} 模型</span>`:'';
   return `<tr>
-    <td><span class="tok">${esc(a.token_masked)}</span><div class="account-identity"><strong>${esc(identity)}</strong>${nameHint}${trialBadge}</div></td>
+    <td><span class="tok">${esc(a.token_masked)}</span><div class="account-identity"><strong>${esc(identity)}</strong>${nameHint}${trialBadge}${disabledBadge}</div></td>
     <td class="table-center">${a.provider}</td>
     <td class="table-center"><span class="badge badge-${a.mode}">${isJwt?'JWT':'Key'}</span></td>
     <td class="table-center"><span class="badge badge-${a.status}">${STATUS_LABEL[a.status]||a.status}</span></td>
@@ -412,13 +416,25 @@ function openEdit(id){
   document.getElementById('edit-name').value=a.name;
   document.getElementById('edit-token').value='';
   fillProxySelect('edit-proxy-id',a.proxy_id,Boolean(a.proxy_url&&!a.proxy_id));
+  renderDisabledModelOptions(a);
   openModal('modal-edit');
+}
+function renderDisabledModelOptions(a){
+  const models=new Map();
+  [...availableModels,...Object.keys(a.quota||{}),...(a.disabled_models||[])].forEach(model=>{
+    const key=normalizeModel(model);if(key&&!models.has(key))models.set(key,String(model));
+  });
+  const disabled=new Set((a.disabled_models||[]).map(normalizeModel));
+  document.getElementById('edit-disabled-models').innerHTML=[...models].map(([key,label])=>
+    `<label class="model-toggle"><input type="checkbox" value="${escAttr(key)}" ${disabled.has(key)?'checked':''}><span>${esc(label)}</span></label>`
+  ).join('')||'<span class="quota-empty">尚無可設定模型</span>';
 }
 async function doEdit(){
   const name=document.getElementById('edit-name').value.trim();
   const token=document.getElementById('edit-token').value.trim();
   const selectedProxy=document.getElementById('edit-proxy-id').value;
-  const payload={name,...(token&&{token})};
+  const disabled_models=[...document.querySelectorAll('#edit-disabled-models input:checked')].map(input=>input.value);
+  const payload={name,disabled_models,...(token&&{token})};
   if(selectedProxy!=='__legacy__')payload.proxy_id=selectedProxy||null;
   try{
     await api('PUT','/accounts/'+_editId,payload);
@@ -484,6 +500,8 @@ function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
 function fmt(n){n=Number(n)||0;return n>=10000?(n/1000).toFixed(1)+'k':n;}
 function fmtTokens(n){n=Number(n)||0;if(n>=1e9)return (n/1e9).toFixed(2)+'B';if(n>=1e6)return (n/1e6).toFixed(2)+'M';if(n>=1e3)return (n/1e3).toFixed(1)+'k';return String(n);}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function escAttr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function normalizeModel(model){return String(model||'').trim().toLowerCase().replace(/[_ ]/g,'-').replace(/-+/g,'-');}
 function fmtDate(d){if(!d)return'—';const dt=new Date(d*1000);return isNaN(dt)?'—':dt.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
 function openModal(id){document.getElementById(id).classList.add('open');}
 function closeModal(id){document.getElementById(id).classList.remove('open');}

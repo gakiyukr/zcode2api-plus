@@ -57,6 +57,36 @@ class ModelAwareSelectionTests(unittest.TestCase):
         self.assertEqual(restored.exhausted_models, ["glm-5.3-flash"])
         self.assertEqual(restored.model_availability("GLM-5.3-Flash"), "exhausted")
 
+    def test_manual_model_disable_overrides_positive_quota(self):
+        """手動停用模型後，即使仍有餘額也不得選中該帳號。"""
+        disabled = self.store.add_account("zai", "disabled-model", "disabled-model-key")
+        fallback = self.store.add_account("zai", "fallback", "fallback-key")
+        disabled.quota = {"GLM-5.3": {"remaining": 1_000}}
+        fallback.quota = {"GLM-5.3": {"remaining": 500}}
+        disabled.set_disabled_models(["GLM_5.3", "glm-5.3"])
+
+        self.assertEqual(disabled.disabled_models, ["glm-5.3"])
+        self.assertEqual(disabled.model_availability("GLM-5.3"), "disabled")
+        self.assertIs(self.store.select("zai", model="GLM-5.3"), fallback)
+
+    def test_manual_model_disable_survives_export_and_import(self):
+        """帳號匯出再匯入後，手動停用模型設定必須保留。"""
+        account = self.store.add_account("zai", "portable", "portable-key")
+        account.set_disabled_models(["GLM-5.3", "GLM-5-Turbo"])
+        self.store.update_account(account)
+        payload = self.store.export()
+
+        imported_temp = tempfile.TemporaryDirectory()
+        try:
+            settings.DATA_DIR = Path(imported_temp.name)
+            settings.DB_PATH = settings.DATA_DIR / "accounts.db"
+            imported_store = Store()
+            imported_store.import_accounts(payload)
+            restored = imported_store.list_accounts("zai")[0]
+            self.assertEqual(restored.disabled_models, ["glm-5.3", "glm-5-turbo"])
+        finally:
+            imported_temp.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

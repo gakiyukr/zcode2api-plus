@@ -83,6 +83,7 @@ class Account:
     # 额度快照：{ model_show_name: {total, used, remaining, expires_at} }
     quota: dict = field(default_factory=dict)
     exhausted_models: list[str] = field(default_factory=list)
+    disabled_models: list[str] = field(default_factory=list)
     plan: dict = field(default_factory=dict)        # 当前激活方案
     usage: dict = field(default_factory=dict)       # 近期用量原始数据
 
@@ -140,10 +141,12 @@ class Account:
         return None
 
     def model_availability(self, model: object) -> str:
-        """回傳 available、exhausted 或 unknown，避免把未知額度誤判為用完。"""
+        """回傳模型可用狀態，手動停用優先於官方額度快照。"""
         target = normalize_model_name(model)
         if not target:
             return "unknown"
+        if target in {normalize_model_name(name) for name in self.disabled_models}:
+            return "disabled"
         if target in {normalize_model_name(name) for name in self.exhausted_models}:
             return "exhausted"
         quota = self.quota_for_model(target)
@@ -156,7 +159,12 @@ class Account:
 
     def is_model_selectable(self, model: object, now: float | None = None) -> bool:
         """帳號全局可用且指定模型未耗盡時才允許調度。"""
-        return self.is_selectable(now) and self.model_availability(model) != "exhausted"
+        return self.is_selectable(now) and self.model_availability(model) in ("available", "unknown")
+
+    def set_disabled_models(self, models: list[object]) -> None:
+        """保存手動停用模型，正規化並去除空值與重複項。"""
+        normalized = [normalize_model_name(model) for model in models]
+        self.disabled_models = list(dict.fromkeys(model for model in normalized if model))
 
     def mark_model_exhausted(self, model: object) -> bool:
         """記錄單一模型已耗盡；無模型名稱時無法安全建立標記。"""
@@ -218,6 +226,7 @@ class Account:
             "status": self.effective_status(),
             "quota": self.quota,
             "exhausted_models": self.exhausted_models,
+            "disabled_models": self.disabled_models,
             "plan": self.plan,
             "plan_name": _plan_text(self.plan),
             "plan_is_trial": _is_trial_plan(self.plan),

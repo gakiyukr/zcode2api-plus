@@ -17,6 +17,7 @@ from ..oauth import ZaiAuthFlow, extract_user_email
 from ..proxy import make_async_client, normalize_proxy_url
 from ..quota import fetch_quota, refresh_accounts
 from ..store import store
+from .gateway import AVAILABLE_MODELS
 
 router = APIRouter(prefix="/admin/api", dependencies=[Depends(verify_admin_key)])
 
@@ -70,6 +71,7 @@ async def list_accounts():
         "accounts": accounts,
         "stats": stats,
         "providers": list(PROVIDERS),
+        "models": AVAILABLE_MODELS,
         "proxies": store.list_proxy_profiles(),
         "ts": time.time(),
     }
@@ -420,6 +422,15 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
         if proxy_url != acc.proxy_url:
             acc.proxy_id = None
         acc.proxy_url = proxy_url
+    if "disabled_models" in payload:
+        disabled_models = payload.get("disabled_models")
+        if not isinstance(disabled_models, list):
+            raise HTTPException(400, "停用模型必須是陣列")
+        if len(disabled_models) > 64:
+            raise HTTPException(400, "停用模型數量過多")
+        if any(not isinstance(model, str) or len(model.strip()) > 100 for model in disabled_models):
+            raise HTTPException(400, "停用模型格式無效")
+        acc.set_disabled_models(disabled_models)
     store.update_account(acc)
     if has_profile:
         store.assign_proxy_profile(acc.id, profile_id)
