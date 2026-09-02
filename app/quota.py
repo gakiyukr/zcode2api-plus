@@ -37,6 +37,43 @@ _QUOTA_CACHE_TTL_SECONDS = 15.0
 _quota_inflight: dict[str, asyncio.Task[dict]] = {}
 _quota_cache: dict[str, tuple[float, dict]] = {}
 
+_SUM_FIELDS = ("total", "used", "remaining", "available")
+_EARLIEST_FIELDS = ("period_start", "period_end", "expires_at")
+
+
+def _sum_units(current: object, incoming: object):
+    """數值額度合併：任一端缺值時保留另一端，避免 None 參與加總。"""
+    if current is None:
+        return incoming
+    if incoming is None:
+        return current
+    return current + incoming
+
+
+def _earliest_ts(current: object, incoming: object):
+    """週期時間合併取最早者，作為額度恢復或到期的保守估計。"""
+    if current is None:
+        return incoming
+    if incoming is None:
+        return current
+    try:
+        return min(current, incoming)
+    except TypeError:
+        return current
+
+
+def _merge_quota_entry(current: dict | None, incoming: dict) -> dict:
+    """同名模型出現在多個訂閱時，合併為單一加總快照而非互相覆蓋。"""
+    if current is None:
+        return incoming
+    for key in _SUM_FIELDS:
+        current[key] = _sum_units(current.get(key), incoming.get(key))
+    for key in _EARLIEST_FIELDS:
+        current[key] = _earliest_ts(current.get(key), incoming.get(key))
+    periods = {period for period in (current.get("period"), incoming.get("period")) if period}
+    current["period"] = "+".join(sorted(periods)) or None
+    return current
+
 
 async def _fetch_quota_once(account: Account) -> dict:
     """拉取官方客户端使用的套餐与模型余额，写回账号状态并持久化。"""
@@ -87,7 +124,8 @@ async def _fetch_quota_once(account: Account) -> dict:
     data = payload.get("data") or {}
     plans = data.get("plans") or []
     balances = data.get("balances") or []
-    account.plan = plans[0] if plans else {}
+    account.plans = [plan for plan in plans if isinstance(plan, dict)]
+    account.plan = account.plans[0] if account.plans else {}
 
     # balance 僅提供當期數值；週期名稱需從同一方案的 entitlement 合併。
     entitlements = {
@@ -101,7 +139,7 @@ async def _fetch_quota_once(account: Account) -> dict:
     for balance in balances:
         name = balance.get("show_name") or balance.get("model") or "model"
         entitlement = entitlements.get(balance.get("entitlement_id"), {})
-        quota_map[name] = {
+        quota_map[name] = _merge_quota_entry(quota_map.get(name), {
             "total": balance.get("total_units"),
             "used": balance.get("used_units"),
             "remaining": balance.get("remaining_units"),
@@ -110,7 +148,7 @@ async def _fetch_quota_once(account: Account) -> dict:
             "period_start": balance.get("period_start"),
             "period_end": balance.get("period_end"),
             "expires_at": balance.get("expires_at"),
-        }
+        })
 
     if not quota_map:
         account.quota = {}

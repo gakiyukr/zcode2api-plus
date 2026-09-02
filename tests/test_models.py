@@ -48,3 +48,20 @@ class AccountIdentityTests(unittest.TestCase):
         account.plan = {"entitlements": [{"plan_type": "trial"}]}
 
         self.assertTrue(account.public_view()["plan_is_trial"])
+
+    def test_plan_view_covers_all_subscriptions(self):
+        """多訂閱帳號的方案名稱應串接，體驗判定須涵蓋每一筆訂閱。"""
+        account = Account.create("zai", "multi-plan", "header.payload.signature")
+        account.plans = [
+            {"plan_id": "global-build", "name": "ZCode Global Build"},
+            {"plan_id": "start-plan", "name": "ZCode Start Plan"},
+        ]
+        account.plan = account.plans[0]
+
+        view = account.public_view()
+
+        self.assertEqual(view["plan_name"], "ZCode Global Build / ZCode Start Plan")
+        self.assertFalse(view["plan_is_trial"])
+
+        account.plans.append({"plan_id": "trial", "name": "體驗套餐"})
+        self.assertTrue(account.public_view()["plan_is_trial"])

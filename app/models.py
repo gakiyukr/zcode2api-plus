@@ -35,8 +35,11 @@ def normalize_model_name(model: object) -> str:
     return value
 
 
-def _plan_text(plan: dict) -> str:
-    """從官方方案資料取出可供辨識的名稱。"""
+def _plan_text(plan: dict | list) -> str:
+    """從官方方案資料取出可供辨識的名稱，多方案時去重後以「 / 」串接。"""
+    if isinstance(plan, list):
+        names = [name for item in plan if (name := _plan_text(item))]
+        return " / ".join(dict.fromkeys(names))
     if not isinstance(plan, dict):
         return ""
     for key in ("plan_name", "display_name", "show_name", "name", "title", "plan_type", "plan_id"):
@@ -84,7 +87,8 @@ class Account:
     quota: dict = field(default_factory=dict)
     exhausted_models: list[str] = field(default_factory=list)
     disabled_models: list[str] = field(default_factory=list)
-    plan: dict = field(default_factory=dict)        # 当前激活方案
+    plan: dict = field(default_factory=dict)        # 主要方案（第一個訂閱）
+    plans: list[dict] = field(default_factory=list)  # 帳號下全部訂閱方案
     usage: dict = field(default_factory=dict)       # 近期用量原始数据
 
     use_count: int = 0
@@ -228,8 +232,9 @@ class Account:
             "exhausted_models": self.exhausted_models,
             "disabled_models": self.disabled_models,
             "plan": self.plan,
-            "plan_name": _plan_text(self.plan),
-            "plan_is_trial": _is_trial_plan(self.plan),
+            "plans": self.plans,
+            "plan_name": _plan_text(self.plans or self.plan),
+            "plan_is_trial": _is_trial_plan(self.plans or self.plan),
             "use_count": self.use_count,
             "fail_count": self.fail_count,
             "total_tokens": {
