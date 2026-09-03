@@ -182,7 +182,10 @@ def _mark_model_exhausted(account: Account, model: object, error: str) -> None:
     if not account.mark_model_exhausted(model):
         _mark(account, Status.EXHAUSTED, error)
         return
-    states = [account.model_availability(name) for name in account.quota]
+    states = [
+        account.model_availability(quota.get("model") or name)
+        for name, quota in account.quota.items()
+    ]
     account.status = Status.EXHAUSTED if states and all(state == "exhausted" for state in states) else Status.ACTIVE
     account.cooling_until = None
     account.last_error = error

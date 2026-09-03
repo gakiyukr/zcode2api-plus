@@ -12,7 +12,7 @@ import httpx
 
 from . import logs, settings
 from .device_identity import get_device_mid
-from .models import Account, Status
+from .models import Account, Status, is_trial_plan, plan_text
 from .proxy import make_async_client
 from .store import store
 
@@ -127,19 +127,27 @@ async def _fetch_quota_once(account: Account) -> dict:
     account.plans = [plan for plan in plans if isinstance(plan, dict)]
     account.plan = account.plans[0] if account.plans else {}
 
-    # balance 僅提供當期數值；週期名稱需從同一方案的 entitlement 合併。
-    entitlements = {
-        entitlement.get("entitlement_id"): entitlement
-        for plan in plans
-        for entitlement in (plan.get("entitlements") or [])
-        if isinstance(entitlement, dict) and entitlement.get("entitlement_id")
-    }
+    # balance 僅提供當期數值；週期與所屬方案需由 entitlement 對應回來。
+    entitlements: dict[str, dict] = {}
+    entitlement_plans: dict[str, dict] = {}
+    for plan in account.plans:
+        for entitlement in (plan.get("entitlements") or []):
+            if isinstance(entitlement, dict) and entitlement.get("entitlement_id"):
+                entitlements[entitlement["entitlement_id"]] = entitlement
+                entitlement_plans[entitlement["entitlement_id"]] = plan
 
+    # 同名模型在多個訂閱各自獨立一列（每日刷新的體驗套餐與限時活動套餐不得混合）；
+    # 僅同一訂閱內的重複項目才合併加總。
+    multi_plan = len(account.plans) > 1
     quota_map: dict = {}
     for balance in balances:
         name = balance.get("show_name") or balance.get("model") or "model"
-        entitlement = entitlements.get(balance.get("entitlement_id"), {})
-        quota_map[name] = _merge_quota_entry(quota_map.get(name), {
+        entitlement_id = balance.get("entitlement_id")
+        entitlement = entitlements.get(entitlement_id, {})
+        plan = entitlement_plans.get(entitlement_id)
+        plan_name = plan_text(plan) if (multi_plan and plan) else ""
+        key = f"{name} · {plan_name}" if plan_name else name
+        quota_map[key] = _merge_quota_entry(quota_map.get(key), {
             "total": balance.get("total_units"),
             "used": balance.get("used_units"),
             "remaining": balance.get("remaining_units"),
@@ -148,6 +156,9 @@ async def _fetch_quota_once(account: Account) -> dict:
             "period_start": balance.get("period_start"),
             "period_end": balance.get("period_end"),
             "expires_at": balance.get("expires_at"),
+            "model": name,
+            "plan_name": plan_name,
+            "plan_is_trial": is_trial_plan(plan) if plan else False,
         })
 
     if not quota_map:

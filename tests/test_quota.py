@@ -172,8 +172,8 @@ class QuotaQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account.exhausted_models, ["glm-5.3-flash"])
 
 
-    async def test_same_model_across_plans_is_summed(self):
-        """同名模型出現在多個訂閱時，額度應加總為單一快照而非互相覆蓋。"""
+    async def test_same_model_across_plans_stays_independent(self):
+        """同名模型在多個訂閱下各自獨立一列，並標記所屬方案與體驗身份。"""
         account = Account.create("zai", "multi", "header.payload.signature")
         _QuotaClient.calls = []
         _QuotaClient.payload = _multi_plan_payload()
@@ -188,15 +188,25 @@ class QuotaQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(account.plans), 2)
         view = account.public_view()
         self.assertEqual(view["plan_name"], "ZCode Global Build / ZCode Start Plan")
-        merged = account.quota["GLM-5.3-Flash"]
-        self.assertEqual(merged["total"], 105_000_000)
-        self.assertEqual(merged["used"], 45_000_000)
-        self.assertEqual(merged["remaining"], 60_000_000)
-        self.assertEqual(merged["period"], "daily+monthly")
-        self.assertEqual(merged["period_end"], 1_788_191_999)  # 重置時間取最早
-        # 單一訂閱耗盡但加總後仍有餘額，模型不得被標記為耗盡
+        self.assertEqual(sorted(account.quota), [
+            "GLM-5.3-Flash · ZCode Global Build",
+            "GLM-5.3-Flash · ZCode Start Plan",
+        ])
+        gb = account.quota["GLM-5.3-Flash · ZCode Global Build"]
+        sp = account.quota["GLM-5.3-Flash · ZCode Start Plan"]
+        self.assertEqual(gb["total"], 100_000_000)
+        self.assertEqual(gb["remaining"], 60_000_000)
+        self.assertEqual(gb["period"], "monthly")
+        self.assertEqual(gb["model"], "GLM-5.3-Flash")
+        self.assertEqual(gb["plan_name"], "ZCode Global Build")
+        self.assertFalse(gb["plan_is_trial"])
+        self.assertEqual(sp["remaining"], 0)
+        self.assertEqual(sp["period"], "daily")
+        self.assertEqual(sp["period_end"], 1_788_191_999)  # 各列保留自身重置時間
+        # 任一訂閱仍有餘額，模型與帳號皆不得視為耗盡
         self.assertEqual(account.exhausted_models, [])
         self.assertEqual(account.status, Status.ACTIVE)
+        self.assertEqual(account.model_availability("GLM-5.3-Flash"), "available")
 
 
 if __name__ == "__main__":

@@ -281,8 +281,11 @@ function quotaCell(a){
     const color=rem<=0?'#c9c9cf':(pct<15?'#b0632a':'#4c9168');
     const period=w.period==='daily'?'每日':'當期';
     const reset=w.period_end?` · 重置 ${fmtReset(w.period_end)}`:'';
+    const model=esc((w&&w.model)||k);
+    const trialTag=w.plan_is_trial?'<em class="quota-row-trial">體驗</em>':'';
+    const planTag=w.plan_name?`<span class="quota-row-plan">${esc(w.plan_name)}</span>`:'';
     return `<div class="quota-row" title="${esc(`${k} · ${period}配額${reset}`)}">
-      <span class="quota-row-name">${esc(k)}</span>
+      <span class="quota-row-name"><span class="quota-row-title">${model}${trialTag}</span>${planTag}</span>
       <span class="quota-row-track"><span class="quota-row-fill" style="width:${pct}%;background:${color}"></span></span>
       <span class="quota-row-val">${period} ${fmtTokens(rem)} / ${fmtTokens(tot)}</span>
     </div>`;
@@ -421,7 +424,8 @@ function openEdit(id){
 }
 function renderDisabledModelOptions(a){
   const models=new Map();
-  [...availableModels,...Object.keys(a.quota||{}),...(a.disabled_models||[])].forEach(model=>{
+  const quotaModels=Object.entries(a.quota||{}).map(([k,w])=>(w&&w.model)||k);
+  [...availableModels,...quotaModels,...(a.disabled_models||[])].forEach(model=>{
     const key=normalizeModel(model);if(key&&!models.has(key))models.set(key,String(model));
   });
   const disabled=new Set((a.disabled_models||[]).map(normalizeModel));

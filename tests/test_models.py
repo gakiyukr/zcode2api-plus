@@ -65,3 +65,31 @@ class AccountIdentityTests(unittest.TestCase):
 
         account.plans.append({"plan_id": "trial", "name": "體驗套餐"})
         self.assertTrue(account.public_view()["plan_is_trial"])
+
+
+class ModelAvailabilityTests(unittest.TestCase):
+    def test_availability_spans_all_plan_rows(self):
+        """同名模型存在多訂閱額度列時，任一列有餘額即視為可用。"""
+        account = Account.create("zai", "rows", "header.payload.signature")
+        account.quota = {
+            "GLM-5.3-Flash · Global": {"model": "GLM-5.3-Flash", "remaining": 100},
+            "GLM-5.3-Flash · Start": {"model": "GLM-5.3-Flash", "remaining": 0},
+        }
+        account.sync_exhausted_models()
+
+        self.assertEqual(account.model_availability("GLM-5.3-Flash"), "available")
+        self.assertEqual(account.exhausted_models, [])
+
+        account.quota["GLM-5.3-Flash · Global"]["remaining"] = 0
+        account.sync_exhausted_models()
+
+        self.assertEqual(account.model_availability("GLM-5.3-Flash"), "exhausted")
+        self.assertEqual(account.exhausted_models, ["glm-5.3-flash"])
+
+    def test_legacy_quota_snapshot_without_model_field(self):
+        """舊版快照（鍵即模型名、無 model 欄位）仍可正確比對額度。"""
+        account = Account.create("zai", "legacy", "header.payload.signature")
+        account.quota = {"GLM-5.3-Flash": {"remaining": 5}}
+
+        self.assertEqual(account.quota_entries_for_model("glm-5.3-flash"), [{"remaining": 5}])
+        self.assertEqual(account.model_availability("GLM-5.3-Flash"), "available")

@@ -135,9 +135,13 @@ tr:hover td{background:#fdfdfd}
 .quota-plan-badge{margin-bottom:6px}
 .quota-rows{display:flex;flex-direction:column;gap:7px;min-width:300px;max-width:380px}
 .quota-row{display:grid;grid-template-columns:minmax(120px,max-content) minmax(60px,1fr) auto;align-items:center;gap:10px}
-.quota-row-name{font-size:11px;font-weight:600;color:#6a6a6a;white-space:nowrap}
+.quota-row-name{font-size:11px;font-weight:600;color:#6a6a6a;white-space:nowrap;display:flex;flex-direction:column;line-height:1.35}
+.quota-row-title{display:inline-flex;align-items:center;gap:4px}
+.quota-row-plan{font-size:9px;font-weight:500;color:#98a2b3;max-width:170px;overflow:hidden;text-overflow:ellipsis}
+.quota-row-trial{font-style:normal;font-size:9px;font-weight:600;color:#b0632a;border:1px solid currentColor;border-radius:4px;padding:0 3px;line-height:1.5}
 .quota-row-track{height:6px;border-radius:999px;background:#eef0ee;overflow:hidden}
-.quota-row-fill{height:100%;border-radius:999px;transition:width .3s}
+/* span 預設為 inline，width 不生效會讓進度條永遠空白，必須 block 化 */
+.quota-row-fill{display:block;height:100%;border-radius:999px;transition:width .3s}
 .quota-row-val{font-size:11px;color:#9a9a9a;white-space:nowrap;font-variant-numeric:tabular-nums}
 .quota-reset{font-size:11px;color:#b0a99c;margin-top:1px}
 .quota-empty{font-size:12px;color:#bbb}

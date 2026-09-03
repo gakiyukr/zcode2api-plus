@@ -35,10 +35,10 @@ def normalize_model_name(model: object) -> str:
     return value
 
 
-def _plan_text(plan: dict | list) -> str:
+def plan_text(plan: dict | list) -> str:
     """從官方方案資料取出可供辨識的名稱，多方案時去重後以「 / 」串接。"""
     if isinstance(plan, list):
-        names = [name for item in plan if (name := _plan_text(item))]
+        names = [name for item in plan if (name := plan_text(item))]
         return " / ".join(dict.fromkeys(names))
     if not isinstance(plan, dict):
         return ""
@@ -49,12 +49,12 @@ def _plan_text(plan: dict | list) -> str:
     return ""
 
 
-def _is_trial_plan(plan: object, depth: int = 0) -> bool:
+def is_trial_plan(plan: object, depth: int = 0) -> bool:
     """辨識官方回傳的體驗、試用或免費方案，缺少標記時以方案名稱補判。"""
     if depth > 6:
         return False
     if isinstance(plan, list):
-        return any(_is_trial_plan(item, depth + 1) for item in plan)
+        return any(is_trial_plan(item, depth + 1) for item in plan)
     if not isinstance(plan, dict):
         return False
     markers = ("trial", "free", "experience", "體驗", "试用", "試用")
@@ -62,7 +62,7 @@ def _is_trial_plan(plan: object, depth: int = 0) -> bool:
         normalized = str(key).replace("_", "").replace("-", "").lower()
         if normalized in {"istrial", "trial", "isfree", "free", "isexperience", "trialplan"} and value is True:
             return True
-        if isinstance(value, (dict, list)) and _is_trial_plan(value, depth + 1):
+        if isinstance(value, (dict, list)) and is_trial_plan(value, depth + 1):
             return True
         if any(marker in str(value or "").lower() for marker in markers):
             return True
@@ -134,18 +134,22 @@ class Account:
             return bool(self.cooling_until and now >= self.cooling_until)
         return True
 
-    def quota_for_model(self, model: object) -> dict | None:
-        """取得請求模型對應的額度；無法精確比對時回傳未知。"""
+    def quota_entries_for_model(self, model: object) -> list[dict]:
+        """取得請求模型在所有訂閱下的額度列；相容舊版（鍵即模型名）快照。"""
         target = normalize_model_name(model)
         if not target:
-            return None
+            return []
+        entries = []
         for name, quota in self.quota.items():
-            if normalize_model_name(name) == target and isinstance(quota, dict):
-                return quota
-        return None
+            if not isinstance(quota, dict):
+                continue
+            entry_model = quota.get("model") or name
+            if normalize_model_name(entry_model) == target:
+                entries.append(quota)
+        return entries
 
     def model_availability(self, model: object) -> str:
-        """回傳模型可用狀態，手動停用優先於官方額度快照。"""
+        """回傳模型可用狀態：手動停用優先，任一訂閱仍有餘額即為可用。"""
         target = normalize_model_name(model)
         if not target:
             return "unknown"
@@ -153,13 +157,18 @@ class Account:
             return "disabled"
         if target in {normalize_model_name(name) for name in self.exhausted_models}:
             return "exhausted"
-        quota = self.quota_for_model(target)
-        if quota is None or quota.get("remaining") is None:
+        remainings = []
+        for quota in self.quota_entries_for_model(target):
+            remaining = quota.get("remaining")
+            if remaining is None:
+                continue
+            try:
+                remainings.append(float(remaining))
+            except (TypeError, ValueError):
+                continue
+        if not remainings:
             return "unknown"
-        try:
-            return "available" if float(quota["remaining"]) > 0 else "exhausted"
-        except (TypeError, ValueError):
-            return "unknown"
+        return "available" if any(value > 0 for value in remainings) else "exhausted"
 
     def is_model_selectable(self, model: object, now: float | None = None) -> bool:
         """帳號全局可用且指定模型未耗盡時才允許調度。"""
@@ -181,17 +190,21 @@ class Account:
         return True
 
     def sync_exhausted_models(self) -> None:
-        """以最新官方額度快照同步已耗盡模型，正額度模型會自動恢復。"""
-        exhausted = []
-        for model, quota in self.quota.items():
+        """以最新官方額度快照同步已耗盡模型；任一訂閱仍有餘額即自動恢復。"""
+        remainings: dict[str, list[float]] = {}
+        for name, quota in self.quota.items():
             if not isinstance(quota, dict) or quota.get("remaining") is None:
                 continue
             try:
-                if float(quota["remaining"]) <= 0:
-                    exhausted.append(normalize_model_name(model))
+                value = float(quota["remaining"])
             except (TypeError, ValueError):
                 continue
-        self.exhausted_models = list(dict.fromkeys(exhausted))
+            model = normalize_model_name(quota.get("model") or name)
+            remainings.setdefault(model, []).append(value)
+        self.exhausted_models = [
+            model for model, values in remainings.items()
+            if values and all(value <= 0 for value in values)
+        ]
 
     def accumulate_tokens(self, usage: dict) -> None:
         """累加一次成功回應的 token 用量（鍵與 UsageCollector.as_dict 一致）。"""
@@ -233,8 +246,8 @@ class Account:
             "disabled_models": self.disabled_models,
             "plan": self.plan,
             "plans": self.plans,
-            "plan_name": _plan_text(self.plans or self.plan),
-            "plan_is_trial": _is_trial_plan(self.plans or self.plan),
+            "plan_name": plan_text(self.plans or self.plan),
+            "plan_is_trial": is_trial_plan(self.plans or self.plan),
             "use_count": self.use_count,
             "fail_count": self.fail_count,
             "total_tokens": {
