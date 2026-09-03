@@ -57,6 +57,25 @@ class ModelAwareSelectionTests(unittest.TestCase):
         self.assertEqual(restored.exhausted_models, ["glm-5.3-flash"])
         self.assertEqual(restored.model_availability("GLM-5.3-Flash"), "exhausted")
 
+    def test_selection_excludes_accounts_without_model_entitlement(self):
+        """快照中未提供此模型的帳號，不得再收到該模型的請求。"""
+        has_flash = self.store.add_account("zai", "has-flash", "has-flash-key")
+        only_53 = self.store.add_account("zai", "only-53", "only-53-key")
+        has_flash.quota = {
+            "GLM-5.3": {"model": "GLM-5.3", "remaining": 100},
+            "GLM-5.3-Flash": {"model": "GLM-5.3-Flash", "remaining": 50},
+        }
+        only_53.quota = {"GLM-5.3": {"model": "GLM-5.3", "remaining": 100}}
+
+        self.assertEqual(only_53.model_availability("GLM-5.3-Flash"), "absent")
+        self.assertEqual(only_53.model_availability("GLM-5.3"), "available")
+        # 有 5.3-Flash 額度的帳號優先承接 5.3-Flash 請求
+        self.assertIs(self.store.select("zai", model="GLM-5.3-Flash"), has_flash)
+        # 僅有 5.3 額度的帳號仍可服務 5.3 請求
+        self.assertIs(self.store.select("zai", skip_ids={has_flash.id}, model="GLM-5.3"), only_53)
+        # 所有帳號都不提供此模型時直接拒絕，不得回退亂派
+        self.assertIsNone(self.store.select("zai", skip_ids={has_flash.id}, model="GLM-5.3-Flash"))
+
     def test_manual_model_disable_overrides_positive_quota(self):
         """手動停用模型後，即使仍有餘額也不得選中該帳號。"""
         disabled = self.store.add_account("zai", "disabled-model", "disabled-model-key")

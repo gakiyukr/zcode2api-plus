@@ -149,7 +149,11 @@ class Account:
         return entries
 
     def model_availability(self, model: object) -> str:
-        """回傳模型可用狀態：手動停用優先，任一訂閱仍有餘額即為可用。"""
+        """回傳模型可用狀態：available / exhausted / disabled / absent / unknown。
+
+        absent 表示額度快照已取得但未提供此模型，調度時應跳過；
+        unknown 僅用於尚無快照（如 apiKey 帳號或未抓過額度）無法判斷的帳號。
+        """
         target = normalize_model_name(model)
         if not target:
             return "unknown"
@@ -157,8 +161,9 @@ class Account:
             return "disabled"
         if target in {normalize_model_name(name) for name in self.exhausted_models}:
             return "exhausted"
+        entries = self.quota_entries_for_model(target)
         remainings = []
-        for quota in self.quota_entries_for_model(target):
+        for quota in entries:
             remaining = quota.get("remaining")
             if remaining is None:
                 continue
@@ -166,9 +171,12 @@ class Account:
                 remainings.append(float(remaining))
             except (TypeError, ValueError):
                 continue
-        if not remainings:
+        if remainings:
+            return "available" if any(value > 0 for value in remainings) else "exhausted"
+        # 有額度列但缺數值無法判斷；連列都沒有時，已有快照即代表不提供此模型
+        if entries:
             return "unknown"
-        return "available" if any(value > 0 for value in remainings) else "exhausted"
+        return "absent" if self.quota else "unknown"
 
     def is_model_selectable(self, model: object, now: float | None = None) -> bool:
         """帳號全局可用且指定模型未耗盡時才允許調度。"""

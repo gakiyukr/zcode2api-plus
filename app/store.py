@@ -305,7 +305,11 @@ class Store:
         skip_ids: set[str] | None = None,
         model: str | None = None,
     ) -> Account | None:
-        """按模型額度與 round-robin 選擇帳號，未知額度僅作後備。"""
+        """按模型額度與 round-robin 選擇帳號。
+
+        有該模型餘額的帳號優先；尚無快照無法判斷者僅作後備；
+        快照中未提供此模型（absent）的帳號一律排除。
+        """
         skip_ids = skip_ids or set()
         now = time.time()
         with self._lock:

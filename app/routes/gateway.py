@@ -249,9 +249,15 @@ async def messages(request: Request):
             continue
         return result
 
-    logs.req_err(req_id, "无可用账号 / 额度均已耗尽")
+    model_name = body.get("model")
+    if model_name:
+        logs.req_err(req_id, f"模型 {model_name} 無可用帳號（未提供此模型或額度已用完）")
+        message = f"模型 {model_name} 目前無可用帳號（帳號未提供此模型或額度已用完），請在後台檢查帳號狀態"
+    else:
+        logs.req_err(req_id, "无可用账号 / 额度均已耗尽")
+        message = "所有账号均不可用或额度已用完，请在后台检查账号状态"
     return JSONResponse(
-        {"error": {"message": "所有账号均不可用或额度已用完，请在后台检查账号状态", "type": "no_available_account"}},
+        {"error": {"message": message, "type": "no_available_account"}},
         status_code=503,
     )
 

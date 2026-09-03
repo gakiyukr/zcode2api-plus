@@ -93,3 +93,12 @@ class ModelAvailabilityTests(unittest.TestCase):
 
         self.assertEqual(account.quota_entries_for_model("glm-5.3-flash"), [{"remaining": 5}])
         self.assertEqual(account.model_availability("GLM-5.3-Flash"), "available")
+
+    def test_missing_model_in_snapshot_is_absent_not_unknown(self):
+        """已有額度快照但無此模型列時，應回傳 absent 而非 unknown。"""
+        account = Account.create("zai", "absent", "header.payload.signature")
+        account.quota = {"GLM-5.3": {"model": "GLM-5.3", "remaining": 10}}
+        self.assertEqual(account.model_availability("GLM-5.3-Flash"), "absent")
+
+        account.quota = {}
+        self.assertEqual(account.model_availability("GLM-5.3-Flash"), "unknown")
