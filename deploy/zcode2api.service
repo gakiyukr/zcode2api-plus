@@ -1,0 +1,30 @@
+# zcode2api-plus 裸機部署 systemd 單元
+#
+# 預設路徑為 /opt/zcode2api；install.sh 會依實際專案位置改寫本檔中的路徑後
+# 安裝到 /etc/systemd/system/zcode2api.service，請勿直接手工編輯副本。
+# 環境變數集中在 <專案目錄>/deploy/zcode2api.env，修改後 systemctl restart zcode2api。
+
+[Unit]
+Description=zcode2api-plus gateway (bare metal, no Docker)
+Documentation=https://github.com/gakiyukr/zcode2api-plus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zcode2api
+Group=zcode2api
+WorkingDirectory=/opt/zcode2api
+EnvironmentFile=/opt/zcode2api/deploy/zcode2api.env
+ExecStart=/opt/zcode2api/venv/bin/python main.py serve
+Restart=always
+RestartSec=5
+
+# 基本加固：除 data 目錄外檔案系統唯讀，禁止提權與共享 /tmp
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/zcode2api/data
+
+[Install]
+WantedBy=multi-user.target

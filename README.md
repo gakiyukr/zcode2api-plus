@@ -55,6 +55,44 @@ docker run -d --name zcode2api-plus -p 3000:3000 \
 
 > 首次发布后,GHCR 上的包默认可能为私有;如需公开拉取,请到仓库 **Packages → 该包 → Package settings → Change visibility** 设为 Public。
 
+## 裸机部署（systemd，免 Docker）
+
+不想编译 Docker 镜像时,可直接在 Debian/Ubuntu 主机上以 systemd 运行主程序。
+所需材料在 `deploy/` 目录:
+
+| 文件 | 用途 |
+|------|------|
+| `deploy/install.sh` | 一键安装:系统依赖 → Python venv → Node 求解器依赖 → systemd 服务 |
+| `deploy/zcode2api.service` | systemd 单元模板（自动重启、只读加固） |
+| `deploy/zcode2api.env.example` | 环境设定模板,安装时复制为 `deploy/zcode2api.env` |
+
+```bash
+git clone https://github.com/gakiyukr/zcode2api-plus.git /opt/zcode2api
+cd /opt/zcode2api
+sudo bash deploy/install.sh
+```
+
+- **浏览器（Chromium）是可选项**:默认 `ZCODE_CAPTCHA_BROWSER=false`,验证码走 Node + jsdom
+  求解器,不需要 Chromium 与系统图形库;需要真实浏览器池时改用
+  `sudo bash deploy/install.sh --with-browser`(安装系统库 + 预下载 Chromium 二进制)。
+- 默认安装到**脚本所在仓库根目录**,可用 `APP_DIR=/srv/zcode2api sudo bash deploy/install.sh` 换位置;
+  服务以系统账号 `zcode2api` 运行(`RUN_USER` 可覆盖)。
+- 环境变量集中在 `deploy/zcode2api.env`(首次安装生成,重复执行不覆盖),改完 `systemctl restart zcode2api`。
+- 重复执行安装脚本即可**更新程序**:先 `git pull`,再重跑一遍脚本,依赖与服务会同步刷新。
+- 管理:`systemctl {status|restart|stop} zcode2api`;日志:`journalctl -u zcode2api -f`。
+
+### 从 Docker 迁移数据
+
+账号与设置都在 `accounts.db`(SQLite),直接拷贝即可:
+
+```bash
+systemctl stop zcode2api
+# 把原 Docker 部署的 data 目录内容复制到新部署的 data 目录（含 accounts.db）
+cp -a /原docker部署路径/data/. /opt/zcode2api/data/
+chown -R zcode2api:zcode2api /opt/zcode2api/data
+systemctl start zcode2api
+```
+
 ## 后台 UI
 
 | 页面 | 说明 |
