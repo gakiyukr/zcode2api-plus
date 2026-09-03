@@ -1,0 +1,4 @@
+# 部署腳本必須保持 LF，否則 bash 在 Linux 上會因 CRLF 執行失敗
+deploy/*.sh text eol=lf
+deploy/zcode2api.service text eol=lf
+deploy/zcode2api.env.example text eol=lf
