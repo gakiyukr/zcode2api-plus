@@ -50,15 +50,25 @@
   }
   status.textContent=`验证配置：scene=${cfg.sceneId||'-'} · region=${cfg.region||'-'} · ${cfg.enabled?'已启用':'未启用'}`;
   hint.textContent='点击「开始验证」，将在真实浏览器中完成验证；如果出现滑块，请在弹窗中手动完成。';
-  let started=false;
+  let started=false, attempts=0;
   document.getElementById('btn').addEventListener('click',()=>{
     if(started)return;
-    started=true;
-    hint.textContent='正在发起验证；如果弹出滑块，请在真实浏览器中完成后等待结果…';
+    started=true; attempts=0;
+    hint.textContent='无痕验证进行中：通常数秒内自动完成，期间不会出现弹窗；仅当风控要求二次验证时才会弹出滑块，请在弹窗中手动完成。';
     window.initAliyunCaptcha({
       SceneId:cfg.sceneId, mode:'popup', region:cfg.region, prefix:cfg.prefix,
       element:'#cap', button:'#btn', captchaLogoImg:'', showErrorTip:false,
       getInstance:(inst)=>{
+        // SDK 验证失败后会销毁重建实例，并以 undefined 回调本函数；
+        // 若不防护，这里会对 undefined 调方法抛 TypeError，导致 started 状态错乱、弹窗反复闪现。
+        if(!inst)return;
+        if(attempts>=3){
+          showToast('多次重试仍未通过，请稍后再点「开始验证」','error');
+          hint.textContent='验证多次未通过。可稍后重试；若持续失败，请检查网络或更换出口 IP。';
+          started=false;
+          return;
+        }
+        attempts++;
         try{ (inst.startTracelessVerification||inst.show).call(inst); }
         catch(e){ showToast('启动验证失败: '+e.message,'error'); started=false; }
       },
@@ -67,10 +77,10 @@
           await api('POST','/captcha/submit',{verify_param:param});
           showToast('验证结果已提交，约 45 秒内供 JWT 请求使用','success');
           hint.textContent='已提交。验证码是短期结果，过期后请重新完成验证。';
-        }catch(e){ showToast('提交失败: '+e.message,'error'); }
+        }catch(e){ showToast('提交失败: '+e.message,'error'); hint.textContent='验证已通过但提交失败，请重新点击「开始验证」。'; }
         started=false;
       },
-      fail:(err)=>{ showToast('验证失败: '+((err&&err.message)||JSON.stringify(err)||'unknown'),'error'); hint.textContent='验证未通过，可再次点击「开始验证」重试。'; started=false; },
+      fail:(err)=>{ showToast('验证失败: '+((err&&err.message)||JSON.stringify(err)||'unknown'),'error'); hint.textContent='验证未通过，SDK 会自动重试；若长时间无结果，可再次点击「开始验证」。'; started=false; },
       onError:(err)=>{ showToast('验证初始化失败: '+((err&&err.message)||'unknown'),'error'); started=false; },
     });
   });
