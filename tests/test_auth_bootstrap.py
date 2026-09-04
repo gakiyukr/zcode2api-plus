@@ -139,8 +139,13 @@ class GatewayKeyVerificationTests(AuthBootstrapTestBase):
         self.store.set_setting("admin_key", "")
         with patch("app.auth_admin.store", self.store):
             with self.assertRaises(HTTPException) as ctx:
-                asyncio.run(verify_admin_key(authorization=None, app_key=None))
+                asyncio.run(verify_admin_key(authorization=None))
         self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_app_key_query_param_is_removed(self):
+        """`?app_key=` URL 傳參鑑權已移除，防止金鑰落入代理與訪問日誌。"""
+        with self.assertRaises(TypeError):
+            asyncio.run(verify_admin_key(authorization=None, app_key="zcode"))
 
 
 class SettingsEndpointTests(AuthBootstrapTestBase):

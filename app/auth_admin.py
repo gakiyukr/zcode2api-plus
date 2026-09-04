@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hmac
 
-from fastapi import Header, HTTPException, Query, status
+from fastapi import Header, HTTPException, status
 
 from .store import store
 
@@ -20,18 +20,17 @@ def _extract_bearer(authorization: str | None) -> str | None:
 
 async def verify_admin_key(
     authorization: str | None = Header(default=None),
-    app_key: str | None = Query(default=None),
 ) -> None:
-    """校验后台管理密钥。
+    """校验後台管理密鑰，僅接受 `Authorization: Bearer <key>` 頭。
 
-    支持 `Authorization: Bearer <key>` 头或 `?app_key=<key>` 查询参数
-    （后者用于 EventSource 等无法发送自定义头的场景）。
+    舊版支援的 `?app_key=<key>` 查詢參數已移除：金鑰會落入反向代理與
+    訪問日誌，且前端已無 EventSource 等無法自訂標頭的場景。
     """
     key = store.admin_key()
     if not key:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未配置后台密钥")
 
-    token = _extract_bearer(authorization) or app_key
+    token = _extract_bearer(authorization)
     if token is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少鉴权凭证")
     if not hmac.compare_digest(token, key):
