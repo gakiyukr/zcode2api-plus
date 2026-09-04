@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
+from fastapi.responses import StreamingResponse
 
 from app.captcha import CaptchaToken
 from app.models import Account
@@ -81,7 +82,7 @@ class AsyncPoolCaptchaTests(unittest.IsolatedAsyncioTestCase):
         queue: asyncio.Queue = asyncio.Queue()
         async_pool._tickets[ticket_id] = {
             "status": "pending",
-            "body": {"model": "GLM-5-Turbo", "max_tokens": 8, "messages": [{"role": "user", "content": "ping"}]},
+            "body": {"model": "GLM-5.3", "max_tokens": 8, "messages": [{"role": "user", "content": "ping"}]},
             "queue": queue,
             "created_at": 0,
         }
@@ -117,7 +118,7 @@ class AsyncPoolCaptchaTests(unittest.IsolatedAsyncioTestCase):
         queue: asyncio.Queue = asyncio.Queue()
         async_pool._tickets[ticket_id] = {
             "status": "pending",
-            "body": {"model": "GLM-5-Turbo", "messages": []},
+            "body": {"model": "GLM-5.3", "messages": []},
             "queue": queue,
             "created_at": 0,
         }
@@ -139,3 +140,58 @@ class AsyncPoolCaptchaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["type"], "error")
         self.assertEqual(events[-1]["data"]["error"]["type"], "captcha_required")
         self.assertEqual(tokens.await_count, async_pool.MAX_CAPTCHA_RETRIES)
+
+
+def _fake_request(body):
+    """構造僅需實作 json() 的假 Request，供入口端點單元測試使用。"""
+    request = Mock()
+    request.json = AsyncMock(return_value=body)
+    return request
+
+
+class AsyncModelWhitelistTests(unittest.IsolatedAsyncioTestCase):
+    """入口端點必須在建票前擋下白名單外的模型，不得轉發上游。"""
+
+    def setUp(self):
+        async_pool._tickets.clear()
+
+    def tearDown(self):
+        async_pool._tickets.clear()
+
+    async def test_messages_rejects_model_outside_whitelist(self):
+        body = {"model": "GLM-5-Turbo", "max_tokens": 8, "messages": []}
+        with patch.object(async_pool, "_process_ticket", AsyncMock()):
+            resp = await async_pool.async_messages(_fake_request(body))
+
+        self.assertEqual(resp.status_code, 400)
+        payload = json.loads(resp.body)
+        self.assertEqual(payload["error"]["type"], "model_not_allowed")
+        self.assertEqual(async_pool._tickets, {})
+
+    async def test_messages_accepts_whitelisted_model(self):
+        body = {"model": "glm-5.3-flash", "max_tokens": 8, "messages": []}
+        with patch.object(async_pool, "_process_ticket", AsyncMock()):
+            resp = await async_pool.async_messages(_fake_request(body))
+
+        self.assertIsInstance(resp, StreamingResponse)
+        self.assertEqual(len(async_pool._tickets), 1)
+        self.assertEqual(async_pool._tickets[next(iter(async_pool._tickets))]["body"]["model"], "glm-5.3-flash")
+
+    async def test_chat_completions_rejects_model_outside_whitelist(self):
+        body = {"model": "glm-4.7", "messages": []}
+        with patch.object(async_pool, "_process_ticket", AsyncMock()):
+            resp = await async_pool.async_chat_completions(_fake_request(body))
+
+        self.assertEqual(resp.status_code, 400)
+        payload = json.loads(resp.body)
+        self.assertEqual(payload["error"]["type"], "model_not_allowed")
+        self.assertEqual(async_pool._tickets, {})
+
+    async def test_chat_completions_defaults_to_whitelisted_model(self):
+        """未帶 model 的舊客戶端應落到白名單內的預設模型，而非被拒。"""
+        body = {"messages": []}
+        with patch.object(async_pool, "_process_ticket", AsyncMock()):
+            resp = await async_pool.async_chat_completions(_fake_request(body))
+
+        self.assertIsInstance(resp, StreamingResponse)
+        self.assertEqual(async_pool._tickets[next(iter(async_pool._tickets))]["body"]["model"], "GLM-5.3")

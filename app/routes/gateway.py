@@ -19,7 +19,7 @@ from .. import logs, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
-from ..models import Account, Status
+from ..models import Account, Status, normalize_model_name
 from ..proxy import make_async_client
 from ..quota import fetch_quota
 from ..store import store
@@ -41,20 +41,20 @@ MODEL_NAME_MAP = {
     "glm-4.7": "GLM-4.7",
 }
 
-# /v1/models 对外公布的可用模型（扩展自 TriDefender）
+# /v1/models 对外公布的可用模型（仅保留 5.3 系列，其余模型不再对外开放）
 AVAILABLE_MODELS = [
-    "glm-4.5-air",
-    "glm-4.6",
-    "glm-4.6v",
-    "glm-4.7",
-    "glm-5",
-    "glm-5-turbo",
-    "glm-5v-turbo",
-    "glm-5.1",
-    "GLM-5.2",
+    "glm-5.3-flash",
     "GLM-5.3",
-    "GLM-5-Turbo",
 ]
+
+# 允许调用的模型集合（normalize 後比對，避免大小寫/底線寫法繞過清單）
+_ALLOWED_MODELS = {normalize_model_name(name) for name in AVAILABLE_MODELS}
+
+
+def _model_allowed(model: object) -> bool:
+    """請求模型必須在對外清單內才允許轉發上游。"""
+    return normalize_model_name(model) in _ALLOWED_MODELS
+
 
 # 命中以下信号则认为账号额度用完
 _EXHAUST_KEYWORDS = ("quota", "insufficient", "balance", "exhaust", "额度", "余额不足")
@@ -228,11 +228,22 @@ async def messages(request: Request):
     incoming_headers = dict(request.headers)
     provider = _detect_provider(body, request.headers)
     body = _normalize_body(body)
+
+    req_id = secrets.token_hex(3)
+
+    # 只开放模型清單内的模型，其余一律拒絕，不再轉發上游
+    if not _model_allowed(body.get("model")):
+        model_name = str(body.get("model") or "")
+        logs.req_err(req_id, f"模型 {model_name} 不在開放清單內，拒絕請求")
+        return JSONResponse(
+            {"error": {"message": f"模型 {model_name} 不在可用清單內，僅支持 {', '.join(AVAILABLE_MODELS)}", "type": "model_not_allowed"}},
+            status_code=400,
+        )
+
     # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
     port = request.url.port or settings.PORT
     payload = json.dumps(body).encode("utf-8")
 
-    req_id = secrets.token_hex(3)
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
 
     tried: set[str] = set()

@@ -1,32 +1,42 @@
-"""测试模型列表。"""
+"""閘門模型白名單測試：僅清單內模型可轉發上游。"""
 
 from __future__ import annotations
 
 import unittest
 
-from app.routes.gateway import AVAILABLE_MODELS
+from app.routes.gateway import AVAILABLE_MODELS, MODEL_NAME_MAP, _model_allowed
 from app.models import Account
 
 
 class AvailableModelsTests(unittest.TestCase):
-    def test_available_models_includes_new_models(self):
-        expected = {
-            "glm-4.5-air",
-            "glm-4.6",
-            "glm-4.6v",
-            "glm-4.7",
-            "glm-5",
-            "glm-5-turbo",
-            "glm-5v-turbo",
-            "glm-5.1",
-            "GLM-5.2",
-            "GLM-5.3",
-            "GLM-5-Turbo",
-        }
-        self.assertEqual(set(AVAILABLE_MODELS), expected)
+    def test_available_models_only_keeps_53_family(self):
+        """模型清單僅保留 5.3 系列，其餘模型不再對外公布。"""
+        self.assertEqual(AVAILABLE_MODELS, ["glm-5.3-flash", "GLM-5.3"])
 
     def test_available_models_count(self):
-        self.assertEqual(len(AVAILABLE_MODELS), 11)
+        self.assertEqual(len(AVAILABLE_MODELS), 2)
+
+    def test_model_whitelist_accepts_listed_models(self):
+        """清單內模型（含大小寫/底線變體）應允許調用。"""
+        self.assertTrue(_model_allowed("GLM-5.3"))
+        self.assertTrue(_model_allowed("glm-5.3"))
+        self.assertTrue(_model_allowed("glm-5.3-flash"))
+        self.assertTrue(_model_allowed("GLM-5.3-Flash"))
+        self.assertTrue(_model_allowed("glm_5.3_flash"))
+
+    def test_model_whitelist_rejects_unlisted_models(self):
+        """清單外模型一律拒絕，不得轉發上游。"""
+        self.assertFalse(_model_allowed("glm-4.7"))
+        self.assertFalse(_model_allowed("glm-5"))
+        self.assertFalse(_model_allowed("GLM-5.2"))
+        self.assertFalse(_model_allowed("glm-5-turbo"))
+        self.assertFalse(_model_allowed(""))
+        self.assertFalse(_model_allowed(None))
+
+    def test_normalize_maps_alias_before_check(self):
+        """別名映射後的模型仍應通過白名單檢查（glm-5.3 → GLM-5.3）。"""
+        self.assertEqual(MODEL_NAME_MAP.get("glm-5.3"), "GLM-5.3")
+        self.assertTrue(_model_allowed(MODEL_NAME_MAP.get("glm-5.3")))
 
 
 class AccountIdentityTests(unittest.TestCase):
@@ -102,3 +112,7 @@ class ModelAvailabilityTests(unittest.TestCase):
 
         account.quota = {}
         self.assertEqual(account.model_availability("GLM-5.3-Flash"), "unknown")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -26,7 +26,13 @@ from ..proxy import make_async_client
 from ..models import Status
 from ..store import store
 from ..usage import UsageCollector
-from .gateway import MAX_CAPTCHA_RETRIES, _is_captcha_error, _normalize_body
+from .gateway import (
+    AVAILABLE_MODELS,
+    MAX_CAPTCHA_RETRIES,
+    _is_captcha_error,
+    _model_allowed,
+    _normalize_body,
+)
 
 router = APIRouter()
 
@@ -48,6 +54,15 @@ async def async_messages(request: Request):
     except (json.JSONDecodeError, ValueError):
         return JSONResponse(
             {"error": {"message": "请求体不是合法 JSON", "type": "invalid_request"}},
+            status_code=400,
+        )
+
+    # 模型白名單與 /v1/messages 一致：僅開放清單內模型，其餘在建票前一律拒絕
+    if not _model_allowed(body.get("model")):
+        model_name = str(body.get("model") or "")
+        logs.warn("async", f"模型 {model_name} 不在開放清單內，拒絕建票")
+        return JSONResponse(
+            {"error": {"message": f"模型 {model_name} 不在可用清單內，僅支持 {', '.join(AVAILABLE_MODELS)}", "type": "model_not_allowed"}},
             status_code=400,
         )
 
@@ -265,7 +280,8 @@ async def async_chat_completions(request: Request):
 
     # 转换为 /v1/messages 格式
     messages = body.get("messages", [])
-    model = body.get("model", "GLM-5-Turbo")
+    # 預設模型對齊對外開放清單（舊預設 GLM-5-Turbo 已不在白名單內）
+    model = body.get("model", "GLM-5.3")
     max_tokens = body.get("max_tokens", 8192)
 
     converted_body = {
@@ -273,6 +289,15 @@ async def async_chat_completions(request: Request):
         "max_tokens": max_tokens,
         "messages": messages,
     }
+
+    # 模型白名單與 /v1/messages 一致：僅開放清單內模型，其餘在建票前一律拒絕
+    if not _model_allowed(converted_body.get("model")):
+        model_name = str(converted_body.get("model") or "")
+        logs.warn("async", f"模型 {model_name} 不在開放清單內，拒絕建票")
+        return JSONResponse(
+            {"error": {"message": f"模型 {model_name} 不在可用清單內，僅支持 {', '.join(AVAILABLE_MODELS)}", "type": "model_not_allowed"}},
+            status_code=400,
+        )
 
     # 创建 ticket
     ticket_id = str(uuid.uuid4())
