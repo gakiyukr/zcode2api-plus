@@ -14,8 +14,8 @@ cp .env.example .env                     # 按需修改
 python main.py serve                     # 启动网关 + 后台 UI（默认端口 3000）
 ```
 
-- 后台管理：`http://localhost:3000/admin`（默认密码 `zcode`）
-- 对话端点：`http://localhost:3000/v1/messages`（兼容 Anthropic Messages 协议）
+- 后台管理：`http://localhost:3000/admin`（密码由 `ZCODE_ADMIN_KEY` 指定；未指定时首次启动随机生成，见启动日志）
+- 对话端点：`http://localhost:3000/v1/messages`（兼容 Anthropic Messages 协议，须携带网关 API Key）
 
 ## Docker 部署
 
@@ -31,7 +31,7 @@ docker build -t zcode2api-plus:latest .
 docker run -d --name zcode2api-plus \
   -p 3000:3000 \
   -v "$(pwd)/data:/data" \
-  -e ZCODE_ADMIN_KEY=zcode \
+  -e ZCODE_ADMIN_KEY=改成你的后台密码 \
   --restart unless-stopped \
   zcode2api-plus:latest
 ```
@@ -49,7 +49,7 @@ docker run -d --name zcode2api-plus \
 ```bash
 # 拉取并运行已发布镜像（tag: latest 或 sha-xxxxxxx）
 docker run -d --name zcode2api-plus -p 3000:3000 \
-  -v "$(pwd)/data:/data" -e ZCODE_ADMIN_KEY=zcode \
+  -v "$(pwd)/data:/data" -e ZCODE_ADMIN_KEY=改成你的后台密码 \
   ghcr.io/gakiyukr/zcode2api-plus:latest
 ```
 
@@ -128,8 +128,11 @@ systemctl start zcode2api
 ## 鉴权
 
 - **后台鉴权**：所有 `/admin/api/*` 需 `Authorization: Bearer <后台密码>`。
-- **网关鉴权（可选）**：在「设置」配置「网关 API Key」后，`/v1/messages` 须携带
-  `Authorization: Bearer <key>` 或 `x-api-key: <key>`；留空则不校验。
+  密码由 `ZCODE_ADMIN_KEY` 指定；未指定时首次启动随机生成并打印在启动日志中
+  （历史版本使用过的默认密码 `zcode` 会在升级启动时强制轮换）。
+- **网关鉴权（必填）**：`/v1/messages`、`/async/v1/*`、`/v1/models` 一律要求 API Key，
+  携带 `Authorization: Bearer <key>` 或 `x-api-key: <key>`。密钥由 `ZCODE_GATEWAY_KEY`
+  指定，未指定时首次启动随机生成（见启动日志），亦可在后台「设置」页查看与修改。
 
 ## 无痕验证（无浏览器）
 
@@ -170,7 +173,8 @@ python main.py export [file] / import <file>       # 导出 / 导入账号
 |------|--------|------|
 | `ZCODE_PORT` | 3000 | 服务端口 |
 | `ZCODE_HOST` | 0.0.0.0 | 监听地址 |
-| `ZCODE_ADMIN_KEY` | zcode | 后台密码初始值（之后以 DB 为准）|
+| `ZCODE_ADMIN_KEY` | （随机生成） | 后台密码初始值（写入 DB 后以 DB 为准）|
+| `ZCODE_GATEWAY_KEY` | （随机生成） | 网关 API Key 初始值（写入 DB 后以 DB 为准）|
 | `ZCODE_DATA_DIR` | ./data | 数据目录（SQLite 存放处）|
 | `ZCODE_QUOTA_REFRESH_INTERVAL` | 60 | 后台刷新额度间隔（秒），0 关闭 |
 | `ZCODE_CLIENT_VERSION` | 3.7.7 | ZCode 客户端版本（额度请求会附带此版本）|

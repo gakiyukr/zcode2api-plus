@@ -77,6 +77,7 @@ async function saveSettings(){
   const gateway_key=document.getElementById('gateway-key').value.trim();
   const quota_refresh_interval=parseInt(document.getElementById('quota-interval').value,10);
   if(!admin_key)return showToast('后台密码不能为空','error');
+  if(!gateway_key)return showToast('网关 API Key 不能为空','error');
   if(isNaN(quota_refresh_interval)||quota_refresh_interval<0)return showToast('刷新间隔必须是非负整数','error');
   try{
     await api('PUT','/settings',{admin_key,gateway_key,quota_refresh_interval});

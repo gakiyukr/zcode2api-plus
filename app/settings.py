@@ -42,8 +42,12 @@ PORT = _int("ZCODE_PORT", 3000)
 HOST = os.getenv("ZCODE_HOST", "0.0.0.0")
 
 # ── 鉴权 ─────────────────────────────────────────────────────────────────────
-# 后台管理密码默认值，首次启动写入 data/accounts.db，之后以数据库（meta 表）为准。
-DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
+# 金鑰初始值：僅在 meta 表缺失（或後台密碼仍為歷史預設值）時生效，寫入後以資料庫為準。
+# 未設定環境變數時由 store 首次啟動隨機生成，絕不落入眾所周知的固定密碼（見 store.py）。
+ADMIN_KEY_ENV = (os.getenv("ZCODE_ADMIN_KEY") or "").strip()
+DEFAULT_ADMIN_KEY = ADMIN_KEY_ENV
+# 網關 API Key 初始值；網關密鑰一律必填，空值即拒絕存取（見 auth_admin.verify_gateway_key）。
+GATEWAY_KEY_ENV = (os.getenv("ZCODE_GATEWAY_KEY") or "").strip()
 
 # ── 验证码缓存 ───────────────────────────────────────────────────────────────
 CAPTCHA_CACHE_TTL = _int("CAPTCHA_CACHE_TTL", 45_000)          # ms

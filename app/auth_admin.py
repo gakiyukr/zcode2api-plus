@@ -42,10 +42,11 @@ async def verify_gateway_key(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ) -> None:
-    """校验 /v1/messages 网关访问密钥（未配置则放行）。"""
+    """校验 /v1/messages 网关访问密钥；密钥一律必填，未配置即拒绝（fail closed）。"""
     key = store.gateway_key()
     if not key:
-        return
+        # 僅在 meta 表被手動清空時觸達；寧可拒絕服務也不放行未鑑權流量
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "网关未配置 API Key，请在后台设置")
     token = _extract_bearer(authorization) or x_api_key
     if token is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少 API Key")

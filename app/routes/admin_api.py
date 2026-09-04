@@ -624,7 +624,11 @@ async def update_settings(payload: dict = Body(...)):
             raise HTTPException(400, "后台密钥不能为空")
         store.set_setting("admin_key", key)
     if "gateway_key" in payload:
-        store.set_setting("gateway_key", (payload["gateway_key"] or "").strip())
+        key = (payload["gateway_key"] or "").strip()
+        if not key:
+            # 網關密鑰必填：存空值會讓 verify_gateway_key 拒絕所有請求，而非回到免鑑權
+            raise HTTPException(400, "网关 API Key 不能为空")
+        store.set_setting("gateway_key", key)
     if "quota_refresh_interval" in payload:
         try:
             interval = max(0, int(payload["quota_refresh_interval"]))

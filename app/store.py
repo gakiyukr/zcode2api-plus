@@ -22,6 +22,9 @@ from .models import PROVIDERS, Account, Status
 _TBL = "accounts"
 _META = "meta"
 
+# 2.0.1 之前發布的固定預設後台密碼；存量部署升級時必須強制輪換。
+_LEGACY_ADMIN_KEY = "zcode"
+
 
 class Store:
     """线程安全的账号 / 设置存储，含轮询游标。"""
@@ -31,6 +34,9 @@ class Store:
         self._accounts: dict[str, list[Account]] = {p: [] for p in PROVIDERS}
         self._settings: dict = {}
         self._rotation: dict[str, int] = {p: 0 for p in PROVIDERS}
+        # 本次啟動隨機生成／輪換的金鑰，供啟動橫幅提示管理者（環境變數配置時不記錄）
+        self.generated_admin_key: str | None = None
+        self.generated_gateway_key: str | None = None
         self._init_db()
         self._load()
 
@@ -66,24 +72,57 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_acc_status   ON {_TBL} (status);
                 """
             )
-            conn.execute(
-                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('admin_key', ?)",
-                (settings.DEFAULT_ADMIN_KEY,),
-            )
-            conn.execute(
-                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('gateway_key', '')"
-            )
+            self._bootstrap_auth_keys(conn)
             conn.execute(
                 f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('quota_refresh_interval', ?)",
                 (str(settings.QUOTA_REFRESH_INTERVAL),),
             )
             conn.commit()
 
+    def _bootstrap_auth_keys(self, conn: sqlite3.Connection) -> None:
+        """初始化後台密碼與網關 API Key，保證兩者永不為空、永不為固定預設值。
+
+        - 環境變數顯式配置時，用於替換缺失值或歷史預設值（寫入後仍以資料庫為準）；
+        - 否則隨機生成，並記錄到 generated_* 旗標供啟動橫幅展示；
+        - 歷史版本寫死的管理密碼「zcode」在升級時強制輪換。
+        """
+        rows = {
+            r["key"]: r["value"]
+            for r in conn.execute(
+                f"SELECT key, value FROM {_META} WHERE key IN ('admin_key', 'gateway_key')"
+            )
+        }
+
+        admin_key = rows.get("admin_key") or ""
+        if not admin_key or admin_key == _LEGACY_ADMIN_KEY:
+            if settings.ADMIN_KEY_ENV:
+                admin_key = settings.ADMIN_KEY_ENV
+            else:
+                admin_key = secrets.token_urlsafe(24)
+                self.generated_admin_key = admin_key
+            conn.execute(
+                f"INSERT OR REPLACE INTO {_META} (key, value) VALUES ('admin_key', ?)",
+                (admin_key,),
+            )
+
+        gateway_key = rows.get("gateway_key") or ""
+        if not gateway_key:
+            if settings.GATEWAY_KEY_ENV:
+                gateway_key = settings.GATEWAY_KEY_ENV
+            else:
+                gateway_key = f"sk-{secrets.token_urlsafe(24)}"
+                self.generated_gateway_key = gateway_key
+            conn.execute(
+                f"INSERT OR REPLACE INTO {_META} (key, value) VALUES ('gateway_key', ?)",
+                (gateway_key,),
+            )
+
     def _load(self) -> None:
         with closing(self._connect()) as conn:
             meta_rows = conn.execute(f"SELECT key, value FROM {_META}").fetchall()
             self._settings = {r["key"]: r["value"] for r in meta_rows}
-            self._settings.setdefault("admin_key", settings.DEFAULT_ADMIN_KEY)
+            # 金鑰由 _bootstrap_auth_keys 保證存在；此處缺省空值即拒絕鑑權（fail closed）
+            self._settings.setdefault("admin_key", "")
             self._settings.setdefault("gateway_key", "")
             self._settings.setdefault("quota_refresh_interval", str(settings.QUOTA_REFRESH_INTERVAL))
 
@@ -144,7 +183,7 @@ class Store:
             self._set_meta(key, str(value))
 
     def admin_key(self) -> str:
-        return str(self.get_setting("admin_key", settings.DEFAULT_ADMIN_KEY) or "")
+        return str(self.get_setting("admin_key") or "")
 
     def gateway_key(self) -> str:
         return str(self.get_setting("gateway_key", "") or "")

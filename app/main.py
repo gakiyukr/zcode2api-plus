@@ -12,6 +12,7 @@ from . import settings
 from . import logs
 from .captcha import captcha_manager
 from .quota import monitor
+from .store import store
 from .routes import admin_api, gateway, pages, async_pool
 
 # 修正 Windows 中文控制台可能出现的乱码
@@ -32,11 +33,23 @@ def _display_host() -> str:
 async def lifespan(app: FastAPI):
     monitor.start()
     base = f"http://{_display_host()}:{settings.PORT}"
-    logs.banner([
+    lines = [
         f"{logs._B}{logs._MAG}zcode2api-plus{logs._R} {logs._DIM}v{settings.APP_VERSION} · Python{logs._R}",
         f"{logs._DIM}后台管理{logs._R}  {logs._C}{base}/admin/login{logs._R}",
         f"{logs._DIM}对话端点{logs._R}  {logs._C}{base}/v1/messages{logs._R}",
-    ])
+    ]
+    # 金鑰由 store 引導邏輯生成時，必須在啟動日誌中交付給管理者，否則無法登入／調用
+    if store.generated_admin_key:
+        lines.append(
+            f"{logs._DIM}初始后台密码{logs._R}  {logs._Y}{store.generated_admin_key}{logs._R}"
+            f" {logs._DIM}（请登录后尽快在「设置」页修改）{logs._R}"
+        )
+    if store.generated_gateway_key:
+        lines.append(
+            f"{logs._DIM}网关 API Key{logs._R}  {logs._Y}{store.generated_gateway_key}{logs._R}"
+            f" {logs._DIM}（调用 /v1/messages 需携带，可在「设置」页修改）{logs._R}"
+        )
+    logs.banner(lines)
     try:
         yield
     finally:
