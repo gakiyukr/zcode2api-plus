@@ -20,6 +20,7 @@ export function SettingsPage() {
   const [adminKeyInput, setAdminKeyInput] = useState('')
   const [gatewayKey, setGatewayKey] = useState('')
   const [quotaInterval, setQuotaInterval] = useState('60')
+  const [rateLimitThreshold, setRateLimitThreshold] = useState('1')
   const [saving, setSaving] = useState(false)
 
   /* 載入完成後填入表單（僅在尚未編輯時同步） */
@@ -28,6 +29,7 @@ export function SettingsPage() {
     setAdminKeyInput(data.admin_key || '')
     setGatewayKey(data.gateway_key || '')
     setQuotaInterval(String(data.quota_refresh_interval ?? 60))
+    setRateLimitThreshold(String(data.rate_limit_threshold ?? 1))
   }, [data])
 
   async function save(e: FormEvent) {
@@ -45,12 +47,18 @@ export function SettingsPage() {
       toast.error('刷新間隔必須是非負整數')
       return
     }
+    const threshold = parseInt(rateLimitThreshold, 10)
+    if (isNaN(threshold) || threshold < 0) {
+      toast.error('限流降級閾值必須是非負整數')
+      return
+    }
     setSaving(true)
     try {
       await api('PUT', '/settings', {
         admin_key: adminKeyInput.trim(),
         gateway_key: gatewayKey.trim(),
         quota_refresh_interval: interval,
+        rate_limit_threshold: threshold,
       })
       /* 同步本機儲存的密鑰，避免改密後被登出 */
       await adminKey.set(adminKeyInput.trim())
@@ -106,6 +114,20 @@ export function SettingsPage() {
                 step={5}
                 value={quotaInterval}
                 onChange={(e) => setQuotaInterval(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-rate-limit-threshold">限流降級閾值（連續 429 次數）</Label>
+              <div className="text-xs text-muted-foreground">
+                帳號連續收到多少次上游 429 後，才標記為「限流」並冷卻一段時間。1 = 一次 429 即降級（預設）；設為更大值可容忍偶發限流；0 = 不降級（429 只切換下一個帳號，不標記冷卻）。修改後即時生效。
+              </div>
+              <Input
+                id="set-rate-limit-threshold"
+                type="number"
+                min={0}
+                step={1}
+                value={rateLimitThreshold}
+                onChange={(e) => setRateLimitThreshold(e.target.value)}
               />
             </div>
             <div className="flex justify-end">

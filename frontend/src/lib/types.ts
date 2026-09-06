@@ -91,6 +91,7 @@ export interface SettingsResponse {
   admin_key: string
   gateway_key: string
   quota_refresh_interval: number
+  rate_limit_threshold: number
 }
 
 export interface EgressInfo {
