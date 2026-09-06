@@ -32,6 +32,7 @@ from .gateway import (
     _is_captcha_error,
     _model_allowed,
     _normalize_body,
+    _register_rate_limit,
 )
 
 router = APIRouter()
@@ -137,6 +138,7 @@ async def _forward_sse(resp, queue, account) -> None:
                 pass
     usage.finish()
     account.accumulate_tokens(usage.as_dict())
+    account.rate_limit_count = 0
     store.update_account(account)
     await queue.put({"type": "done"})
 
@@ -218,9 +220,18 @@ async def _process_ticket(ticket_id: str):
 
                         if resp.status_code in (429, 503):
                             account.fail_count += 1
-                            account.status = Status.COOLING
-                            account.cooling_until = time.time() + settings.COOLING_SECONDS
-                            account.last_error = f"上游服務暫時不可用 HTTP {resp.status_code}"
+                            if resp.status_code == 429:
+                                should_cool, hint = _register_rate_limit(account)
+                                if should_cool:
+                                    account.status = Status.COOLING
+                                    account.cooling_until = time.time() + settings.COOLING_SECONDS
+                                    account.last_error = "上游限流 429"
+                                else:
+                                    account.last_error = f"上游限流 429（{hint}）"
+                            else:
+                                account.status = Status.COOLING
+                                account.cooling_until = time.time() + settings.COOLING_SECONDS
+                                account.last_error = f"上游服務暫時不可用 HTTP {resp.status_code}"
                             store.update_account(account)
                             network_retry = True
                             last_network_error = text

@@ -89,6 +89,7 @@ class AsyncPoolCaptchaTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(async_pool.store, "select", return_value=account),
+            patch.object(async_pool.store, "update_account"),
             patch.object(async_pool.captcha_manager, "get_verify_param", tokens),
             patch.object(async_pool.captcha_manager, "invalidate") as invalidate,
             patch.object(async_pool, "make_async_client", _FakeClient),
@@ -195,3 +196,44 @@ class AsyncModelWhitelistTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(resp, StreamingResponse)
         self.assertEqual(async_pool._tickets[next(iter(async_pool._tickets))]["body"]["model"], "GLM-5.3")
+
+
+class AsyncPoolRateLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_429_below_threshold_keeps_account_active(self):
+        """async 池的 429 同样遵循降级阈值，未达标不标记 cooling。"""
+        account = Account.create("zai", "async-429", "header.payload.signature")
+        _FakeClient.responses = [
+            _FakeResponse(429, '{"error":"rate limited"}'),
+            _FakeResponse(429, '{"error":"rate limited"}'),
+        ]
+        _FakeClient.calls = []
+        ticket_id = "ticket-429"
+        queue: asyncio.Queue = asyncio.Queue()
+        async_pool._tickets[ticket_id] = {
+            "status": "pending",
+            "body": {"model": "GLM-5.3", "max_tokens": 8, "messages": [{"role": "user", "content": "ping"}]},
+            "queue": queue,
+            "created_at": 0,
+        }
+
+        with (
+            patch.object(async_pool.store, "select", return_value=account),
+            patch.object(async_pool.captcha_manager, "get_verify_param", AsyncMock(return_value=CaptchaToken("token", "sgp"))),
+            patch.object(async_pool, "make_async_client", _FakeClient),
+            patch.object(async_pool.store, "update_account"),
+            patch.object(async_pool.store, "rate_limit_threshold", return_value=3),
+            patch.object(async_pool.settings, "ASYNC_MAX_RETRIES", 1),
+            patch.object(async_pool.asyncio, "sleep", AsyncMock()),
+        ):
+            await async_pool._process_ticket(ticket_id)
+
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        async_pool._tickets.pop(ticket_id, None)
+
+        self.assertEqual(len(_FakeClient.calls), 2)
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(account.status, "active")
+        self.assertEqual(account.rate_limit_count, 2)
+        self.assertIn("未达降级阈值", account.last_error or "")

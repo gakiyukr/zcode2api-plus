@@ -177,6 +177,23 @@ def _mark(account: Account, status_value: str, error: str | None = None) -> None
     store.update_account(account)
 
 
+def _register_rate_limit(account: Account) -> tuple[bool, str]:
+    """记录一次上游 429，返回 (是否应标记 cooling, 未降级原因)。
+
+    降级阈值取自后台设置：1 = 一次 429 即降级；N = 连续 N 次 429 才降级；
+    0 = 不降级。账号连续计数在成功请求后清零。
+    """
+    threshold = store.rate_limit_threshold()
+    if not threshold:
+        account.rate_limit_count = 0
+        return False, "降级已关闭"
+    account.rate_limit_count += 1
+    if account.rate_limit_count >= threshold:
+        account.rate_limit_count = 0
+        return True, ""
+    return False, f"未达降级阈值（{account.rate_limit_count}/{threshold}）"
+
+
 def _mark_model_exhausted(account: Account, model: object, error: str) -> None:
     """只停用已耗盡的請求模型；所有已知模型皆耗盡時才停用整個帳號。"""
     if not account.mark_model_exhausted(model):
@@ -360,8 +377,14 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                 )
 
             if status_code == 429:
-                _mark(account, Status.COOLING, "上游限流 429")
-                logs.warn(req_id, f"账号 {account.name} 被限流 429，切换下一个")
+                should_cool, hint = _register_rate_limit(account)
+                if should_cool:
+                    _mark(account, Status.COOLING, "上游限流 429")
+                    logs.warn(req_id, f"账号 {account.name} 被限流 429，达到降级阈值进入冷却，切换下一个")
+                else:
+                    account.last_error = f"上游限流 429（{hint}）"
+                    store.update_account(account)
+                    logs.warn(req_id, f"账号 {account.name} 被限流 429（{hint}），切换下一个")
                 return _NEXT_ACCOUNT
 
             if status_code == 503:
@@ -432,6 +455,7 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
         # 成功：记录用量并流式透传
         account.use_count += 1
         account.last_used_at = time.time()
+        account.rate_limit_count = 0
         if account.status in (Status.COOLING, Status.EXHAUSTED):
             account.status = Status.ACTIVE
         store.update_account(account)

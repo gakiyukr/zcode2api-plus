@@ -245,5 +245,98 @@ class GatewayTokenStatsTests(unittest.IsolatedAsyncioTestCase):
         update.assert_called()
 
 
+class GatewayRateLimitThresholdTests(unittest.IsolatedAsyncioTestCase):
+    """429 限流降级阈值：连续计数达标才标记 cooling，成功后清零。"""
+
+    def _sequence(self, statuses_bodies):
+        _SequenceClient.responses = [_SequenceResponse(s, b) for s, b in statuses_bodies]
+        _SequenceClient.calls = 0
+
+    async def _run(self, account, body=None, consume=False):
+        with (
+            patch.object(gateway.store, "update_account"),
+            patch.object(gateway.store, "rate_limit_threshold", return_value=self.threshold),
+            patch.object(gateway.httpx, "AsyncClient", _SequenceClient),
+            patch.object(gateway.asyncio, "create_task", side_effect=lambda coroutine: coroutine.close()),
+        ):
+            response = await gateway._try_account(
+                "req", account, body if body is not None else {"stream": True, "model": "GLM-5.3"}, b"{}", {}, None, False
+            )
+            if consume and response is not gateway._NEXT_ACCOUNT:
+                chunks = [chunk async for chunk in response.body_iterator]
+                return response, chunks
+            return response, None
+
+    async def test_first_429_cools_with_default_threshold(self):
+        self.threshold = 1
+        account = Account.create("zai", "rl-default", "header.payload.signature")
+        self._sequence([(429, '{"error":"rate limited"}')])
+        response, _ = await self._run(account)
+
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "cooling")
+        self.assertGreater(account.cooling_until or 0, 0)
+        self.assertEqual(account.rate_limit_count, 0)
+
+    async def test_429_below_threshold_keeps_account_active(self):
+        self.threshold = 3
+        account = Account.create("zai", "rl-tolerant", "header.payload.signature")
+        self._sequence([(429, '{"error":"rate limited"}')])
+        response, _ = await self._run(account)
+
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "active")
+        self.assertEqual(account.rate_limit_count, 1)
+        self.assertIn("未达降级阈值", account.last_error or "")
+
+    async def test_consecutive_429s_cool_after_threshold(self):
+        self.threshold = 3
+        account = Account.create("zai", "rl-cumulative", "header.payload.signature")
+        for _ in range(2):
+            self._sequence([(429, '{"error":"rate limited"}')])
+            response, _ = await self._run(account)
+            self.assertIs(response, gateway._NEXT_ACCOUNT)
+            self.assertEqual(account.status, "active")
+
+        self._sequence([(429, '{"error":"rate limited"}')])
+        response, _ = await self._run(account)
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "cooling")
+        self.assertGreater(account.cooling_until or 0, 0)
+        self.assertEqual(account.rate_limit_count, 0)
+
+    async def test_success_resets_rate_limit_count(self):
+        self.threshold = 3
+        account = Account.create("zai", "rl-reset", "header.payload.signature")
+        self._sequence([
+            (429, '{"error":"rate limited"}'),
+            (200, '{"ok":true}'),
+            (429, '{"error":"rate limited"}'),
+            (429, '{"error":"rate limited"}'),
+        ])
+        await self._run(account)  # 429 → count 1
+        response, chunks = await self._run(account, body={}, consume=True)  # 成功 → 计数清零
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(chunks, [b'{"ok":true}'])
+        self.assertEqual(account.rate_limit_count, 0)
+
+        await self._run(account)  # count 1
+        response, _ = await self._run(account)  # count 2，仍未达阈值
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "active")
+        self.assertEqual(account.rate_limit_count, 2)
+
+    async def test_zero_threshold_never_cools_on_429(self):
+        self.threshold = 0
+        account = Account.create("zai", "rl-disabled", "header.payload.signature")
+        for _ in range(4):
+            self._sequence([(429, '{"error":"rate limited"}')])
+            response, _ = await self._run(account)
+            self.assertIs(response, gateway._NEXT_ACCOUNT)
+            self.assertEqual(account.status, "active")
+        self.assertEqual(account.rate_limit_count, 0)
+        self.assertIn("降级已关闭", account.last_error or "")
+
+
 if __name__ == "__main__":
     unittest.main()

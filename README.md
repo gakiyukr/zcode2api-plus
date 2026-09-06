@@ -179,6 +179,7 @@ python main.py export [file] / import <file>       # 导出 / 导入账号
 | `ZCODE_QUOTA_REFRESH_INTERVAL` | 60 | 后台刷新额度间隔（秒），0 关闭 |
 | `ZCODE_CLIENT_VERSION` | 3.7.7 | ZCode 客户端版本（额度请求会附带此版本）|
 | `ZCODE_COOLING_SECONDS` | 300 | 限流冷却时长（秒）|
+| `ZCODE_RATE_LIMIT_THRESHOLD` | 1 | 连续多少次上游 429 才将账号标记为限流冷却；0 表示不因 429 降级（仍会切换下一个账号）|
 | `ZCODE_NODE_PATH` | node | 无痕验证求解器使用的 Node 可执行文件 |
 | `ZCODE_CAPTCHA_TIMEOUT` | 40 | 单次验证码求解超时（秒）|
 | `ZCODE_CAPTCHA_RETRIES` | 4 | 验证码求解失败重试次数 |

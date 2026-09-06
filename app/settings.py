@@ -103,6 +103,8 @@ ASYNC_MAX_RETRIES = max(0, _int("ZCODE_ASYNC_MAX_RETRIES", 3))
 QUOTA_REFRESH_INTERVAL = _int("ZCODE_QUOTA_REFRESH_INTERVAL", 60)
 # 限流（cooling）冷却时长（秒）
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
+# 限流降级阈值：账号连续收到多少次上游 429 才标记 cooling。0 = 不降级
+RATE_LIMIT_THRESHOLD = max(0, _int("ZCODE_RATE_LIMIT_THRESHOLD", 1))
 
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 UPSTREAM = {

@@ -77,6 +77,10 @@ class Store:
                 f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('quota_refresh_interval', ?)",
                 (str(settings.QUOTA_REFRESH_INTERVAL),),
             )
+            conn.execute(
+                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('rate_limit_threshold', ?)",
+                (str(settings.RATE_LIMIT_THRESHOLD),),
+            )
             conn.commit()
 
     def _bootstrap_auth_keys(self, conn: sqlite3.Connection) -> None:
@@ -125,6 +129,7 @@ class Store:
             self._settings.setdefault("admin_key", "")
             self._settings.setdefault("gateway_key", "")
             self._settings.setdefault("quota_refresh_interval", str(settings.QUOTA_REFRESH_INTERVAL))
+            self._settings.setdefault("rate_limit_threshold", str(settings.RATE_LIMIT_THRESHOLD))
 
             self._accounts = {p: [] for p in PROVIDERS}
             rows = conn.execute(
@@ -193,6 +198,12 @@ class Store:
             return max(0, int(self.get_setting("quota_refresh_interval", settings.QUOTA_REFRESH_INTERVAL)))
         except (TypeError, ValueError):
             return settings.QUOTA_REFRESH_INTERVAL
+
+    def rate_limit_threshold(self) -> int:
+        try:
+            return max(0, int(self.get_setting("rate_limit_threshold", settings.RATE_LIMIT_THRESHOLD)))
+        except (TypeError, ValueError):
+            return settings.RATE_LIMIT_THRESHOLD
 
     # ── 代理設定 ────────────────────────────────────────────────────────────
     def list_proxy_profiles(self) -> list[dict]:

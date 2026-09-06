@@ -613,6 +613,7 @@ async def get_settings():
         "admin_key": store.admin_key(),
         "gateway_key": store.gateway_key(),
         "quota_refresh_interval": store.quota_refresh_interval(),
+        "rate_limit_threshold": store.rate_limit_threshold(),
     }
 
 
@@ -635,6 +636,12 @@ async def update_settings(payload: dict = Body(...)):
         except (TypeError, ValueError):
             raise HTTPException(400, "刷新间隔必须是非负整数")
         store.set_setting("quota_refresh_interval", str(interval))
+    if "rate_limit_threshold" in payload:
+        try:
+            threshold = max(0, int(payload["rate_limit_threshold"]))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "限流降级阈值必须是非负整数")
+        store.set_setting("rate_limit_threshold", str(threshold))
     return {"ok": True}
 
 

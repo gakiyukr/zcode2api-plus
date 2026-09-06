@@ -93,6 +93,8 @@ class Account:
 
     use_count: int = 0
     fail_count: int = 0
+    # 连续 429 计数：达到降级阈值才标记 cooling，成功请求后清零
+    rate_limit_count: int = 0
     # 累計調度 token 用量（僅計成功回應，由 UsageCollector 餵入）
     total_input_tokens: int = 0
     total_output_tokens: int = 0
