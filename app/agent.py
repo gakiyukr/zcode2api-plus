@@ -19,6 +19,7 @@ _DROP_HEADERS = {
     "http-referer",
     "accept-encoding",
     "connection",
+    "cookie",
     "x-aliyun-captcha-verify-param",
     "x-aliyun-captcha-verify-region",
 }

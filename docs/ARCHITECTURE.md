@@ -145,14 +145,14 @@ sequenceDiagram
                 GW->>S: use_count++，刷新额度（后台）
             else 403 验证码失效
                 GW->>CM: invalidate() → 重试本账号
-            else 402 / quota 关键字
-                GW->>S: 标记 exhausted → 换下一个账号
             else 401/403 鉴权
                 GW->>S: 标记 invalid → 换下一个账号
-            else 429 限流
+            else 402 / 429 官方用量上限码族 / code 1005
+                GW->>S: 标记该模型 exhausted → 换下一个账号
+            else 429 瞬时限流（1302/1305 等）
                 GW->>S: 标记 cooling → 换下一个账号
-            else 其它错误
-                U-->>C: 原样回传错误
+            else 其它错误（未识别信号）
+                U-->>C: 原样透传上游响应，不做状态推断
             end
         end
     end
@@ -173,7 +173,7 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> active: 新增 / 导入
-    active --> exhausted: 余额=0 或 上游 402 / quota
+    active --> exhausted: 余额=0 或 上游 402 / 429 用量上限码族 / code 1005
     active --> cooling: 429 限流 / 连接失败
     active --> invalid: 401·403 鉴权失败
     active --> disabled: 后台手动禁用
@@ -188,7 +188,7 @@ stateDiagram-v2
 |------|:---:|------|------|
 | `active` | ✅ | 默认 | — |
 | `cooling` | ⏳ 冷却到期后 | 429 / 连接失败 | `cooling_until` 到点;或额度刷新 |
-| `exhausted` | ❌ | 额度=0 / 402 / quota 关键字 | 额度刷新检测到剩余>0 |
+| `exhausted` | ❌ | 额度=0 / 402 / 429 用量上限码族 / code 1005 | 额度刷新检测到剩余>0 |
 | `invalid` | ❌ | 401/403 非验证码鉴权失败 | 改凭证 / 重新启用 |
 | `disabled` | ❌ | 手动禁用 | 手动启用 |
 
@@ -260,7 +260,7 @@ meta(      key PK, value )      # admin_key / gateway_key / quota_refresh_interv
 
 | 范围 | 依赖 | 规则 |
 |------|------|------|
-| 后台 `/admin/api/*` | `verify_admin_key` | 必须 `Authorization: Bearer <后台密钥>`(仅接受请求头,`?app_key=` 已移除);`hmac.compare_digest` 定时安全比较 |
+| 后台 `/admin/api/*` | `verify_admin_key` | 必须 `Authorization: Bearer <后台密钥>`(仅接受请求头,`?app_key=` 已移除);`hmac.compare_digest` 定时安全比较;单 IP 失败速率限制(5 分钟窗口 10 次,超限一律 429,成功清零) |
 | 网关 `/v1/messages`·`/v1/models`·`/async/v1/*` | `verify_gateway_key` | 密钥一律必填(`Bearer` 或 `x-api-key`);缺失 401、错误 403、未配置 503(fail closed) |
 
 密钥存于 `meta` 表,可在「设置」页或 `.env` 初始化。前端凭证加密存于浏览器 localStorage。
@@ -308,8 +308,10 @@ meta(      key PK, value )      # admin_key / gateway_key / quota_refresh_interv
 - **额度/计费字段**:当前按 ZCode 3.7.7 官方客户端请求
   `billing/balance?app_version=3.7.7`;`total_units` / `used_units` / `remaining_units` / `expires_at`
   等字段已按实际响应解析,但不同套餐的字段仍可能不一致。
-- **额度用完判定**:`exhausted` 触发条件(余额=0、HTTP 402、错误体含 `quota/insufficient/余额` 等关键字)
-  为启发式;真实上游的耗尽信号若不同,可能需要调整 `app/quota.py` / `app/routes/gateway.py` 的判定。
+- **额度用完判定**:分类依据为状态码 + 官方业务码(docs.z.ai 错误码表):HTTP 402、
+  429 中的用量上限码族(1113/1308-1311/1313/1316-1321)、HTTP 200 包装体的业务码 1005。
+  已不做响应体关键词匹配;其中「HTTP 200 + code 1005 = 当日额度用完」仍属对 zcode-plan
+  上游的观测结论(官方文档中 1005 另有「需要二次认证」含义),如与真实上游不符请反馈修正。
 - **模型清单**:`/v1/models` 当前固定为 `GLM-5.2` 与 `GLM-5-Turbo`,未做上游动态拉取。
 - **无痕验证 SDK**:`solver.js` 运行的是阿里云自家混淆 SDK;若其指纹逻辑(feilin / cloudauth-device)更新,
   jsdom 中补齐的浏览器 API 桩可能需要相应调整。

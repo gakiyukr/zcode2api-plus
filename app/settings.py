@@ -91,7 +91,7 @@ def _load_or_generate_device_mid() -> str:
 DEVICE_MID = _load_or_generate_device_mid()
 
 # ── Async 空闲池 ─────────────────────────────────────────────────────────────
-# 是否启用异步空闲池路由（/async/v1/messages 和 /async/v1/chat/completions）
+# 是否启用异步空闲池路由（/async/v1/messages）
 ASYNC_ENABLED = (os.getenv("ZCODE_ASYNC_ENABLED", "true") or "true").strip().lower() not in {
     "0", "false", "no", "off",
 }

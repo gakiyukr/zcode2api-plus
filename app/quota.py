@@ -221,8 +221,16 @@ async def fetch_quota(account: Account) -> dict:
     return await asyncio.shield(task)
 
 
+def _prune_quota_cache() -> None:
+    """清理已删除账号的额度缓存，避免 _quota_cache 无界增长。"""
+    live = {a.id for a in store.list_accounts()}
+    for key in [key for key in _quota_cache if key not in live]:
+        _quota_cache.pop(key, None)
+
+
 async def refresh_accounts(accounts: list[Account]) -> dict:
     """并发刷新一批账号，返回汇总。"""
+    _prune_quota_cache()
     if not accounts:
         return {"ok": 0, "fail": 0}
     sem = asyncio.Semaphore(8)

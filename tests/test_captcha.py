@@ -102,7 +102,6 @@ class GatewayCaptchaRetryTests(unittest.IsolatedAsyncioTestCase):
                 "req",
                 account,
                 {},
-                b"{}",
                 {"x-aliyun-captcha-verify-param": "client-token"},
                 None,
                 True,

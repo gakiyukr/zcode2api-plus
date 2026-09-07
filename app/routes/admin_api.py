@@ -82,6 +82,7 @@ async def status_info():
     return {
         "providers": list(PROVIDERS),
         "gateway_key_set": bool(store.gateway_key()),
+        "quota_refresh_interval": store.quota_refresh_interval(),
         "quota_pool": {
             p: sum(1 for a in store.list_accounts(p) if a.is_selectable())
             for p in PROVIDERS

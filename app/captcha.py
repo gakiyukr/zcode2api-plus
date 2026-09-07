@@ -14,7 +14,8 @@ from . import logs, settings
 from .captcha_browser import BrowserWorkerPool, CaptchaBrowserError
 
 
-_DEFAULT_CONFIG = {"enabled": True, "prefix": "no8xfe", "region": "sgp", "sceneId": "11xygtvd"}
+# 上游配置接口不可用时的兜底值；region 与线上实测值一致（旧值 sgp 已过期）
+_DEFAULT_CONFIG = {"enabled": True, "prefix": "no8xfe", "region": "cn", "sceneId": "11xygtvd"}
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class CaptchaManager:
         self._cached_at: float = 0.0
         self._cached_ttl: float = 0.0
         self._lock = asyncio.Lock()
+        self._browser_lock = asyncio.Lock()
         self._config_cache: dict | None = None
         self._config_cache_at: float = 0.0
         self._browser_pool: BrowserWorkerPool | None = None
@@ -61,30 +63,34 @@ class CaptchaManager:
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
     async def get_verify_param(self, port: int | None = None) -> CaptchaToken | None:
-        """返回验证码令牌；真实浏览器令牌每次请求重新生成，人工令牌短期复用。"""
+        """返回验证码令牌；真实浏览器令牌每次请求重新生成，人工/Node 令牌短期复用。
+
+        浏览器路径不持全局锁：并发求解由 BrowserWorkerPool 的 worker 槽位
+        （size 即并发上限）限流；全局锁只保护人工/Node 令牌缓存的单飞与写入。
+        """
         del port  # 保留旧调用参数，验证码服务本身不依赖网关端口。
         now = time.time() * 1000
         if self._cached and now - self._cached_at < self._cached_ttl:
             return self._cached
+
+        config = await self.fetch_config()
+        if config.get("enabled") is False:
+            async with self._browser_lock:
+                self.invalidate()
+                await self._stop_browser_pool()
+            return None
+
+        # Docker 默认使用真实 Chromium；浏览器启动失败时回退旧 Node 求解器。
+        browser_token = await self._solve_browser(config)
+        if browser_token is not None:
+            # 上游验证码参数可能是一次性的，不能像人工回填一样缓存 45 秒。
+            return browser_token
 
         async with self._lock:
             # 二次检查：等锁期间可能已被其他请求或人工页面填充
             now = time.time() * 1000
             if self._cached and now - self._cached_at < self._cached_ttl:
                 return self._cached
-
-            config = await self.fetch_config()
-            if config.get("enabled") is False:
-                self.invalidate()
-                await self._stop_browser_pool()
-                return None
-
-            # Docker 默认使用真实 Chromium；浏览器启动失败时回退旧 Node 求解器。
-            browser_token = await self._solve_browser(config)
-            if browser_token is not None:
-                # 上游验证码参数可能是一次性的，不能像人工回填一样缓存 45 秒。
-                return browser_token
-
             token = await self._solve(config)
             self._cached = token
             self._cached_at = time.time() * 1000
@@ -132,42 +138,47 @@ class CaptchaManager:
         return CaptchaToken(verify_param=param, region=region)
 
     async def _ensure_browser_pool(self, scene: str, region: str, prefix: str) -> BrowserWorkerPool | None:
+        """取已启动的浏览器池，必要时启动；生命周期由 _browser_lock 串行化。"""
         key = (scene, region, prefix)
-        if self._browser_pool and self._browser_config_key == key and self._browser_pool.is_started:
-            return self._browser_pool
+        async with self._browser_lock:
+            # 等锁期间可能已由并发调用触发失败冷却，进入后再查一次
+            if time.monotonic() < self._browser_failure_until:
+                return None
+            if self._browser_pool and self._browser_config_key == key and self._browser_pool.is_started:
+                return self._browser_pool
 
-        await self._stop_browser_pool()
-        pool: BrowserWorkerPool | None = None
-        try:
-            pool = BrowserWorkerPool.from_cloakbrowser(
-                scene,
-                region,
-                prefix,
-                size=settings.CAPTCHA_BROWSER_WORKERS,
-                startup_timeout=float(settings.CAPTCHA_BROWSER_STARTUP_TIMEOUT),
-                request_timeout=float(settings.CAPTCHA_BROWSER_REQUEST_TIMEOUT),
-                queue_timeout=float(settings.CAPTCHA_BROWSER_QUEUE_TIMEOUT),
-                shutdown_timeout=float(settings.CAPTCHA_BROWSER_SHUTDOWN_TIMEOUT),
-            )
-            await pool.start()
-        except Exception as err:  # noqa: BLE001
-            self._browser_failure_until = time.monotonic() + settings.CAPTCHA_BROWSER_FAILURE_COOLDOWN
-            logs.warn(
-                "captcha",
-                f"真实浏览器池不可用，{settings.CAPTCHA_BROWSER_FAILURE_COOLDOWN}s 内回退 Node: {type(err).__name__}",
-            )
-            if pool is not None:
-                try:
-                    await pool.stop()
-                except Exception:  # noqa: BLE001
-                    pass
-            return None
+            await self._stop_browser_pool()
+            pool: BrowserWorkerPool | None = None
+            try:
+                pool = BrowserWorkerPool.from_cloakbrowser(
+                    scene,
+                    region,
+                    prefix,
+                    size=settings.CAPTCHA_BROWSER_WORKERS,
+                    startup_timeout=float(settings.CAPTCHA_BROWSER_STARTUP_TIMEOUT),
+                    request_timeout=float(settings.CAPTCHA_BROWSER_REQUEST_TIMEOUT),
+                    queue_timeout=float(settings.CAPTCHA_BROWSER_QUEUE_TIMEOUT),
+                    shutdown_timeout=float(settings.CAPTCHA_BROWSER_SHUTDOWN_TIMEOUT),
+                )
+                await pool.start()
+            except Exception as err:  # noqa: BLE001
+                self._browser_failure_until = time.monotonic() + settings.CAPTCHA_BROWSER_FAILURE_COOLDOWN
+                logs.warn(
+                    "captcha",
+                    f"真实浏览器池不可用，{settings.CAPTCHA_BROWSER_FAILURE_COOLDOWN}s 内回退 Node: {type(err).__name__}",
+                )
+                if pool is not None:
+                    try:
+                        await pool.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return None
 
-        self._browser_pool = pool
-        self._browser_config_key = key
-        self._browser_failure_until = 0.0
-        logs.ok("captcha", f"真实浏览器验证码池已就绪（{settings.CAPTCHA_BROWSER_WORKERS} 个 worker）")
-        return pool
+            self._browser_pool = pool
+            self._browser_config_key = key
+            self._browser_failure_until = 0.0
+            logs.ok("captcha", f"真实浏览器验证码池已就绪（{settings.CAPTCHA_BROWSER_WORKERS} 个 worker）")
+            return pool
 
     async def _stop_browser_pool(self) -> None:
         pool = self._browser_pool
@@ -249,7 +260,7 @@ class CaptchaManager:
         self._cached_ttl = 0.0
 
     async def close(self) -> None:
-        async with self._lock:
+        async with self._browser_lock:
             await self._stop_browser_pool()
 
 

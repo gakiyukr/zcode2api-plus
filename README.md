@@ -55,52 +55,12 @@ docker run -d --name zcode2api-plus -p 3000:3000 \
 
 > 首次发布后,GHCR 上的包默认可能为私有;如需公开拉取,请到仓库 **Packages → 该包 → Package settings → Change visibility** 设为 Public。
 
-## 裸机部署（systemd，免 Docker）
-
-不想编译 Docker 镜像时,可直接在 Debian/Ubuntu 主机上以 systemd 运行主程序。
-所需材料在 `deploy/` 目录:
-
-| 文件 | 用途 |
-|------|------|
-| `deploy/install.sh` | 一键安装:系统依赖 → Python venv → Node 求解器依赖 → systemd 服务 |
-| `deploy/zcode2api.service` | systemd 单元模板（自动重启、只读加固） |
-| `deploy/zcode2api.env.example` | 环境设定模板,安装时复制为 `deploy/zcode2api.env` |
-
-```bash
-git clone https://github.com/gakiyukr/zcode2api-plus.git /opt/zcode2api
-cd /opt/zcode2api
-sudo bash deploy/install.sh
-```
-
-- **浏览器（Chromium）是可选项**:默认 `ZCODE_CAPTCHA_BROWSER=false`,验证码走 Node + jsdom
-  求解器,不需要 Chromium 与系统图形库;需要真实浏览器池时改用
-  `sudo bash deploy/install.sh --with-browser`(安装系统库 + 预下载 Chromium 二进制)。
-- 默认安装到**脚本所在仓库根目录**,可用 `APP_DIR=/srv/zcode2api sudo bash deploy/install.sh` 换位置;
-  服务以系统账号 `zcode2api` 运行(`RUN_USER` 可覆盖)。
-- 环境变量集中在 `deploy/zcode2api.env`(首次安装生成,重复执行不覆盖),改完 `systemctl restart zcode2api`。
-- 重复执行安装脚本即可**更新程序**:先 `git pull`,再重跑一遍脚本,依赖与服务会同步刷新。
-- 管理:`systemctl {status|restart|stop} zcode2api`;日志:`journalctl -u zcode2api -f`。
-
-### 从 Docker 迁移数据
-
-账号与设置都在 `accounts.db`(SQLite),直接拷贝即可:
-
-```bash
-systemctl stop zcode2api
-# 把原 Docker 部署的 data 目录内容复制到新部署的 data 目录（含 accounts.db）
-cp -a /原docker部署路径/data/. /opt/zcode2api/data/
-chown -R zcode2api:zcode2api /opt/zcode2api/data
-systemctl start zcode2api
-```
-
 ## 后台 UI
 
 | 页面 | 说明 |
 |------|------|
 | `/admin/login` | 后台登录（Bearer 密钥鉴权，凭证加密存于浏览器 localStorage）|
-| `/admin/dashboard` | 儀表板：帳號池、提供商、額度與即時活動總覽 |
-| `/admin/usage` | 用量分析：Token 組成、帳號調度分布與累計排行 |
-| `/admin/monitor` | 運維監控：服務健康、請求品質、CPU／記憶體與元件狀態 |
+| `/admin/dashboard` | 儀表板：帳號池、提供商、額度、調度分布與用量排行總覽 |
 | `/admin/accounts` | 账号池：新增/导入/导出、启用禁用、**实时额度与状态监控**（每 5 秒刷新）|
 | `/admin/proxies` | 代理設定：管理 HTTP／SOCKS5 出口並指派給指定帳號 |
 | `/admin/settings` | 后台密码、网关 API Key |
@@ -121,8 +81,8 @@ systemctl start zcode2api
 
 - 在「账号池」粘贴 Coding Plan JWT（3 段点分）或 API Key，每行一个即可加入轮询。
 - 网关每次请求选择下一个「可用」账号（跳过用完 / 限流 / 异常 / 禁用）。
-- 命中额度用完信号（余额为 0、上游 402、错误体含 quota/余额 等）→ 标记 `exhausted` 并换下一个账号。
-- 上游 429 → 标记 `cooling` 冷却一段时间后自动恢复；401/403（非验证码）→ 标记 `invalid`。
+- 命中额度用完信号（余额为 0、上游 402、429 官方用量上限码族 1113/1308-1311/1313/1316-1321、业务码 1005）→ 只标记该模型 `exhausted` 并换下一个账号。
+- 上游 429（瞬时限流 1302/1305 等）→ 标记 `cooling` 冷却一段时间后自动恢复；401/403（非验证码）→ 标记 `invalid`；其余上游错误不做账号状态推断，原样透传给客户端。
 - 后台任务按 `ZCODE_QUOTA_REFRESH_INTERVAL` 周期刷新各账号额度；也可在 UI 手动刷新。
 
 ## 鉴权
@@ -130,6 +90,7 @@ systemctl start zcode2api
 - **后台鉴权**：所有 `/admin/api/*` 需 `Authorization: Bearer <后台密码>`。
   密码由 `ZCODE_ADMIN_KEY` 指定；未指定时首次启动随机生成并打印在启动日志中
   （历史版本使用过的默认密码 `zcode` 会在升级启动时强制轮换）。
+  连续鉴权失败会被限速：单 IP 5 分钟内失败达 10 次后一律 429（含正确密码），成功校验即清零。
 - **网关鉴权（必填）**：`/v1/messages`、`/async/v1/*`、`/v1/models` 一律要求 API Key，
   携带 `Authorization: Bearer <key>` 或 `x-api-key: <key>`。密钥由 `ZCODE_GATEWAY_KEY`
   指定，未指定时首次启动随机生成（见启动日志），亦可在后台「设置」页查看与修改。
@@ -204,7 +165,7 @@ python main.py export [file] / import <file>       # 导出 / 导入账号
 │   ├── routes/            # gateway / admin_api / pages
 │   └── statics/           # （已移除，後台改為 frontend/ SPA）
 ├── frontend/              # 管理後台 SPA（Vite + React + TypeScript + Tailwind v4 + shadcn/ui）
-│   ├── src/pages/         # login / dashboard / accounts / usage / monitor / proxies / settings / captcha
+│   ├── src/pages/         # login / dashboard / accounts / proxies / settings / captcha
 │   ├── src/lib/           # admin-key（舊 auth.js 加密格式相容）/ api / format / types
 │   └── dist/              # 建置產物（npm run build，git 忽略）
 ├── captcha_node/          # 无浏览器无痕验证求解器（Node + jsdom，solver.js）
@@ -221,7 +182,7 @@ python main.py export [file] / import <file>       # 导出 / 导入账号
 
 ## 技术栈
 
-- Python 3.13 · FastAPI · Uvicorn · httpx
+- Python 3.11（Docker 镜像版本，cloakbrowser 兼容性锁定）· FastAPI · Uvicorn · httpx
 - SQLite（账号 / 设置持久化，WAL 模式）
 - Node.js + jsdom（无浏览器求解阿里云无痕验证 → verifyParam）
 
@@ -238,7 +199,7 @@ npm run build    # 產出 frontend/dist/（後端服務此目錄，源碼運行�
 
 - 後端將 `/admin/*` 全部回落到 `frontend/dist/index.html`（SPA 內部路由重新整理不 404），`/assets/*` 為 Vite 靜態資源。
 - 登入密鑰沿用舊版的加密儲存格式（localStorage `zcode2api_admin_key`），升級後既有瀏覽器 session 無需重新登入。
-- Docker 映像與 `deploy/install.sh` 皆會自動執行前端建置。
+- Docker 映像會自動執行前端建置。
 
 ## 文档
 

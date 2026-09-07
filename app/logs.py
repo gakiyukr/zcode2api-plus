@@ -35,11 +35,10 @@ def header(module: str, msg: str):
     print(f"  {_B}{_MAG}{module}{_R} {msg}")
 
 
-def req(req_id: str, model: str, stream: bool, last_msg: str):
-    """请求日志 — 一行显示关键信息"""
+def req(req_id: str, model: str, stream: bool):
+    """请求日志 — 只记录元信息，不记录消息内容（避免 prompt 落入终端日志）"""
     s = "stream" if stream else "sync"
-    msg_preview = last_msg[:40] + ("..." if len(last_msg) > 40 else "")
-    print(f"  {_C}>>>{_R} {_DIM}{req_id}{_R}  {_W}{model}{_R}  {_DIM}{s}{_R}  {_DIM}\"{msg_preview}\"{_R}")
+    print(f"  {_C}>>>{_R} {_DIM}{req_id}{_R}  {_W}{model}{_R}  {_DIM}{s}{_R}")
 
 
 def req_ok(req_id: str, tokens: int = 0):

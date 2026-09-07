@@ -31,14 +31,10 @@ MAX_CAPTCHA_RETRIES = 3
 MAX_ACCOUNT_ATTEMPTS = 5
 _START_PLAN_BUSY_RETRY_DELAYS = (1.0, 2.0)
 
-# Z.AI 上游模型名大小写敏感
+# Z.AI 上游模型名大小写敏感；仅映射开放清单内的模型，
+# 其余写法本就会被白名单拒绝，无需维护映射。
 MODEL_NAME_MAP = {
-    "glm-5.2": "GLM-5.2",
-    "glm-5-turbo": "GLM-5-Turbo",
-    "glm-turbo": "GLM-5-Turbo",
     "glm-5.3": "GLM-5.3",
-    "glm-5.1": "GLM-5.1",
-    "glm-4.7": "GLM-4.7",
 }
 
 # /v1/models 对外公布的可用模型（仅保留 5.3 系列，其余模型不再对外开放）
@@ -56,8 +52,14 @@ def _model_allowed(model: object) -> bool:
     return normalize_model_name(model) in _ALLOWED_MODELS
 
 
-# 命中以下信号则认为账号额度用完
-_EXHAUST_KEYWORDS = ("quota", "insufficient", "balance", "exhaust", "额度", "余额不足")
+# Z.AI 官方 429 业务码中的额度/用量上限族（docs.z.ai 错误码表）：
+# 1113 欠费；1308 用量上限；1309 套餐过期；1310 周/月上限；1311 套餐不含此模型；
+# 1313 公平使用；1316-1321 5小时/7天上限及子账户/企业消费上限。
+# 与瞬时限流（1302/1305）区分：上限族按「模型耗尽」换号，限流按冷却换号。
+_QUOTA_EXHAUSTED_CODES = {
+    "1113", "1308", "1309", "1310", "1311", "1313",
+    "1316", "1317", "1318", "1319", "1320", "1321",
+}
 _CAPTCHA_HEADERS = (
     "x-aliyun-captcha-verify-param",
     "x-aliyun-captcha-verify-region",
@@ -149,11 +151,21 @@ def _captcha_required(req_id: str, detail: str) -> JSONResponse:
     )
 
 
-def _is_exhausted(status_code: int, text: str) -> bool:
-    if status_code in (402,):
-        return True
-    low = text.lower()
-    return any(k in low for k in _EXHAUST_KEYWORDS)
+def _upstream_business_code(text: str) -> str | None:
+    """提取上游错误体中的业务码。
+
+    兼容两种形态：zcode-plan 包装格式 {"code":..,"msg":..} 与
+    api.z.ai 的 Anthropic 风格 {"error":{"message":..,"type":"1000"}}。
+    """
+    payload = _safe_json(text)
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    if code is None:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = error.get("type")
+    return None if code is None else str(code)
 
 
 def _is_model_concurrency_limit(status_code: int, text: str) -> bool:
@@ -192,20 +204,6 @@ def _mark_model_exhausted(account: Account, model: object, error: str) -> None:
     store.update_account(account)
 
 
-def _last_user_text(body: dict) -> str:
-    for msg in reversed(body.get("messages") or []):
-        if not isinstance(msg, dict) or msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    return part.get("text", "")
-    return ""
-
-
 @router.get("/v1/models", dependencies=[Depends(verify_gateway_key)])
 async def list_models():
     """列出可用模型（Anthropic /v1/models 风格）。"""
@@ -242,9 +240,8 @@ async def messages(request: Request):
 
     # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
     port = request.url.port or settings.PORT
-    payload = json.dumps(body).encode("utf-8")
 
-    logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
+    logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")))
 
     tried: set[str] = set()
 
@@ -255,7 +252,7 @@ async def messages(request: Request):
         tried.add(account.id)
         needs_captcha = provider == "zai" and account.mode == "jwt"
 
-        result = await _try_account(req_id, account, body, payload, incoming_headers, port, needs_captcha)
+        result = await _try_account(req_id, account, body, incoming_headers, port, needs_captcha)
         if result is _NEXT_ACCOUNT:
             continue
         return result
@@ -276,7 +273,7 @@ async def messages(request: Request):
 _NEXT_ACCOUNT = object()
 
 
-async def _try_account(req_id, account, body, payload, incoming_headers, port, needs_captcha):
+async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha):
     """尝试用单个账号转发，含验证码续期。返回 Response 或 _NEXT_ACCOUNT。"""
     # JWT 账号需要注入 ZCode 系统提示词
     needs_zcode_system = account.mode == "jwt"
@@ -333,16 +330,18 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                     return _captcha_required(req_id, detail)
                 continue  # 同账号重试验证码
 
-            if _is_exhausted(status_code, text):
+            # 鉴权失败是强信号（JWT 上游为裸 401 空 body；api.z.ai 为
+            # error.type=1000/1001/1003），先于额度判定，避免响应体内容干扰。
+            if status_code in (401, 403):
+                _mark(account, Status.INVALID, f"鉴权失败 HTTP {status_code}")
+                logs.warn(req_id, f"账号 {account.name} 鉴权失败 {status_code}，切换下一个")
+                return _NEXT_ACCOUNT
+
+            if status_code == 402:
                 model = body.get("model")
                 _mark_model_exhausted(account, model, f"{model or '當前模型'} 額度已用完")
                 logs.warn(req_id, f"账号 {account.name} 的 {model or '當前模型'} 額度用完，切換下一個")
                 asyncio.create_task(_safe_refresh(account))
-                return _NEXT_ACCOUNT
-
-            if status_code in (401, 403):
-                _mark(account, Status.INVALID, f"鉴权失败 HTTP {status_code}")
-                logs.warn(req_id, f"账号 {account.name} 鉴权失败 {status_code}，切换下一个")
                 return _NEXT_ACCOUNT
 
             if _is_model_concurrency_limit(status_code, text):
@@ -360,8 +359,14 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                 )
 
             if status_code == 429:
-                _mark(account, Status.COOLING, "上游限流 429")
-                logs.warn(req_id, f"账号 {account.name} 被限流 429，切换下一个")
+                if _upstream_business_code(text) in _QUOTA_EXHAUSTED_CODES:
+                    model = body.get("model")
+                    _mark_model_exhausted(account, model, f"{model or '當前模型'} 額度/用量上限已達")
+                    logs.warn(req_id, f"账号 {account.name} 的 {model or '當前模型'} 觸發用量上限，切換下一個")
+                    asyncio.create_task(_safe_refresh(account))
+                else:
+                    _mark(account, Status.COOLING, "上游限流 429")
+                    logs.warn(req_id, f"账号 {account.name} 被限流 429，切换下一个")
                 return _NEXT_ACCOUNT
 
             if status_code == 503:
@@ -370,7 +375,7 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                 logs.warn(req_id, f"账号 {account.name} 上游返回 503，進入冷卻並切換下一個")
                 return _NEXT_ACCOUNT
 
-            # 其它错误：直接回传客户端
+            # 其它错误：非已知信号，不做账号状态推断，直接原样继承上游响应
             account.fail_count += 1
             store.update_account(account)
             logs.req_err(req_id, f"上游错误 HTTP {status_code}（账号 {account.name}）")
