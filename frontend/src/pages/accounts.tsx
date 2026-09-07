@@ -585,7 +585,7 @@ export function AccountsPage() {
                 <div className="flex flex-col gap-3">
                   <p className="text-xs text-muted-foreground">1. 開啟授權頁並完成 Z.AI 登入：</p>
                   <div className="flex items-center gap-2">
-                    <Input readOnly value={flow.url} className="flex-1 font-mono text-xs" />
+                    <Input readOnly value={flow.url} className="min-w-0 flex-1 font-mono text-xs" />
                     <Button variant="outline" size="sm" onClick={copyLoginUrl}>複製</Button>
                     <Button size="sm" onClick={openLoginUrl}>開啟</Button>
                   </div>
