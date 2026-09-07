@@ -6,8 +6,6 @@ import { Topbar } from '@/components/layout/topbar'
 import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar'
 import { LoginPage } from '@/pages/login'
 import { DashboardPage } from '@/pages/dashboard'
-import { UsagePage } from '@/pages/usage'
-import { MonitorPage } from '@/pages/monitor'
 import { AccountsPage } from '@/pages/accounts'
 import { ProxiesPage } from '@/pages/proxies'
 import { CaptchaPage } from '@/pages/captcha'
@@ -38,8 +36,6 @@ export default function App() {
       <Route element={<Shell />}>
         <Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} />
         <Route path="/admin/dashboard" element={<DashboardPage />} />
-        <Route path="/admin/usage" element={<UsagePage />} />
-        <Route path="/admin/monitor" element={<MonitorPage />} />
         <Route path="/admin/accounts" element={<AccountsPage />} />
         <Route path="/admin/proxies" element={<ProxiesPage />} />
         <Route path="/admin/captcha" element={<CaptchaPage />} />

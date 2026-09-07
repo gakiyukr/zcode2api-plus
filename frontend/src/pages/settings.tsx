@@ -5,6 +5,7 @@ import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { adminKey } from '@/lib/admin-key'
@@ -20,6 +21,7 @@ export function SettingsPage() {
   const [adminKeyInput, setAdminKeyInput] = useState('')
   const [gatewayKey, setGatewayKey] = useState('')
   const [quotaInterval, setQuotaInterval] = useState('60')
+  const [showKeys, setShowKeys] = useState(false)
   const [saving, setSaving] = useState(false)
 
   /* 載入完成後填入表單（僅在尚未編輯時同步） */
@@ -78,22 +80,33 @@ export function SettingsPage() {
             <div className="flex flex-col gap-2">
               <Label htmlFor="set-admin-key">後台密碼</Label>
               <div className="text-xs text-muted-foreground">用於登入此管理後台。修改後需用新密碼重新登入。</div>
-              <Input id="set-admin-key" value={adminKeyInput} onChange={(e) => setAdminKeyInput(e.target.value)} />
+              <Input
+                id="set-admin-key"
+                type={showKeys ? 'text' : 'password'}
+                value={adminKeyInput}
+                onChange={(e) => setAdminKeyInput(e.target.value)}
+              />
             </div>
             <div className="flex flex-col gap-2">
-              <Label htmlFor="set-gateway-key">網關 API Key（可選）</Label>
+              <Label htmlFor="set-gateway-key">網關 API Key</Label>
               <div className="text-xs text-muted-foreground">
-                設定後，呼叫 <code className="rounded bg-muted px-1">/v1/messages</code> 須攜帶{' '}
+                一律必填（fail-closed）：呼叫 <code className="rounded bg-muted px-1">/v1/messages</code>、
+                <code className="rounded bg-muted px-1">/async/v1/*</code>、
+                <code className="rounded bg-muted px-1">/v1/models</code> 須攜帶{' '}
                 <code className="rounded bg-muted px-1">Authorization: Bearer &lt;key&gt;</code> 或{' '}
-                <code className="rounded bg-muted px-1">x-api-key</code>。留空則不校驗。
+                <code className="rounded bg-muted px-1">x-api-key</code>。留空儲存會被拒絕。
               </div>
               <Input
                 id="set-gateway-key"
+                type={showKeys ? 'text' : 'password'}
                 value={gatewayKey}
                 onChange={(e) => setGatewayKey(e.target.value)}
-                placeholder="留空表示不啟用"
               />
             </div>
+            <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+              <Checkbox checked={showKeys} onCheckedChange={(v) => setShowKeys(v === true)} />
+              顯示密鑰明文
+            </label>
             <div className="flex flex-col gap-2">
               <Label htmlFor="set-quota-interval">額度刷新間隔（秒）</Label>
               <div className="text-xs text-muted-foreground">

@@ -1,4 +1,4 @@
-/* 儀表板頁：網關指標卡、提供商概況、帳號健康圓環、Token 組成、最近活動、網關資訊（輪詢 10 秒） */
+/* 儀表板頁：網關指標卡、提供商概況、帳號健康、Token 組成、帳號調度分布、用量排行、最近活動、網關資訊（輪詢 10 秒） */
 import {
   Boxes,
   CircleCheck,
@@ -12,6 +12,8 @@ import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { Empty, MetricCard, PanelCard } from '@/components/panel'
 import { Button } from '@/components/ui/button'
+import { Card } from '@/components/ui/card'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { api } from '@/lib/api'
 import { fmt, fmtCompact, relativeTime } from '@/lib/format'
 import {
@@ -19,20 +21,20 @@ import {
   STATUS_LABEL_LONG,
   type Account,
   type AccountsResponse,
-  type SettingsResponse,
   type StatusResponse,
+  type UsageResponse,
 } from '@/lib/types'
 
 export function DashboardPage() {
   const { data, isFetching, refetch } = useQuery({
     queryKey: ['dashboard'],
     queryFn: async () => {
-      const [accountsData, statusData, settingsData] = await Promise.all([
+      const [accountsData, statusData, usageData] = await Promise.all([
         api<AccountsResponse>('GET', '/accounts'),
         api<StatusResponse>('GET', '/status'),
-        api<SettingsResponse>('GET', '/settings'),
+        api<UsageResponse>('GET', '/usage'),
       ])
-      return { accountsData, statusData, settingsData }
+      return { accountsData, statusData, usageData }
     },
     refetchInterval: 10000,
   })
@@ -41,7 +43,8 @@ export function DashboardPage() {
   const stats = data?.accountsData.stats
   const providers = data?.accountsData.providers ?? []
   const status = data?.statusData
-  const settings = data?.settingsData
+  const usage = data?.usageData
+  const usageCalls = Number(usage?.summary?.calls) || 0
 
   const calls = Number(stats?.calls) || 0
   const failed = Number(stats?.fail) || 0
@@ -205,6 +208,62 @@ export function DashboardPage() {
         </PanelCard>
       </div>
 
+      {/* 帳號調度分布＋用量排行（原用量分析頁內容） */}
+      <div className="grid gap-4 lg:grid-cols-5">
+        <PanelCard title="帳號調度分布" subtitle="依請求數排序" className="lg:col-span-2">
+          <Donut ranking={usage?.ranking ?? []} calls={usageCalls} />
+        </PanelCard>
+
+        <PanelCard title="帳號用量排行" subtitle="目前服務程序啟動後的累計調度" badge={fmt(usageCalls)} className="lg:col-span-3">
+          <Card className="overflow-x-auto py-0">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>帳號</TableHead>
+                  <TableHead>提供商</TableHead>
+                  <TableHead className="text-right">請求</TableHead>
+                  <TableHead className="text-right">失敗</TableHead>
+                  <TableHead className="text-right">Token</TableHead>
+                  <TableHead className="w-40">佔比</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {(usage?.ranking ?? []).length ? (
+                  (usage?.ranking ?? []).map((r) => {
+                    const pct = usageCalls ? (r.requests / usageCalls) * 100 : 0
+                    return (
+                      <TableRow key={r.name}>
+                        <TableCell className="font-medium">{r.name}</TableCell>
+                        <TableCell>
+                          <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700">{r.provider}</span>
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">{fmt(r.requests)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{fmt(r.errors)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{fmtCompact(r.tokens)}</TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-2">
+                            <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+                              <i className="block h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+                            </span>
+                            <small className="w-11 shrink-0 text-right text-xs tabular-nums text-muted-foreground">{pct.toFixed(1)}%</small>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })
+                ) : (
+                  <TableRow>
+                    <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
+                      尚無帳號用量資料
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </Card>
+        </PanelCard>
+      </div>
+
       {/* 網關資訊 */}
       <PanelCard
         title="網關資訊"
@@ -223,7 +282,7 @@ export function DashboardPage() {
           </div>
           <div className="grid grid-cols-3 gap-3 text-sm">
             <GatewayMeta label="API 鑑權" value={status?.gateway_key_set ? '已啟用' : '未啟用'} />
-            <GatewayMeta label="額度更新" value={settings?.quota_refresh_interval ? `${settings.quota_refresh_interval} 秒` : '手動'} />
+            <GatewayMeta label="額度更新" value={status?.quota_refresh_interval ? `${status.quota_refresh_interval} 秒` : '手動'} />
             <GatewayMeta
               label="資料更新"
               value={data ? new Date(data.accountsData.ts * 1000).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '--'}
@@ -281,6 +340,48 @@ function HealthDonut({ stats }: { stats?: AccountsResponse['stats'] }) {
 function accountTokens(a: Account): number {
   const t = a.total_tokens || { input: 0, output: 0, cache_creation: 0, cache_read: 0 }
   return (Number(t.input) || 0) + (Number(t.output) || 0) + (Number(t.cache_creation) || 0) + (Number(t.cache_read) || 0)
+}
+
+/* 調度分布圓環配色（原用量分析頁）：前五名帳號各一色，其餘歸入灰底 */
+const PALETTE = ['#3b82f6', '#10b981', '#8b5cf6', '#f59e0b', '#94a3b8']
+
+/* 調度分布圓環：前五名帳號請求占比 */
+function Donut({ ranking, calls }: { ranking: UsageResponse['ranking']; calls: number }) {
+  const top = ranking.slice(0, 5)
+  let cursor = 0
+  const stops = top.map((r, i) => {
+    const pct = calls ? (Number(r.requests) / calls) * 100 : 0
+    const seg = `${PALETTE[i]} ${cursor}% ${cursor + pct}%`
+    cursor += pct
+    return seg
+  })
+  stops.push(`#e9edf3 ${cursor}% 100%`)
+  return (
+    <div className="flex items-center gap-6">
+      <div
+        className="relative flex size-32 shrink-0 items-center justify-center rounded-full"
+        style={{ background: `conic-gradient(${stops.join(',')})` }}
+      >
+        <div className="flex size-[86px] flex-col items-center justify-center rounded-full bg-card">
+          <strong className="text-xl tabular-nums">{fmt(calls)}</strong>
+          <span className="text-xs text-muted-foreground">請求</span>
+        </div>
+      </div>
+      <div className="flex min-w-0 flex-1 flex-col gap-2 text-sm">
+        {top.length ? (
+          top.map((r, i) => (
+            <div key={r.name} className="flex items-center gap-2">
+              <span className="size-2 shrink-0 rounded-full" style={{ background: PALETTE[i] }} />
+              <span className="min-w-0 flex-1 truncate text-muted-foreground">{r.name}</span>
+              <strong className="shrink-0 tabular-nums">{calls ? ((r.requests / calls) * 100).toFixed(1) : '0'}%</strong>
+            </div>
+          ))
+        ) : (
+          <Empty>尚無用量資料</Empty>
+        )}
+      </div>
+    </div>
+  )
 }
 
 function MetaStat({ label, value }: { label: string; value: string }) {

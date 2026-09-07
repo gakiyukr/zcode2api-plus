@@ -1,7 +1,5 @@
-/* 後台導覽定義：沿用舊版 header.js 的七項導覽與分組（總覽／營運／設定） */
+/* 後台導覽定義：總覽（儀表板，含原用量分析內容）／營運／設定三分組 */
 import {
-  ChartColumn,
-  ChartLine,
   LayoutDashboard,
   Settings,
   ShieldCheck,
@@ -19,8 +17,6 @@ export interface NavItem {
 
 export const NAV_ITEMS: NavItem[] = [
   { href: '/admin/dashboard', label: '儀表板', group: '總覽', icon: LayoutDashboard },
-  { href: '/admin/usage', label: '用量分析', group: '總覽', icon: ChartLine },
-  { href: '/admin/monitor', label: '運維監控', group: '營運', icon: ChartColumn },
   { href: '/admin/accounts', label: '帳號池', group: '營運', icon: Users },
   { href: '/admin/proxies', label: '代理設定', group: '營運', icon: SlidersHorizontal },
   { href: '/admin/captcha', label: '驗證中心', group: '營運', icon: ShieldCheck },

@@ -84,6 +84,7 @@ export interface AccountsResponse {
 export interface StatusResponse {
   providers: string[]
   gateway_key_set: boolean
+  quota_refresh_interval: number
   quota_pool: Record<string, number>
 }
 
@@ -102,19 +103,6 @@ export interface EgressInfo {
   ok?: boolean
   source?: string
   latency_ms?: number
-}
-
-export interface MonitorResponse {
-  ts: number
-  uptime_sec: number
-  system: {
-    cpu_count: number
-    load_1m: number | null
-    memory: { total_mb: number | null; available_mb: number | null; used_percent: number | null }
-  }
-  requests: { total: number; errors: number; success_rate: number | null; average_qps: number }
-  accounts: { total: number; active: number; cooling: number; exhausted: number; invalid: number; disabled: number }
-  services: { name: string; status: string; detail: string }[]
 }
 
 export interface UsageRankingRow {
