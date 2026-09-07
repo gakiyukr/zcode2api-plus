@@ -191,11 +191,21 @@ class ProxyProfileStoreTests(unittest.TestCase):
         self._old_db_path = settings.DB_PATH
         settings.DATA_DIR = Path(self._temp.name)
         settings.DB_PATH = settings.DATA_DIR / "accounts.db"
-        self.store = Store()
+        self._stores: list[Store] = []
+        self.store = self.make_store()
+
+    def make_store(self) -> Store:
+        """建立登錄於本測試案例的 Store，tearDown 時統一關閉以釋放檔案鎖。"""
+        store = Store()
+        self._stores.append(store)
+        return store
 
     def tearDown(self):
         settings.DATA_DIR = self._old_data_dir
         settings.DB_PATH = self._old_db_path
+        # Windows 檔案鎖：連接未關閉前無法刪除臨時資料庫
+        for store in self._stores:
+            store.close()
         self._temp.cleanup()
 
     def test_profile_assignment_update_and_delete(self):
@@ -213,7 +223,7 @@ class ProxyProfileStoreTests(unittest.TestCase):
         self.assertIsNotNone(updated)
         self.assertEqual(account.proxy_url, "http://127.0.0.1:8080")
 
-        reloaded = Store()
+        reloaded = self.make_store()
         restored = reloaded.find_any(account.id)
         self.assertIsNotNone(restored)
         self.assertEqual(restored.proxy_id, profile["id"])

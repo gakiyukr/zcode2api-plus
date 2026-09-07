@@ -14,7 +14,6 @@ import secrets
 import sqlite3
 import threading
 import time
-from contextlib import closing
 
 from . import settings
 from .models import PROVIDERS, Account, Status
@@ -34,6 +33,7 @@ class Store:
         self._accounts: dict[str, list[Account]] = {p: [] for p in PROVIDERS}
         self._settings: dict = {}
         self._rotation: dict[str, int] = {p: 0 for p in PROVIDERS}
+        self._conn: sqlite3.Connection | None = None
         # 本次啟動隨機生成／輪換的金鑰，供啟動橫幅提示管理者（環境變數配置時不記錄）
         self.generated_admin_key: str | None = None
         self.generated_gateway_key: str | None = None
@@ -41,17 +41,33 @@ class Store:
         self._load()
 
     # ── SQLite 基础 ──────────────────────────────────────────────────────────
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(settings.DB_PATH, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
+    def _connection(self) -> sqlite3.Connection:
+        """进程内复用的单个连接（WAL），由 _lock 串行化访问。
+
+        每次写库都新开连接并重复设置 PRAGMA 是事件循环上最大的阻塞来源；
+        复用后写路径只剩语句执行与 WAL commit，连接无须关闭。
+        """
+        if self._conn is None:
+            conn = sqlite3.connect(settings.DB_PATH, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._conn = conn
+        return self._conn
+
+    def close(self) -> None:
+        """關閉復用連接。生產進程結束時釋放；測試必須在刪除臨時資料庫前呼叫，
+        否則 Windows 因檔案鎖無法清理仍被連接持有的 accounts.db。"""
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
     def _init_db(self) -> None:
         settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with closing(self._connect()) as conn:
+        with self._lock:
+            conn = self._connection()
             conn.executescript(
                 f"""
                 CREATE TABLE IF NOT EXISTS {_META} (
@@ -118,7 +134,8 @@ class Store:
             )
 
     def _load(self) -> None:
-        with closing(self._connect()) as conn:
+        with self._lock:
+            conn = self._connection()
             meta_rows = conn.execute(f"SELECT key, value FROM {_META}").fetchall()
             self._settings = {r["key"]: r["value"] for r in meta_rows}
             # 金鑰由 _bootstrap_auth_keys 保證存在；此處缺省空值即拒絕鑑權（fail closed）
@@ -139,7 +156,8 @@ class Store:
                     self._accounts[account.provider].append(account)
 
     def _persist_account(self, account: Account) -> None:
-        with closing(self._connect()) as conn:
+        with self._lock:
+            conn = self._connection()
             conn.execute(
                 f"""INSERT OR REPLACE INTO {_TBL}
                     (id, provider, name, mode, status, enabled, created_at, data)
@@ -153,24 +171,19 @@ class Store:
             conn.commit()
 
     def _delete_account(self, account_id: str) -> None:
-        with closing(self._connect()) as conn:
+        with self._lock:
+            conn = self._connection()
             conn.execute(f"DELETE FROM {_TBL} WHERE id = ?", (account_id,))
             conn.commit()
 
     def _set_meta(self, key: str, value: str) -> None:
-        with closing(self._connect()) as conn:
+        with self._lock:
+            conn = self._connection()
             conn.execute(
                 f"INSERT OR REPLACE INTO {_META} (key, value) VALUES (?, ?)",
                 (key, value),
             )
             conn.commit()
-
-    def save(self) -> None:
-        """全量落库（兜底接口）。"""
-        with self._lock:
-            for accounts in self._accounts.values():
-                for account in accounts:
-                    self._persist_account(account)
 
     # ── 设置 ─────────────────────────────────────────────────────────────────
     def get_setting(self, key: str, default=None):

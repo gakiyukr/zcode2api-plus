@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -115,7 +116,7 @@ class GatewayCaptchaRetryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(gateway.store, "update_account"),
             patch.object(gateway.asyncio, "create_task", side_effect=lambda coroutine: coroutine.close()),
         ):
-            response = await gateway._try_account("req", account, {}, b"{}", {}, None, True)
+            response = await gateway._try_account("req", account, {}, {}, None, True)
             chunks = [chunk async for chunk in response.body_iterator]
 
         self.assertEqual(response.status_code, 200)
@@ -138,7 +139,7 @@ class GatewayCaptchaRetryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(gateway.asyncio, "sleep", AsyncMock()),
             patch.object(gateway.asyncio, "create_task", side_effect=lambda coroutine: coroutine.close()),
         ):
-            response = await gateway._try_account("req", account, {}, b"{}", {}, None, True)
+            response = await gateway._try_account("req", account, {}, {}, None, True)
             chunks = [chunk async for chunk in response.body_iterator]
 
         self.assertEqual(response.status_code, 200)
@@ -164,7 +165,7 @@ class GatewayCaptchaRetryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(gateway.asyncio, "create_task", side_effect=lambda coroutine: coroutine.close()),
         ):
             response = await gateway._try_account(
-                "req", account, {"stream": True, "model": "GLM-5.3-Flash"}, b"{}", {}, None, False
+                "req", account, {"stream": True, "model": "GLM-5.3-Flash"}, {}, None, False
             )
 
         self.assertIs(response, gateway._NEXT_ACCOUNT)
@@ -183,7 +184,7 @@ class GatewayCaptchaRetryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(gateway.store, "update_account"),
         ):
             response = await gateway._try_account(
-                "req", account, {"stream": True, "model": "GLM-5.3"}, b"{}", {}, None, False
+                "req", account, {"stream": True, "model": "GLM-5.3"}, {}, None, False
             )
 
         self.assertIs(response, gateway._NEXT_ACCOUNT)
@@ -234,7 +235,7 @@ class GatewayTokenStatsTests(unittest.IsolatedAsyncioTestCase):
             patch.object(gateway.store, "update_account") as update,
             patch.object(gateway.asyncio, "create_task", side_effect=lambda coroutine: coroutine.close()),
         ):
-            response = await gateway._try_account("req", account, {}, b"{}", {}, None, True)
+            response = await gateway._try_account("req", account, {}, {}, None, True)
             chunks = [chunk async for chunk in response.body_iterator]
 
         self.assertEqual(response.status_code, 200)
@@ -243,6 +244,139 @@ class GatewayTokenStatsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["input"], 11)
         self.assertEqual(usage["output"], 22)
         update.assert_called()
+
+
+class GatewayErrorClassificationTests(unittest.IsolatedAsyncioTestCase):
+    """上游错误按「状态码 + 官方业务码」分类；未识别信号原样透传，不做关键词猜测。"""
+
+    @staticmethod
+    def _prepare(responses):
+        _SequenceClient.responses = responses
+        _SequenceClient.calls = 0
+        return _SequenceClient
+
+    async def test_business_code_extraction(self):
+        self.assertEqual(gateway._upstream_business_code('{"code":1310,"msg":"cap"}'), "1310")
+        self.assertEqual(
+            gateway._upstream_business_code('{"error":{"message":"Authentication Failed","type":"1000"}}'),
+            "1000",
+        )
+        self.assertIsNone(gateway._upstream_business_code("not json"))
+        self.assertIsNone(gateway._upstream_business_code('{"error":"flat"}'))
+
+    async def test_401_with_quota_words_marks_invalid(self):
+        """鉴权失败必须先于额度判定：401 body 即使含 quota 字样也判 invalid 而非耗尽。"""
+        account = Account.create("zai", "auth", "header.payload.signature")
+        client = self._prepare(
+            [_SequenceResponse(401, '{"error":{"message":"insufficient quota","type":"1000"}}')]
+        )
+
+        with (
+            patch.object(gateway.httpx, "AsyncClient", client),
+            patch.object(gateway.store, "update_account"),
+        ):
+            response = await gateway._try_account(
+                "req", account, {"stream": True, "model": "GLM-5.3"}, {}, None, False
+            )
+
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "invalid")
+        self.assertEqual(account.exhausted_models, [])
+
+    async def test_401_empty_body_marks_invalid(self):
+        """实测 JWT 上游的 401 为空 body（Content-Length: 0），仍应判 invalid。"""
+        account = Account.create("zai", "auth-empty", "header.payload.signature")
+        client = self._prepare([_SequenceResponse(401, "")])
+
+        with (
+            patch.object(gateway.httpx, "AsyncClient", client),
+            patch.object(gateway.store, "update_account"),
+        ):
+            response = await gateway._try_account(
+                "req", account, {"stream": True, "model": "GLM-5.3"}, {}, None, False
+            )
+
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "invalid")
+
+    async def test_402_exhausts_requested_model(self):
+        account = Account.create("zai", "payment", "header.payload.signature")
+        account.quota = {
+            "GLM-5.3": {"remaining": 1_000},
+            "GLM-5.3-Flash": {"remaining": 1_000},
+        }
+        client = self._prepare([_SequenceResponse(402, '{"error":{"message":"payment required"}}')])
+
+        with (
+            patch.object(gateway.httpx, "AsyncClient", client),
+            patch.object(gateway.store, "update_account"),
+            patch.object(gateway.asyncio, "create_task", side_effect=lambda coroutine: coroutine.close()),
+        ):
+            response = await gateway._try_account(
+                "req", account, {"stream": True, "model": "GLM-5.3"}, {}, None, False
+            )
+
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "active")
+        self.assertEqual(account.exhausted_models, ["glm-5.3"])
+
+    async def test_429_official_quota_code_exhausts_model(self):
+        """429 + 官方用量上限码族（如 1310）按模型耗尽处理，账号保持可用。"""
+        account = Account.create("zai", "cap", "header.payload.signature")
+        account.quota = {
+            "GLM-5.3": {"remaining": 1_000},
+            "GLM-5.3-Flash": {"remaining": 1_000},
+        }
+        client = self._prepare([_SequenceResponse(429, '{"code":1310,"msg":"usage cap reached"}')])
+
+        with (
+            patch.object(gateway.httpx, "AsyncClient", client),
+            patch.object(gateway.store, "update_account"),
+            patch.object(gateway.asyncio, "create_task", side_effect=lambda coroutine: coroutine.close()),
+        ):
+            response = await gateway._try_account(
+                "req", account, {"stream": True, "model": "GLM-5.3"}, {}, None, False
+            )
+
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "active")
+        self.assertEqual(account.exhausted_models, ["glm-5.3"])
+
+    async def test_429_rate_limit_cools_account(self):
+        """429 + 瞬时限流码（1302）走冷却换号，不误标耗尽。"""
+        account = Account.create("zai", "ratelimit", "header.payload.signature")
+        client = self._prepare([_SequenceResponse(429, '{"code":1302,"msg":"rate limited"}')])
+
+        with (
+            patch.object(gateway.httpx, "AsyncClient", client),
+            patch.object(gateway.store, "update_account"),
+        ):
+            response = await gateway._try_account(
+                "req", account, {"stream": True, "model": "GLM-5.3"}, {}, None, False
+            )
+
+        self.assertIs(response, gateway._NEXT_ACCOUNT)
+        self.assertEqual(account.status, "cooling")
+        self.assertEqual(account.exhausted_models, [])
+
+    async def test_unknown_upstream_error_is_passed_through_verbatim(self):
+        """未识别的上游错误（如 500 且 body 含 quota 字样）不再误标账号，原样透传。"""
+        account = Account.create("zai", "boom", "header.payload.signature")
+        upstream_body = '{"error":{"message":"internal boom","quota_hint":"yes"}}'
+        client = self._prepare([_SequenceResponse(500, upstream_body)])
+
+        with (
+            patch.object(gateway.httpx, "AsyncClient", client),
+            patch.object(gateway.store, "update_account"),
+        ):
+            response = await gateway._try_account(
+                "req", account, {"stream": True, "model": "GLM-5.3"}, {}, None, False
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(json.loads(response.body), json.loads(upstream_body))
+        self.assertEqual(account.status, "active")
+        self.assertEqual(account.exhausted_models, [])
 
 
 if __name__ == "__main__":

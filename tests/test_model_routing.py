@@ -16,11 +16,20 @@ class ModelAwareSelectionTests(unittest.TestCase):
         self._old_db_path = settings.DB_PATH
         settings.DATA_DIR = Path(self._temp.name)
         settings.DB_PATH = settings.DATA_DIR / "accounts.db"
-        self.store = Store()
+        self._stores: list[Store] = []
+        self.store = self.make_store()
+
+    def make_store(self) -> Store:
+        """建立登錄於本測試案例的 Store，tearDown 時統一關閉以釋放檔案鎖。"""
+        store = Store()
+        self._stores.append(store)
+        return store
 
     def tearDown(self):
         settings.DATA_DIR = self._old_data_dir
         settings.DB_PATH = self._old_db_path
+        for store in self._stores:
+            store.close()
         self._temp.cleanup()
 
     def test_selection_prefers_positive_quota_over_unknown_and_zero(self):
@@ -51,7 +60,7 @@ class ModelAwareSelectionTests(unittest.TestCase):
         account.mark_model_exhausted("GLM-5.3-Flash")
         self.store.update_account(account)
 
-        restored = Store().find_any(account.id)
+        restored = self.make_store().find_any(account.id)
 
         self.assertIsNotNone(restored)
         self.assertEqual(restored.exhausted_models, ["glm-5.3-flash"])
@@ -96,14 +105,18 @@ class ModelAwareSelectionTests(unittest.TestCase):
         payload = self.store.export()
 
         imported_temp = tempfile.TemporaryDirectory()
+        imported_store: Store | None = None
         try:
             settings.DATA_DIR = Path(imported_temp.name)
             settings.DB_PATH = settings.DATA_DIR / "accounts.db"
-            imported_store = Store()
+            imported_store = self.make_store()
             imported_store.import_accounts(payload)
             restored = imported_store.list_accounts("zai")[0]
             self.assertEqual(restored.disabled_models, ["glm-5.3", "glm-5-turbo"])
         finally:
+            # Windows 檔案鎖：連接未關閉前無法刪除臨時資料庫
+            if imported_store is not None:
+                imported_store.close()
             imported_temp.cleanup()
 
 
