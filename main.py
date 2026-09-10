@@ -92,6 +92,17 @@ async def cmd_login(args: list[str]) -> None:
     if zcode_jwt:
         acc = store.add_account("zai", "oauth-login", zcode_jwt)
         print(c(f"\n✔ 已保存 Coding Plan JWT 账号: {acc.name} ({acc.id})", "green"))
+        # 入池即激活上报 + 自动领取全部可领活动套餐（失败仅提示，不中断）
+        from app.claim import auto_claim_all_plans
+        try:
+            outcomes = await auto_claim_all_plans(acc)
+            for o in outcomes:
+                if o.get("ok"):
+                    print(c(f"✔ 自动领取成功: {o.get('plan_name') or o.get('plan_id')}", "green"))
+                else:
+                    print(c(f"⚠️ 自动领取失败: {o.get('message')}", "yellow"))
+        except Exception as err:  # noqa: BLE001
+            print(c(f"⚠️ 自动领取任务异常: {err}", "yellow"))
     if access_token:
         try:
             key = await flow.exchange_api_key(access_token)

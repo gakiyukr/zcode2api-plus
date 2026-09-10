@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import time
 import os
@@ -12,6 +13,12 @@ from fastapi.responses import JSONResponse
 from .. import settings
 from ..auth_admin import verify_admin_key
 from ..captcha import captcha_manager
+from ..claim import (
+    ClaimError,
+    auto_claim_all_plans,
+    preview_plans,
+    report_activation_events,
+)
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow, extract_user_email
 from ..proxy import make_async_client, normalize_proxy_url
@@ -375,10 +382,12 @@ async def add_accounts(payload: dict = Body(...)):
             acc.proxy_url = proxy_url
             store.update_account(acc)
         added.append(acc.id)
-    # 立即刷新一次额度（仅 zai jwt）
+    # 立即刷新一次额度（仅 zai jwt），随后后台自动激活上报 + 领取活动套餐
     fresh = [a for a in store.list_accounts(provider) if a.id in added and a.mode == "jwt"]
     if fresh:
         await refresh_accounts(fresh)
+        for acc in fresh:
+            _schedule_auto_claim(acc)
     return {"count": len(added), "ids": added}
 
 
@@ -485,6 +494,119 @@ async def reset_account_stats(account_id: str):
     return {"ok": True}
 
 
+# ── 套餐領取 ─────────────────────────────────────────────────────────────────
+_auto_claim_tasks: set[asyncio.Task] = set()  # 強引用防 GC
+
+
+def _schedule_auto_claim(account) -> None:
+    """入池後調度後台自動領取（激活上報 + 全量可領套餐）。
+
+    不阻塞入池回應（驗證碼求解可長達數十秒）；僅 JWT 賬號，失敗不影響入池。
+    """
+    if not (account.mode == "jwt" and account.jwt_token):
+        return
+
+    async def _job():
+        try:
+            outcomes = await auto_claim_all_plans(account)
+            if outcomes:
+                await refresh_accounts([account])  # 領到額度立即反映到 UI
+        except Exception as err:  # noqa: BLE001 - 兜底：絕不冒泡
+            from .. import logs
+            logs.warn("claim", f"賬號 {account.name} 自動領取任務異常: {err}")
+
+    task = asyncio.create_task(_job())
+    _auto_claim_tasks.add(task)
+    task.add_done_callback(_auto_claim_tasks.discard)
+
+
+def _jwt_accounts(account_ids: list[str] | None) -> list:
+    accounts = store.list_accounts("zai")
+    if account_ids:
+        wanted = set(account_ids)
+        accounts = [a for a in accounts if a.id in wanted]
+    return [a for a in accounts if a.mode == "jwt" and a.jwt_token]
+
+
+@router.get("/claim/preview")
+async def claim_preview(account_id: str | None = None):
+    """立即拉取可領取套餐（全部/單個 JWT 賬號）。
+
+    先上報激活事件（模擬官方客戶端當日活躍；疑似活動投放資格信號），
+    上報失敗不阻斷 preview。冷卻中賬號跳過上游查詢。
+    """
+    ids = [account_id] if account_id else None
+    out = []
+    for acc in _jwt_accounts(ids):
+        if not acc.is_selectable() and acc.status == Status.COOLING:
+            out.append({"account_id": acc.id, "account_name": acc.name,
+                        "plans": [], "error": "賬號冷卻中（風控/限流），已跳過上游查詢",
+                        "activated": False, "activation_error": None})
+            continue
+        try:
+            activation_error = await report_activation_events(acc)
+        except Exception as err:  # noqa: BLE001 - 上報失敗不阻斷 preview
+            activation_error = str(err)
+        try:
+            plans = await preview_plans(acc)
+            out.append({"account_id": acc.id, "account_name": acc.name,
+                        "plans": plans, "error": None,
+                        "activated": activation_error is None,
+                        "activation_error": activation_error})
+        except ClaimError as err:
+            out.append({"account_id": acc.id, "account_name": acc.name,
+                        "plans": [], "error": str(err),
+                        "activated": activation_error is None,
+                        "activation_error": activation_error})
+    return {"preview": out}
+
+
+@router.post("/claim")
+async def claim_plans(payload: dict = Body(default=None)):
+    """領取套餐（body 可選 account_ids / plan_id）；缺省對全部 JWT 賬號自動選最優套餐。
+
+    回傳 outcomes[]：{account_id, account_name, ok, plan_name?, grants?, message?}。
+    """
+    payload = payload or {}
+    account_ids = payload.get("account_ids") or None
+    plan_id = (payload.get("plan_id") or "").strip() or None
+    candidates = _jwt_accounts(account_ids)
+    if not candidates:
+        return {"outcomes": [], "summary": {"ok": 0, "fail": 0}}
+
+    from ..claim import claim as do_claim
+
+    # 冷卻中賬號不領取（billing/claim 是上游寫流量，風控期打上去只會加劇）
+    outcomes = [
+        {"account_id": a.id, "account_name": a.name, "ok": False,
+         "message": "賬號冷卻中（風控/限流），已跳過領取"}
+        for a in candidates if a.status == Status.COOLING
+    ]
+    for acc in candidates:
+        if acc.status == Status.COOLING:
+            continue
+        try:
+            result = await do_claim(acc, plan_id)
+        except ClaimError as err:
+            from .. import logs
+            logs.warn("claim", f"賬號 {acc.name} 領取失敗: {err}")
+            outcomes.append({"account_id": acc.id, "account_name": acc.name,
+                             "ok": False, "message": str(err)})
+            continue
+        except RuntimeError as err:
+            # 兜底：captcha 層歷史語義的執行期故障，防回歸裸 500
+            from .. import logs
+            logs.err("claim", f"賬號 {acc.name} 領取失敗: {err}")
+            outcomes.append({"account_id": acc.id, "account_name": acc.name,
+                             "ok": False, "message": str(err)})
+            continue
+        await refresh_accounts([acc])
+        outcomes.append({"account_id": acc.id, "account_name": acc.name,
+                         "ok": True, **result})
+    ok = sum(1 for o in outcomes if o["ok"])
+    return {"outcomes": outcomes, "summary": {"ok": ok, "fail": len(outcomes) - ok}}
+
+
 # ── 手动人机验证 ─────────────────────────────────────────────────────────────
 @router.get("/captcha/config")
 async def captcha_config():
@@ -546,6 +668,7 @@ async def _save_oauth_account(flow: ZaiAuthFlow, data: dict):
             await refresh_accounts([account])
         except Exception:  # noqa: BLE001 - 额度刷新失败不影响账号入池
             pass
+        _schedule_auto_claim(account)  # 授权完成即激活+自动领取，入池即吃满活动
     return account
 
 

@@ -1,6 +1,7 @@
 /* 帳號池頁：統計卡、篩選、帳號明細表與新增／編輯對話框（輪詢 5 秒） */
 import {
   Download,
+  Gift,
   Loader2,
   Pencil,
   Plus,
@@ -333,6 +334,31 @@ export function AccountsPage() {
     })
   }
 
+  /* ── 套餐領取 ── */
+  const [claiming, setClaiming] = useState(false)
+  async function claimPlans() {
+    confirm({
+      title: '領取活動套餐',
+      description: '將對池內全部 JWT 帳號依優先級領取當前可領的限時活動套餐（需求解驗證碼，可能耗時數十秒）。確認執行？',
+      onConfirm: async () => {
+        setClaiming(true)
+        toast.info('正在領取套餐…')
+        try {
+          const d = await api<{ outcomes: { account_name?: string; ok: boolean; message?: string }[]; summary: { ok: number; fail: number } }>('POST', '/claim', {})
+          for (const o of d.outcomes.filter((x) => !x.ok)) {
+            toast.warning(`${o.account_name ?? ''} 領取失敗：${o.message ?? '未知原因'}`)
+          }
+          toast.success(`套餐領取完成：成功 ${d.summary.ok}，失敗 ${d.summary.fail}`)
+          invalidate()
+        } catch (e) {
+          toast.error('領取失敗：' + errMsg(e))
+        } finally {
+          setClaiming(false)
+        }
+      },
+    })
+  }
+
   /* ── 匯入／匯出 ── */
   async function doExport() {
     try {
@@ -382,6 +408,9 @@ export function AccountsPage() {
           </Button>
           <Button variant="outline" size="sm" onClick={() => void refreshAll()}>
             <RefreshCw /> 重新整理額度
+          </Button>
+          <Button variant="outline" size="sm" disabled={claiming} onClick={claimPlans}>
+            {claiming ? <Loader2 className="animate-spin" /> : <Gift />} 領取套餐
           </Button>
           <Button size="sm" onClick={openAdd}>
             <Plus /> 新增
