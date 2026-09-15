@@ -306,10 +306,17 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
 		token, err := s.Captcha.GetVerifyParam(nil)
-		if err != nil || token == nil {
-			return nil, &ClaimError{"驗證碼求解失敗或已停用，請到後台驗證碼頁面回填參數"}
+		if err != nil {
+			return nil, &ClaimError{"驗證碼求解失敗，請到後台驗證碼頁面回填參數"}
 		}
-		headers := claimHeaders(acc, token.VerifyParam, token.Region)
+		// token == nil 表示上游停用验证码（无需携带该头），不是失败。
+		// gateway 与 async 对同一语义都放行；claim 曾把它当终止错误，
+		// 于是同一账号能正常转发请求却永远领不了套餐。
+		var verifyParam, verifyRegion string
+		if token != nil {
+			verifyParam, verifyRegion = token.VerifyParam, token.Region
+		}
+		headers := claimHeaders(acc, verifyParam, verifyRegion)
 		payload, _ := json.Marshal(map[string]string{"plan_id": planID})
 		body, err := s.billingRequest(acc, http.MethodPost, "/billing/claim", headers, payload)
 		if err != nil {
@@ -337,7 +344,10 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 // 实测缺版本/平台头时即使验证码有效也 3007；X-Device-Mid 由 authHeaders 提供。
 func claimHeaders(acc *model.Account, verifyParam, region string) map[string]string {
 	headers := authHeaders(acc)
-	headers[captchaHeader] = verifyParam
+	// 上游停用验证码时不携带该头（与 gateway/async 一致），避免送空值
+	if verifyParam != "" {
+		headers[captchaHeader] = verifyParam
+	}
 	if region != "" {
 		headers[captchaRegionHeader] = region
 	}

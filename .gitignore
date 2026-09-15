@@ -10,6 +10,8 @@ venv/
 # 运行时数据（账号 SQLite 等），绝不可入库
 data/
 data_test/
+# 账号导出（含明文凭证；export 子命令默认写到这里）
+zcode-accounts.json
 
 .env
 js-code/

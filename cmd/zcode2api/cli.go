@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -103,14 +104,49 @@ func indexOf(args []string, want string) int {
 	return -1
 }
 
+// openBrowser 用系统默认浏览器打开 URL。
+//
+// Windows 下不能走 `cmd /c start <url>`：cmd.exe 会把 URL 里的 & 当成命令
+// 分隔符，授权链接（含 redirect_uri/response_type/state 多个参数）必然被
+// 截断，后续参数还会被当作命令执行。rundll32 直接接收参数，不经过 shell。
+func openBrowser(target string) error {
+	switch runtime.GOOS {
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", target).Start()
+	case "darwin":
+		return exec.Command("open", target).Start()
+	default:
+		return exec.Command("xdg-open", target).Start()
+	}
+}
+
 // openStore CLI 公共入口：打开数据库，失败即退出。
+//
+// 首次打开会随机生成后台密码与网关 API Key。这份密钥只存在本进程内
+// （store.Generated* 字段），进程一退出就再也拿不到——所以必须在这里立刻
+// 打印出来。否则任何一条先于 serve 执行的子命令（含 Dockerfile 构建期的
+// `accounts`）都会把密钥静默写进库，而启动横幅因为「本次未生成」再也不显示，
+// 管理者既进不了后台、网关也因 fail-closed 拒绝所有请求。
 func openStore() *store.Store {
 	st, err := store.New()
 	if err != nil {
 		web.Err("cli", "存储初始化失败: "+err.Error())
 		os.Exit(1)
 	}
+	printGeneratedKeys(st)
 	return st
+}
+
+// printGeneratedKeys 打印本次运行新生成的密钥（若有）。
+func printGeneratedKeys(st *store.Store) {
+	if st.GeneratedAdminKey != "" {
+		fmt.Println(web.Yellow + "\n本次已生成后台密码（仅显示这一次，请立即保存）:" + web.Reset)
+		fmt.Println("  " + web.Bold + st.GeneratedAdminKey + web.Reset)
+	}
+	if st.GeneratedGatewayKey != "" {
+		fmt.Println(web.Yellow + "本次已生成网关 API Key（仅显示这一次，请立即保存）:" + web.Reset)
+		fmt.Println("  " + web.Bold + st.GeneratedGatewayKey + web.Reset)
+	}
 }
 
 // ── login ───────────────────────────────────────────────────────────────────
@@ -131,7 +167,10 @@ func cmdLogin(args []string) {
 	fmt.Println(web.Blue + authorizeURL + web.Reset)
 
 	if indexOf(args, "--no-browser") < 0 {
-		_ = exec.Command("cmd", "/c", "start", authorizeURL).Start() // Windows
+		if err := openBrowser(authorizeURL); err != nil {
+			// 不阻断流程：上面已打印完整 URL，用户可手动打开
+			fmt.Println(web.Yellow + "⚠️ 无法自动打开浏览器: " + err.Error() + "，请手动打开上面的链接" + web.Reset)
+		}
 	}
 
 	fmt.Println("\n授权完成后，请复制浏览器地址栏中的完整登录完成页地址并粘贴：")
@@ -165,10 +204,15 @@ func cmdLogin(args []string) {
 			return
 		}
 		if result.Email != nil && strings.TrimSpace(*result.Email) != "" {
-			st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+			if err := st.Update(acc.Provider, acc.ID, func(a *model.Account) {
 				a.Email = result.Email
 				a.Name = *result.Email
-			})
+			}); err != nil {
+				// 不吞错：落库失败时下面仍会打印「已保存」，而 email/name
+				// 只存在于内存，重启即回滚，属于明确误导。
+				fmt.Println(web.Red + "❌ 账号信息落库失败: " + err.Error() + web.Reset)
+				return
+			}
 			// Update 改的是 Store 内部对象，acc 仍是 AddAccount 时的副本；
 			// 重新取快照，否则下面会打印出改名前的旧名字。
 			if fresh := st.Find(acc.Provider, acc.ID); fresh != nil {
@@ -273,9 +317,16 @@ func cmdSetAdminKey(args []string) {
 		fmt.Println(web.Red + "格式: zcode2api set-admin-key <key>" + web.Reset)
 		return
 	}
+	// 空值会让后台立即全量 401（VerifyAdminKey 对空密钥 fail-closed），
+	// 而后台 API 对同一字段已有拒绝逻辑——CLI 不能更宽松。
+	key := strings.TrimSpace(args[0])
+	if key == "" {
+		fmt.Println(web.Red + "❌ 后台密钥不能为空（空值会让后台无法登录）" + web.Reset)
+		return
+	}
 	st := openStore()
 	defer func() { _ = st.Close() }()
-	if err := st.SetSetting("admin_key", args[0]); err != nil {
+	if err := st.SetSetting("admin_key", key); err != nil {
 		fmt.Println(web.Red + "❌ 更新失败: " + err.Error() + web.Reset)
 		return
 	}
