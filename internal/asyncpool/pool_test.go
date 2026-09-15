@@ -399,6 +399,50 @@ func TestMessagesAcceptsWhitelistedModel(t *testing.T) {
 	}
 }
 
+// TestSuccessRecordsUsageAndRevivesStatus async 成功交付后必须与 engine.success
+// 记出相同的账号状态。
+//
+// 曾只累加 token：后台用量页漏算 async 流量，且冷却到期的账号即使这里已经
+// 成功返回，状态仍停在 cooling，只能等下一轮额度轮询（默认 60s）才恢复调度。
+func TestSuccessRecordsUsageAndRevivesStatus(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "revive")
+
+	// 制造「冷却已到期」的前置状态：这是最需要被成功路径复位的情形
+	pastCooling := float64(time.Now().Add(-time.Minute).UnixNano()) / 1e9
+	msg := "上游限流 HTTP 429"
+	st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.Status = model.StatusCooling
+		a.CoolingUntil = &pastCooling
+		a.LastError = &msg
+	})
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":7}}}`,
+			`data: {"type":"message_delta","usage":{"output_tokens":3}}`,
+		}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-success", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-success")
+
+	got := st.Find(model.ProviderZai, acc.ID)
+	if got.UseCount != 1 {
+		t.Fatalf("成功交付应累计 use_count（与 engine 一致）: %d", got.UseCount)
+	}
+	if got.LastUsedAt == nil {
+		t.Fatal("成功交付应写入 last_used_at")
+	}
+	if got.Status != model.StatusActive {
+		t.Fatalf("成功后应复位为 active: %s", got.Status)
+	}
+	if got.TotalInputTokens != 7 || got.TotalOutputTokens != 3 {
+		t.Fatalf("token 统计不符: in=%d out=%d", got.TotalInputTokens, got.TotalOutputTokens)
+	}
+}
+
 func TestSSEDoneReleasesTicket(t *testing.T) {
 	// 正常 done 事件後同樣要釋放 ticket，不得殘留。
 	p, _, _, _ := newTestPool(t)

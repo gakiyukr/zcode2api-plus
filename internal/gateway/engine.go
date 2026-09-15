@@ -512,17 +512,27 @@ func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg st
 	MarkModelExhausted(e.Store, acc.Provider, acc.ID, modelName, errMsg)
 }
 
-// success 记录成功调用的账号状态；并异步触发一次额度刷新
-// （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
-func (e *Engine) success(acc *model.Account) {
-	ts := float64(e.now().UnixNano()) / 1e9
-	e.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+// MarkSuccess 记录一次成功调用：累计调用次数与最后使用时间，并把
+// cooling/exhausted 复位为 active（有成功响应即证明账号当前可用）。
+//
+// 导出供 async 池复用：两条请求路径对同一账号必须记出相同的统计与状态，
+// 否则后台用量页会漏算 async 流量，冷却到期的账号也只能等下一轮额度轮询
+// 才恢复调度。
+func MarkSuccess(st *store.Store, provider, id string, now time.Time) {
+	ts := float64(now.UnixNano()) / 1e9
+	st.Update(provider, id, func(a *model.Account) {
 		a.UseCount++
 		a.LastUsedAt = &ts
 		if a.Status == model.StatusCooling || a.Status == model.StatusExhausted {
 			a.Status = model.StatusActive
 		}
 	})
+}
+
+// success 记录成功调用的账号状态；并异步触发一次额度刷新
+// （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
+func (e *Engine) success(acc *model.Account) {
+	MarkSuccess(e.Store, acc.Provider, acc.ID, e.now())
 	e.fireRefresh(acc)
 }
 

@@ -602,11 +602,16 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 		return false, err
 	}
 
-	// 统计落库失败不应触发换号重发
+	// 统计落库失败不应触发换号重发。
+	// 除 token 外还要记调用次数/最后使用时间并复位状态——与 engine.success
+	// 一致（gateway.MarkSuccess），否则后台用量页漏算 async 流量，
+	// 且冷却到期的账号即使这里已成功也仍停在 cooling。
 	usage.Finish()
+	got := usage.AsDict()
 	p.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
-		a.AccumulateTokens(usage.AsDict())
+		a.AccumulateTokens(got)
 	})
+	gateway.MarkSuccess(p.Store, acc.Provider, acc.ID, time.Now())
 	p.emit(ctx, ticketID, ticketEvent{Type: "done"})
 	return false, nil
 }
