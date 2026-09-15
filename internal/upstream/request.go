@@ -76,10 +76,13 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 		return Request{}, fmt.Errorf("未知提供商: %s", acc.Provider)
 	}
 
-	headers := map[string]string{
-		"content-type":        "application/json",
+	// 固定头一律用 Go 的规范化形式（textproto canonical），与客户端头的 key
+	// 形式保持一致——否则同一逻辑头会以两个不同 key 存在于 map 中，
+	// 最终值取决于 map 迭代顺序（随机）。
+	fixed := map[string]string{
+		"Content-Type":        "application/json",
 		authHeader:            authValue,
-		"anthropic-version":   "2023-06-01",
+		"Anthropic-Version":   "2023-06-01",
 		"User-Agent":          config.UserAgent,
 		"X-ZCode-App-Version": config.ZcodeClientVersion,
 		"X-ZCode-Agent":       "glm",
@@ -87,17 +90,25 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 		"X-Device-Mid":        config.DeviceMid(),
 	}
 	if verifyParam != "" {
-		headers["X-Aliyun-Captcha-Verify-Param"] = verifyParam
+		fixed["X-Aliyun-Captcha-Verify-Param"] = verifyParam
 		if verifyRegion != "" {
-			headers["X-Aliyun-Captcha-Verify-Region"] = verifyRegion
+			fixed["X-Aliyun-Captcha-Verify-Region"] = verifyRegion
 		}
 	}
 
+	// 先透传客户端头（剔除敏感/连接类），再强制写回固定头。
+	// 顺序不能颠倒：客户端可送 x-device-mid（它不在 dropHeaders 内，也不是
+	// x-zcode 前缀），若在其后合并就会覆盖掉设备指纹——而该指纹是刻意固定
+	// 以避免被风控的。同理 Content-Type / Anthropic-Version 也不得被改写。
+	headers := map[string]string{}
 	for key, value := range incomingHeaders {
 		lower := strings.ToLower(key)
 		if dropHeaders[lower] || strings.HasPrefix(lower, "x-zcode") {
 			continue
 		}
+		headers[key] = value
+	}
+	for key, value := range fixed {
 		headers[key] = value
 	}
 

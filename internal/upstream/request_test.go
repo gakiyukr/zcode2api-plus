@@ -23,7 +23,7 @@ func TestBuildRequestJWT(t *testing.T) {
 	if h["Authorization"] != "Bearer header.payload.sig" {
 		t.Fatalf("Authorization 不符: %q", h["Authorization"])
 	}
-	if h["content-type"] != "application/json" || h["anthropic-version"] != "2023-06-01" {
+	if h["Content-Type"] != "application/json" || h["Anthropic-Version"] != "2023-06-01" {
 		t.Fatalf("固定头不符: %v", h)
 	}
 	if h["X-ZCode-App-Version"] != config.ZcodeClientVersion || h["X-ZCode-Agent"] != "glm" {
@@ -77,6 +77,12 @@ func TestClientHeadersFiltered(t *testing.T) {
 		"X-Aliyun-Captcha-Verify-Region": "client-region",
 		"Accept":                         "application/json",
 		"X-Custom-Trace":                 "keep-me",
+		// 设备指纹与协议头必须由本服务决定。x-device-mid 既不在 dropHeaders
+		// 内也不是 x-zcode 前缀，且 Go 会把入站头规范化为 X-Device-Mid——
+		// 与固定头同名，合并顺序一旦颠倒就会被客户端完全覆写。
+		"X-Device-Mid":      "spoofed-fingerprint",
+		"Content-Type":      "text/plain",
+		"Anthropic-Version": "1999-01-01",
 	}
 	req, err := BuildRequest(jwtAccount(), "server-token", "sgp", incoming)
 	if err != nil {
@@ -100,6 +106,15 @@ func TestClientHeadersFiltered(t *testing.T) {
 	}
 	if h["X-Aliyun-Captcha-Verify-Region"] != "sgp" {
 		t.Fatal("客户端不得覆盖验证码 region 头")
+	}
+	if h["X-Device-Mid"] == "spoofed-fingerprint" || h["X-Device-Mid"] == "" {
+		t.Fatalf("客户端不得覆盖设备指纹: %q", h["X-Device-Mid"])
+	}
+	if h["Content-Type"] != "application/json" {
+		t.Fatalf("客户端不得覆盖 Content-Type: %q", h["Content-Type"])
+	}
+	if h["Anthropic-Version"] != "2023-06-01" {
+		t.Fatalf("客户端不得覆盖 Anthropic-Version: %q", h["Anthropic-Version"])
 	}
 	if h["Accept"] != "application/json" || h["X-Custom-Trace"] != "keep-me" {
 		t.Fatalf("普通透传头应保留: %v", h)
