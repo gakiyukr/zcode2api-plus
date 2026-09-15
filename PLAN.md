@@ -460,35 +460,45 @@ Previous read at ... by goroutine 11:
    缓存 transport，避免网关 120s 与 async 180s 共用同一连接池而互相覆盖。
    回归测试 `TestAccountProxyIsUsed`（移除修复即失败）。
 
-**中**
+**中（均已修复）**
 
-3. **async 池把「HTTP 200 + JSON 业务错误」当成功串流** — `internal/asyncpool/pool.go:485`
+3. ~~**async 池把「HTTP 200 + JSON 业务错误」当成功串流**~~ — 已修复（d3990b3）
    引擎有 `content-type: application/json` 分支（`engine.go:226` → `handleUpstreamJSON`），
-   async 直接 `forwardSSE`。上游回 200 带 `{"code":1005}`（额度耗尽）时，客户端收到
+   async 曾直接 `forwardSSE`。上游回 200 带 `{"code":1005}`（额度耗尽）时，客户端收到
    ready→done 的「成功」串流但零 chunk，账号状态不被标记，同一账号会被反复选中反复失败。
+   现 `attemptUpstream` 先判 content-type，200+JSON 走 `handleUpstreamJSON`：1005 标模型耗尽
+   并换号、3007 换验证码重试、其余非零码投递 upstream_error（文案经导出的
+   `gateway.MessageFromJSON` 与引擎同源）、无业务码的 JSON 报 `invalid_upstream_response`。
+   回归测试 `TestJSONBusinessErrorIsNotTreatedAsStream`、`TestJSONNonZeroCodeDeliveredAsError`。
 
-4. **async 成功路径不累计 use_count/last_used_at，也不复位 cooling/exhausted** —
-   `internal/asyncpool/pool.go:542-547`（对照 `engine.go:503-511`）。后台用量页少算 async 流量；
-   冷却到期的账号即使 async 已成功也停在 cooling，需等下一轮额度轮询。
+4. ~~**async 成功路径不累计 use_count/last_used_at，也不复位 cooling/exhausted**~~ — 已修复（5105b5d）
+   曾只累加 token，后台用量页少算 async 流量；冷却到期的账号即使 async 已成功也停在
+   cooling，需等下一轮额度轮询（默认 60s）才恢复调度。
+   现抽出 `gateway.MarkSuccess` 供两条路径共用，避免再次分叉。
+   回归测试 `TestSuccessRecordsUsageAndRevivesStatus`。
 
-5. **`MarkModelExhausted` 无条件把 invalid/cooling 账号刷回 active** — `internal/gateway/engine.go:483-489`
-   「不是全部模型都耗尽」即写 `StatusActive` 并清空 `CoolingUntil`，不区分账号当前是
+5. ~~**`MarkModelExhausted` 无条件把 invalid/cooling 账号刷回 active**~~ — 已修复（117e241）
+   曾「不是全部模型都耗尽」即写 `StatusActive` 并清空 `CoolingUntil`，不区分账号当前是
    `invalid`（凭据失效）还是 `cooling`（刚被限流）。并发请求下 A 标的 invalid 会被 B 覆盖。
-   修法：只在当前状态为 `active`/`exhausted` 时才改，不碰 `invalid`/`cooling`。
+   现以 `isStrongStatus` 保护 `invalid`/`cooling`/`disabled`：模型级标记仍写入
+   `ExhaustedModels`（该模型照样被摘出轮询），但不改状态、不清冷却、不覆写 `last_error`。
+   回归测试 `TestMarkModelExhaustedDoesNotClobberStrongerStatus`。
 
-6. **客户端可覆写上游 `X-Device-Mid` 指纹头** — `internal/upstream/request.go:40-52`
-   `dropHeaders` 不含 `x-device-mid`，而固定头 map 的 key 与 Go 规范化后的客户端头同名，
-   `headers[key] = value` 直接覆盖。同理 `Content-Type`/`Anthropic-Version` 因大小写 key
-   不同而出现「两者都 Set、最终值取决于 map 迭代顺序」的随机覆盖。
-   修法：把 `x-device-mid` 加入 dropHeaders；固定头统一用规范化 key 并在透传后强制回写。
+6. ~~**客户端可覆写上游 `X-Device-Mid` 指纹头**~~ — 已修复（0bcd18f）
+   `dropHeaders` 不含 `x-device-mid`，而 Go 把入站头规范化为 `X-Device-Mid`，与固定头同名，
+   `headers[key] = value` 直接覆盖。`Content-Type`/`Anthropic-Version` 另因大小写 key 不同
+   而出现「两者都 Set、最终值取决于 map 迭代顺序」的随机覆盖。
+   现固定头单独收集并在透传**之后**写回（顺序不可颠倒），且统一用 canonical key。
+   回归测试 `TestClientHeadersFiltered`（含伪造指纹断言）。
 
-7. **`handleEditAccount` 无法清空 `proxy_url`** — 已随 9b24dcc 修复。
+7. ~~**`handleEditAccount` 无法清空 `proxy_url`**~~ — 已修复（9b24dcc）。
 
-8. **`Update` 吞掉落库错误** — 已随 9b24dcc 修复（改为返回 error）。
+8. ~~**`Update` 吞掉落库错误**~~ — 已修复（9b24dcc，改为返回 error）。
 
-9. **混合池下 async 选中 apiKey 账号即终止票据** — `internal/asyncpool/pool.go:275-280`
-   `acc.Mode != "jwt"` 时直接 `return`，且 `tried` 标记在检查之后，该账号不会被跳过，
-   轮询再次轮到它时仍失败。修法：把检查移入循环并 `tried[acc.ID] = true` 后 continue。
+9. ~~**混合池下 async 选中 apiKey 账号即终止票据**~~ — 已修复（e86c5bc）
+   曾 `acc.Mode != "jwt"` 时直接 `return`，且 `tried` 标记在检查之后，该账号不会被跳过，
+   轮询再次轮到它时仍失败。现移入循环：逐个标记 tried 后重选，直到选到 JWT 账号或
+   候选耗尽（`tried` 单调增长，必然终止）。回归测试 `TestSkipsAPIKeyAccountsInMixedPool`。
 
 **低**
 
@@ -526,7 +536,7 @@ Previous read at ... by goroutine 11:
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
-  保持同名用例语义，便于两边对照。当前 23 个测试文件、185 个 `Test` 函数，`go test ./...` 全绿。
+  保持同名用例语义，便于两边对照。当前 23 个测试文件、190 个 `Test` 函数，`go test ./...` 全绿。
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
   最终用 openai 官方客户端（python）指向网关做真客户端回归（待真实账号环境）。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。
