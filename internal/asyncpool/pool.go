@@ -24,6 +24,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
 	"zcode2api/internal/web"
@@ -407,7 +408,7 @@ func (p *Pool) attemptUpstream(
 		httpReq.Header.Set(k, v)
 	}
 
-	resp, err := p.client().Do(httpReq)
+	resp, err := p.clientFor(acc).Do(httpReq)
 	if err != nil {
 		return false, err
 	}
@@ -556,17 +557,32 @@ func (p *Pool) bumpFail(acc *model.Account) {
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────
 
-func (p *Pool) client() *http.Client {
+// asyncResponseHeaderTimeout 对齐 Python make_async_client(account, timeout=httpx.Timeout(180))：
+// 各阶段上限 180s；响应体流式读取（SSE）不能设总超时。
+const asyncResponseHeaderTimeout = 180 * time.Second
+
+// clientFor 返回账号的出站客户端。
+//
+// 与网关一致：账号配置了 proxy_url 时走对应代理。README 与 PLAN §5.9 都承诺
+// 「该账号的网关请求、额度查询与套餐领取均走对应代理」——async 曾漏掉这一条，
+// 配置代理的账号在这条路径上以服务器真实 IP 直连上游（泄露部署 IP、触发风控）。
+// 代理无效时回退直连并记日志，与 engine.clientFor / quota.clientFor 同语义。
+func (p *Pool) clientFor(acc *model.Account) *http.Client {
 	if p.Client != nil {
 		return p.Client
 	}
-	// 对齐 Python make_async_client(account, timeout=httpx.Timeout(180))：
-	// 各阶段上限 180s；响应体流式读取（SSE）不能设总超时
-	return &http.Client{
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 180 * time.Second,
-		},
+	raw := ""
+	if acc != nil && acc.ProxyURL != nil {
+		raw = *acc.ProxyURL
 	}
+	t, err := proxy.TransportForTimeout(raw, asyncResponseHeaderTimeout)
+	if err != nil {
+		// 仅当账号配了非法代理才会失败；回退直连（TransportForTimeout 对空 URL
+		// 永不报错，故此处 t 一定非 nil）。
+		web.Warn("async", fmt.Sprintf("账号 %s 代理无效，回退直连: %v", acc.Name, err))
+		t, _ = proxy.TransportForTimeout("", asyncResponseHeaderTimeout)
+	}
+	return &http.Client{Transport: t}
 }
 
 // marshalJSON 与网关一致（Python json.dumps(ensure_ascii=False) 形态）：

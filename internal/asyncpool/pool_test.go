@@ -3,11 +3,13 @@
 package asyncpool
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -684,6 +686,97 @@ func TestRateLimitMarksCoolingAndRetries(t *testing.T) {
 	}
 	if acc.LastError == nil || !strings.Contains(*acc.LastError, "HTTP 429") {
 		t.Fatalf("last_error 应记录 429: %v", acc.LastError)
+	}
+}
+
+// TestAccountProxyIsUsed 账号配置的 proxy_url 必须作用于 async 路径。
+//
+// README 与 PLAN §5.9 都承诺「该账号的网关请求、额度查询与套餐领取均走对应
+// 代理」。async 池曾忽略 proxy_url 直接出站：配置代理的账号在这条路径上以
+// 服务器真实 IP 连上游，正是使用者配置代理要规避的（IP 绑定、地区限制、风控）。
+// TestAccountProxyIsUsed 账号配置的 proxy_url 必须作用于 async 路径。
+//
+// README 与 PLAN §5.9 都承诺「该账号的网关请求、额度查询与套餐领取均走对应
+// 代理」。async 池曾忽略 proxy_url 直接出站：配置代理的账号在这条路径上以
+// 服务器真实 IP 连上游，正是使用者配置代理要规避的（IP 绑定、地区限制、风控）。
+func TestAccountProxyIsUsed(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "proxied")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
+			`data: {"type":"message_delta","usage":{"output_tokens":1}}`,
+		}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	// 最小 CONNECT 代理：记录被请求的目标，再把连接原样转发到真实上游。
+	// 用裸 TCP listener 而非 httptest，因为 CONNECT 需要接管连接（Hijack）。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var mu sync.Mutex
+	var connects []string
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+
+				// 明文 http 目标走绝对 URI（Proxy 字段的标准行为），
+				// https 目标才走 CONNECT；两种都记为该代理被使用。
+				target := req.Host
+				if target == "" {
+					target = req.URL.Host
+				}
+				mu.Lock()
+				connects = append(connects, target)
+				mu.Unlock()
+
+				// 把请求原样转发到真实上游并回传响应
+				outReq := req.Clone(context.Background())
+				outReq.RequestURI = ""
+				if outReq.URL.Host == "" {
+					outReq.URL.Host = target
+				}
+				resp, err := http.DefaultTransport.RoundTrip(outReq)
+				if err != nil {
+					return
+				}
+				defer resp.Body.Close()
+				_ = resp.Write(c)
+			}(conn)
+		}
+	}()
+
+	st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		proxyURL := "http://" + ln.Addr().String()
+		a.ProxyURL = &proxyURL
+	})
+
+	tk := insertTicket(p, "ticket-proxy", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-proxy")
+	_ = drainEvents(tk)
+
+	mu.Lock()
+	gotConnects := len(connects)
+	mu.Unlock()
+	if gotConnects == 0 {
+		t.Fatalf("账号配置了代理，请求却未经代理出站（上游调用=%d）", up.callCount())
+	}
+	if up.callCount() == 0 {
+		t.Fatal("上游应收到请求")
 	}
 }
 
