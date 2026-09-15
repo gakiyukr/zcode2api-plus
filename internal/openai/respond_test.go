@@ -333,3 +333,36 @@ func TestConvertResponseRejectsMissingContent(t *testing.T) {
 		t.Fatal("正常形态不应返回 nil")
 	}
 }
+
+// TestMergeUsageTakesMaxForNumericKeys 合并两段 usage 时数值键取最大。
+//
+// message_start 带 input 系字段、message_delta 带 output 系字段，但上游可能
+// 在 message_delta 里重复携带 input 键（例如 input_tokens: 0）。直接覆盖会
+// 把真实输入量归零，客户端计费与上下文统计随之出错。
+func TestMergeUsageTakesMaxForNumericKeys(t *testing.T) {
+	got := mergeUsage(
+		map[string]any{"input_tokens": float64(100), "cache_read_input_tokens": float64(50)},
+		map[string]any{"input_tokens": float64(0), "output_tokens": float64(7)},
+	)
+	if got["prompt_tokens"] != float64(150) {
+		t.Fatalf("input 不应被 0 覆盖: %v", got["prompt_tokens"])
+	}
+	if got["completion_tokens"] != float64(7) {
+		t.Fatalf("output 应取到: %v", got["completion_tokens"])
+	}
+}
+
+// TestStreamErrorEventIsFlat 上游 error 事件必须压平为 OpenAI 形态，
+// 否则客户端读 error.message 得到 null。
+func TestStreamErrorEventIsFlat(t *testing.T) {
+	flat := openAIErrorObject(map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": "overloaded_error", "message": "上游过载"},
+	})
+	if flat["message"] != "上游过载" || flat["type"] != "overloaded_error" {
+		t.Fatalf("应压平为 OpenAI 形态: %v", flat)
+	}
+	if _, nested := flat["error"]; nested {
+		t.Fatalf("不应保留嵌套 error: %v", flat)
+	}
+}

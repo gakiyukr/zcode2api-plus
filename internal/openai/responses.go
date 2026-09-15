@@ -144,10 +144,9 @@ func convertResponsesInput(input any) ([]any, error) {
 					}},
 				})
 			case "function_call_output":
-				output, _ := item["output"].(string)
 				pendingBlocks = append(pendingBlocks, map[string]any{
 					"type": "tool_result", "tool_use_id": item["call_id"],
-					"content": []any{map[string]any{"type": "text", "text": output}},
+					"content": functionCallOutputContent(item["output"]),
 				})
 			default:
 				// reasoning 等 item 忽略
@@ -210,11 +209,12 @@ func stringOf(v any) string {
 
 // ConvertResponsesResponse 把上游 Anthropic Messages JSON 转换为 Responses 形态。
 func ConvertResponsesResponse(payload map[string]any) map[string]any {
+	// 与 respond.go 的 chat/completions 路径同语义：id 缺失或 content 形态
+	// 不对都视为「不是合法 Messages 响应」。原写法用嵌套 if 等价于「两者
+	// 同时缺失才拒绝」，会产出 "resp_" 这种空 id。
 	id, _ := payload["id"].(string)
-	if id == "" {
-		if _, ok := payload["content"].([]any); !ok {
-			return nil
-		}
+	if _, ok := payload["content"].([]any); !ok || id == "" {
+		return nil
 	}
 	output, _ := messageToResponsesOutput(payload)
 	return map[string]any{
@@ -275,6 +275,39 @@ func messageToResponsesOutput(message map[string]any) ([]any, bool) {
 }
 
 // responsesUsage Anthropic usage → Responses usage（直接 token 计数）。
+// functionCallOutputContent 归一 function_call_output 的 output 字段。
+//
+// Responses 契约允许它要么是字符串，要么是 content items 数组——Codex 在
+// 工具结果无 structured_content 时固定发数组（models.rs 的
+// FunctionCallOutputBody::ContentItems）。只做字符串断言会把整段工具输出
+// 静默变成空串，模型随即失去工具上下文。
+func functionCallOutputContent(raw any) []any {
+	switch v := raw.(type) {
+	case string:
+		return []any{map[string]any{"type": "text", "text": v}}
+	case []any:
+		blocks := make([]any, 0, len(v))
+		for _, entry := range v {
+			item, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, ok := item["text"].(string); ok {
+				blocks = append(blocks, map[string]any{"type": "text", "text": text})
+				continue
+			}
+			// 非文本项（图片等）无法映射到 Anthropic tool_result，降级为
+			// 其 JSON 字面量，至少不丢信息。
+			if encoded, err := marshalCompact(item); err == nil {
+				blocks = append(blocks, map[string]any{"type": "text", "text": encoded})
+			}
+		}
+		return blocks
+	default:
+		return []any{map[string]any{"type": "text", "text": ""}}
+	}
+}
+
 func responsesUsage(raw any) map[string]any {
 	u, _ := raw.(map[string]any)
 	num := func(key string) float64 {
@@ -287,12 +320,24 @@ func responsesUsage(raw any) map[string]any {
 			return 0
 		}
 	}
-	input := num("input_tokens")
+	// Anthropic 的 input_tokens 不含缓存读写，两者独立计数；Codex 从
+	// input_tokens_details.cached_tokens 读取缓存命中并据此判断压缩阈值，
+	// 漏算会让上下文用量被严重低估。
+	cacheRead := num("cache_read_input_tokens")
+	cacheCreation := num("cache_creation_input_tokens")
+	input := num("input_tokens") + cacheRead + cacheCreation
 	output := num("output_tokens")
 	return map[string]any{
 		"input_tokens":  input,
 		"output_tokens": output,
 		"total_tokens":  input + output,
+		"input_tokens_details": map[string]any{
+			"cached_tokens":      cacheRead,
+			"cache_write_tokens": cacheCreation,
+		},
+		"output_tokens_details": map[string]any{
+			"reasoning_tokens": float64(0),
+		},
 	}
 }
 

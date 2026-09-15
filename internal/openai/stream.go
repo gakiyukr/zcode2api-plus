@@ -88,7 +88,10 @@ func (e *sseEncoder) dispatch(event, data string) error {
 	case "message_stop":
 		return e.onMessageStop()
 	case "error":
-		return e.emit(map[string]any{"error": payload})
+		// payload 是 Anthropic 形态 {"type":"error","error":{...}}；OpenAI 要求
+		// error.message / error.type 直接位于 error 之下，照抄会多一层嵌套，
+		// 客户端读 error.message 得到 null。
+		return e.emit(map[string]any{"error": openAIErrorObject(payload)})
 	default:
 		// ping / content_block_stop 等事件丢弃
 		return nil
@@ -190,6 +193,33 @@ func (e *sseEncoder) onMessageStop() error {
 }
 
 // emit 序列化并写出一个 chunk 事件。
+// openAIErrorObject 把 Anthropic 错误对象压平为 OpenAI 形态。
+// 输入形如 {"type":"error","error":{"type":"...","message":"..."}}。
+func openAIErrorObject(payload map[string]any) map[string]any {
+	if inner, ok := payload["error"].(map[string]any); ok {
+		out := map[string]any{}
+		for k, v := range inner {
+			out[k] = v
+		}
+		return out
+	}
+	// 上游直接给了扁平错误体：原样透传，只保证有 message 字段
+	out := map[string]any{}
+	for k, v := range payload {
+		if k == "type" {
+			continue
+		}
+		out[k] = v
+	}
+	if _, ok := out["message"]; !ok {
+		out["message"] = "上游返回错误"
+	}
+	if _, ok := out["type"]; !ok {
+		out["type"] = "upstream_error"
+	}
+	return out
+}
+
 func (e *sseEncoder) emit(payload map[string]any) error {
 	data, err := marshalCompact(payload)
 	if err != nil {
@@ -200,14 +230,53 @@ func (e *sseEncoder) emit(payload map[string]any) error {
 
 // mergeUsage 合并 message_start（input 系）与 message_delta（output）的 usage。
 func mergeUsage(input, output map[string]any) map[string]any {
+	return mapUsage(mergeUsageMax(input, output))
+}
+
+// mergeUsageMax 合并两段 Anthropic usage，数值键取最大。
+//
+// message_start 带 input 系字段、message_delta 带 output 系字段，但上游
+// 可能在 message_delta 里重复携带 input 键（例如 input_tokens: 0）。
+// 直接覆盖会让真实的输入量被归零，客户端计费与上下文统计随之出错。
+// gateway/usage.go 对同一问题已采用 max，这里保持一致。
+func mergeUsageMax(input, output map[string]any) map[string]any {
 	merged := map[string]any{}
 	for k, v := range input {
 		merged[k] = v
 	}
 	for k, v := range output {
+		if prev, ok := merged[k]; ok && numericGreater(prev, v) {
+			continue
+		}
 		merged[k] = v
 	}
-	return mapUsage(merged)
+	return merged
+}
+
+// numericGreater 判断 a 是否为大于 b 的数值（非数值键返回 false，走覆盖）。
+func numericGreater(a, b any) bool {
+	af, aok := toFloatOK(a)
+	bf, bok := toFloatOK(b)
+	if !aok || !bok {
+		return false
+	}
+	return af > bf
+}
+
+func toFloatOK(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }
 
 // stringOr 取字符串值，nil 或空时回退。

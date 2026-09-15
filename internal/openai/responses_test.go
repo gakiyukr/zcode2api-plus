@@ -126,6 +126,77 @@ func TestResponsesConvertResponseShape(t *testing.T) {
 	}
 }
 
+// TestFunctionCallOutputAcceptsContentItems function_call_output.output 为
+// content items 数组时不得被静默转成空串。
+//
+// Responses 契约允许该字段是字符串或数组；Codex 在工具结果无 structured
+// content 时固定发数组。只做字符串断言会让整段工具输出变成空 text 块，
+// 模型随即失去工具上下文。
+func TestFunctionCallOutputAcceptsContentItems(t *testing.T) {
+	got, err := ConvertResponsesRequest(map[string]any{
+		"model": "glm-5.3-flash",
+		"input": []any{
+			map[string]any{"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+			map[string]any{"type": "function_call_output", "call_id": "c1", "output": []any{
+				map[string]any{"type": "output_text", "text": "第一段"},
+				map[string]any{"type": "output_text", "text": "第二段"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := got["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)
+	block := last["content"].([]any)[0].(map[string]any)
+	content, _ := block["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("数组 output 应保留两段文本: %v", content)
+	}
+	for i, want := range []string{"第一段", "第二段"} {
+		if content[i].(map[string]any)["text"] != want {
+			t.Fatalf("第 %d 段文本不符: %v", i, content[i])
+		}
+	}
+}
+
+// TestResponsesUsageIncludesCacheTokens Responses 的 usage 必须与
+// chat/completions 路径一致地计入缓存 token。
+//
+// Anthropic 的 input_tokens 不含缓存读写；Codex 从
+// input_tokens_details.cached_tokens 读取命中量并据此判断上下文压缩阈值，
+// 漏算会让用量被严重低估。
+func TestResponsesUsageIncludesCacheTokens(t *testing.T) {
+	got := responsesUsage(map[string]any{
+		"input_tokens":                float64(10),
+		"output_tokens":               float64(5),
+		"cache_read_input_tokens":     float64(100),
+		"cache_creation_input_tokens": float64(20),
+	})
+	if got["input_tokens"] != float64(130) {
+		t.Fatalf("input_tokens 应含缓存读写: %v", got["input_tokens"])
+	}
+	if got["total_tokens"] != float64(135) {
+		t.Fatalf("total_tokens 不符: %v", got["total_tokens"])
+	}
+	details, _ := got["input_tokens_details"].(map[string]any)
+	if details["cached_tokens"] != float64(100) {
+		t.Fatalf("应暴露 cached_tokens: %v", details)
+	}
+}
+
+// TestConvertResponsesResponseRejectsEmptyID id 缺失时不得产出 "resp_" 空 id。
+func TestConvertResponsesResponseRejectsEmptyID(t *testing.T) {
+	if got := ConvertResponsesResponse(map[string]any{
+		"content": []any{map[string]any{"type": "text", "text": "hi"}},
+	}); got != nil {
+		t.Fatalf("无 id 应拒绝: %v", got)
+	}
+	if got := ConvertResponsesResponse(map[string]any{"id": "m1"}); got != nil {
+		t.Fatalf("无 content 应拒绝: %v", got)
+	}
+}
+
 func TestResponsesStreamEvents(t *testing.T) {
 	upstream := strings.Join([]string{
 		`event: message_start`,
@@ -161,9 +232,18 @@ func TestResponsesStreamEvents(t *testing.T) {
 		name := strings.SplitN(ev, "\n", 2)[0]
 		names = append(names, strings.TrimPrefix(name, "event: "))
 	}
+	// 事件序列契约（依据 Codex CLI 的 responses.rs / turn.rs）：
+	//   - 文字增量前必须先有 message 的 output_item.added，否则 Codex 的
+	//     active_item 为空，output_text.delta 会被丢弃（debug 下 panic）。
+	//   - 每个 item 都要有 output_item.done，Codex 只在该事件里排入工具任务。
 	want := []string{
-		"response.created", "response.output_text.delta",
-		"response.output_item.added", "response.function_call_arguments.delta",
+		"response.created",
+		"response.output_item.added", // message item（文字前宣告）
+		"response.output_text.delta",
+		"response.output_item.added", // function_call item
+		"response.function_call_arguments.delta",
+		"response.output_item.done", // message
+		"response.output_item.done", // function_call
 		"response.completed",
 	}
 	if len(names) != len(want) {

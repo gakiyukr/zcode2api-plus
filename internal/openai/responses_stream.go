@@ -54,14 +54,18 @@ type responsesEncoder struct {
 	write     func(string) error
 	startedAt time.Time
 
-	respID        string
-	model         string
-	created       float64
-	finished      bool
-	inputUsage    map[string]any
-	outputUsage   map[string]any
-	textParts     []string
-	functionCalls []any // 完整 function_call item（completed 时回填 output）
+	respID      string
+	model       string
+	created     float64
+	finished    bool
+	inputUsage  map[string]any
+	outputUsage map[string]any
+	textParts   []string
+	// messageAnnounced 记录 message item 是否已通过 output_item.added 宣告。
+	// Codex 端只用 OutputItemAdded 设置 active_item，而 OutputTextDelta 在
+	// active_item 为空时走 error_or_panic（turn.rs），故文字增量前必须先宣告。
+	messageAnnounced bool
+	functionCalls    []any // 完整 function_call item（completed 时回填 output）
 }
 
 // emit 写出一个 `event: X\ndata: {...}\n\n` 事件。
@@ -149,6 +153,12 @@ func (e *responsesEncoder) onContentBlockDelta(payload map[string]any) error {
 		if text == "" {
 			return nil
 		}
+		// 必须先宣告 message item：Codex 只用 output_item.added 设置
+		// active_item，而 output_text.delta 在 active_item 为空时会被丢弃
+		// （debug 构建下 error_or_panic）。只宣告一次。
+		if err := e.announceMessageItem(); err != nil {
+			return err
+		}
 		e.textParts = append(e.textParts, text)
 		return e.emit("response.output_text.delta", map[string]any{
 			"item_id": "msg_" + e.respID,
@@ -199,9 +209,50 @@ func (e *responsesEncoder) onMessageStop() error {
 			item["status"] = "completed"
 		}
 	}
+
+	// 每个 item 都要发 output_item.done：Codex 只在这个事件里排入工具任务并
+	// 设置 needs_follow_up（turn.rs 的 OutputItemDone 分支是唯一入口）。
+	// 缺了它，模型请求的工具永不执行，会话在第一次工具调用处中断。
+	if err := e.announceMessageItem(); err != nil {
+		return err
+	}
+	if err := e.emit("response.output_item.done", map[string]any{
+		"output_index": float64(0),
+		"item":         messageItem,
+	}); err != nil {
+		return err
+	}
+	for i, raw := range e.functionCalls {
+		if err := e.emit("response.output_item.done", map[string]any{
+			"output_index": float64(i + 1), // message item 占 index 0
+			"item":         raw,
+		}); err != nil {
+			return err
+		}
+	}
+
 	output := append([]any{messageItem}, e.functionCalls...)
 	return e.emit("response.completed", map[string]any{
 		"response": e.responseEnvelope("completed", output),
+	})
+}
+
+// announceMessageItem 首次需要时宣告 message item（幂等）。
+// 无文字输出时也宣告一次：Codex 需要 OutputItemDone 才会排入工具任务。
+func (e *responsesEncoder) announceMessageItem() error {
+	if e.messageAnnounced {
+		return nil
+	}
+	e.messageAnnounced = true
+	return e.emit("response.output_item.added", map[string]any{
+		"output_index": float64(0),
+		"item": map[string]any{
+			"type":   "message",
+			"id":     "msg_" + e.respID,
+			"role":   "assistant",
+			"status": "in_progress",
+			"content": []any{},
+		},
 	})
 }
 
@@ -224,12 +275,5 @@ func (e *responsesEncoder) responseEnvelope(status string, output []any) map[str
 // mergeRawUsage 合并 message_start（input 系）与 message_delta（output）的
 // Anthropic 形态 usage（键保持 input_tokens/output_tokens）。
 func mergeRawUsage(input, output map[string]any) map[string]any {
-	merged := map[string]any{}
-	for k, v := range input {
-		merged[k] = v
-	}
-	for k, v := range output {
-		merged[k] = v
-	}
-	return merged
+	return mergeUsageMax(input, output)
 }
