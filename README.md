@@ -65,7 +65,7 @@ sudo ./deploy/manage.sh            # 交互式選單：安裝/更新/卸載/狀�
 
 ```bash
 sudo ./deploy/manage.sh install                # 二進制 + systemd（已實測）
-sudo ./deploy/manage.sh install --port 3010 --user zcode --prefetch-browser
+sudo ./deploy/manage.sh install --port 3010 --user zcode
 sudo ./deploy/manage.sh update                 # 更新（自動比對 Release 版本）
 sudo ./deploy/manage.sh uninstall              # 卸載（--purge 連數據刪除）
 sudo ./deploy/manage.sh docker-install         # Docker（未驗證）

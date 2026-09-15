@@ -471,8 +471,19 @@ func TestPoolStopIdempotentAndRestart(t *testing.T) {
 }
 
 func TestPoolStopWaitsInflight(t *testing.T) {
+	// 用 channel 明確等待 worker 真正開始求解：
+	// StatsSnapshot().Requests 在派發時就自增，此時 worker 未必已進入求解，
+	// Stop 可能搶在開始前走「快速放棄」路徑，導致間歇性失敗。
+	started := make(chan struct{})
 	f := &scriptFactory{make: func(int) ([]stepFunc, error) {
-		return []stepFunc{slowStep(200*time.Millisecond, "inflight-token")}, nil
+		return []stepFunc{func(ctx context.Context) (string, error) {
+			close(started)
+			sleepCtx(ctx, 200*time.Millisecond)
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			return "inflight-token", nil
+		}}, nil
 	}}
 	p := newTestPool(t, f.create, 1)
 	p.shutdownTimeout = 5 * time.Second
@@ -480,25 +491,30 @@ func TestPoolStopWaitsInflight(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	solveDone := make(chan error, 1)
-	var tok string
+	type solveResult struct {
+		tok string
+		err error
+	}
+	solveDone := make(chan solveResult, 1)
 	go func() {
-		result, err := p.Solve(context.Background())
-		tok = result
-		solveDone <- err
+		tok, err := p.Solve(context.Background())
+		solveDone <- solveResult{tok, err}
 	}()
-	waitFor(t, 2*time.Second, func() bool {
-		return p.StatsSnapshot().Requests == 1
-	}, "在途请求应已派发")
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker 未开始求解")
+	}
 
 	p.Stop() // 应等待在途求解完成
 	select {
-	case err := <-solveDone:
-		if err != nil {
-			t.Fatalf("在途求解不应被中断: %v", err)
+	case res := <-solveDone:
+		if res.err != nil {
+			t.Fatalf("在途求解不应被中断: %v", res.err)
 		}
-		if tok != "inflight-token" {
-			t.Fatalf("在途结果应正常投递: %q", tok)
+		if res.tok != "inflight-token" {
+			t.Fatalf("在途结果应正常投递: %q", res.tok)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Stop 应等待在途求解完成")

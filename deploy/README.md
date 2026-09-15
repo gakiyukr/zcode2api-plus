@@ -68,7 +68,7 @@ sudo ./deploy/manage.sh docker-uninstall   # Docker 卸載
 --local              # 從本機源碼構建（需 Go 工具鏈）
 --version TAG        # 指定 Release 標籤，預設取最新
 --no-browser         # 不裝驗證碼瀏覽器依賴（改用後台人工回填）
---prefetch-browser   # 安裝時預下載 Chromium（約 200MB）
+--no-prefetch-browser  # 安裝時不預下載 Chromium（預設會下載，約 200MB）
 --no-deps            # 跳過系統依賴安裝
 --purge              # 卸載時連同數據目錄刪除
 --keep-user          # 卸載時保留系統賬號
@@ -99,7 +99,7 @@ sudo ./deploy/manage.sh
 
 # 或非交互
 sudo ./deploy/manage.sh install
-sudo ./deploy/manage.sh install --port 3010 --user zcode --prefetch-browser
+sudo ./deploy/manage.sh install --port 3010 --user zcode
 ```
 
 安裝完成後會自動啟動服務，並在首次啟動時把**後台密碼**與**網關 API Key** 打印到日誌與終端。
@@ -112,8 +112,16 @@ sudo ./deploy/manage.sh install --port 3010 --user zcode --prefetch-browser
 3. 安裝驗證碼瀏覽器的共享庫（見 [驗證碼瀏覽器](#驗證碼瀏覽器重要)）
 4. 取得二進制：從 GitHub Releases 下載，或用 `--local` 就地編譯
 5. 生成 `/opt/zcode2api/.env`（已存在則保留）
-6. 渲染並安裝 `/etc/systemd/system/zcode2api.service`
-7. `systemctl enable --now zcode2api`
+6. **預下載補丁 Chromium**（約 200MB，實測約 20 秒；`--no-prefetch-browser` 可跳過）
+7. 渲染並安裝 `/etc/systemd/system/zcode2api.service`
+8. `systemctl enable --now zcode2api`
+
+> **為何預設預下載**：瀏覽器池是惰性啟動的，若不在安裝階段下載，
+> 首次 JWT 請求會因驗證碼不可用而失敗（並觸發 60 秒冷卻），
+> 使用者需等下一次請求才成功。安裝時一次下載可完全避免此情況。
+>
+> 已存在快取時命令會直接跳過，不會重複下載。
+> 也可事後單獨執行：`zcode2api prefetch-browser`。
 
 ### 目錄結構
 

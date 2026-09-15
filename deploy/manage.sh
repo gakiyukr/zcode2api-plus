@@ -28,7 +28,9 @@ ENABLE_BROWSER="true"
 WITH_DEPS="true"
 SOURCE="release"
 VERSION=""
-PREFETCH_BROWSER="false"
+# 预下载补丁 Chromium：默认开启，避免新机首次请求等待数分钟。
+# 用 --no-prefetch-browser 关闭（或 --no-browser 一并跳过验证码浏览器）。
+PREFETCH_BROWSER="true"
 PURGE="false"
 KEEP_USER="false"
 DOCKER_VOLUMES="false"
@@ -392,12 +394,12 @@ bin_install() {
 	write_unit
 
 	if [ "$PREFETCH_BROWSER" = "true" ] && [ "$ENABLE_BROWSER" = "true" ]; then
-		info "预先下载补丁 Chromium（约 200MB，可能需要数分钟）"
+		info "预下载补丁 Chromium（约 200MB，可能需要数分钟）"
 		if ( cd "$DIR" && set -a && . "$DIR/.env" && set +a && \
-			timeout 1800 "$DIR/zcode2api" accounts >/dev/null 2>&1 ); then
+			timeout 1800 "$DIR/zcode2api" prefetch-browser ); then
 			ok "浏览器预下载完成"
 		else
-			warn "预下载未成功；服务首次启动时会自动重试"
+			warn "预下载未成功；服务首次使用时会自动重试"
 		fi
 	fi
 
@@ -760,7 +762,9 @@ menu_install() {
 		ENABLE_BROWSER="false"
 	fi
 	if [ "$ENABLE_BROWSER" = "true" ]; then
-		confirm "现在预先下载补丁 Chromium（约 200MB）？" && PREFETCH_BROWSER="true"
+		# 默认预下载：否则新机首次 JWT 请求需等待下载（约 200MB），
+		# 期间该请求会因验证码不可用而失败。
+		confirm "现在预下载补丁 Chromium（约 200MB）？" || PREFETCH_BROWSER="false"
 	fi
 	echo
 	bin_install
@@ -846,7 +850,7 @@ ${C_BOLD}zcode2api 管理脚本（Linux）${C_RST}
   --local             从本机源码构建（需 Go 工具链）
   --version TAG       指定 Release 标签（如 v1.2.3），默认取最新
   --no-browser        不安装验证码浏览器依赖（改用后台人工回填）
-  --prefetch-browser  安装时预先下载补丁 Chromium（约 200MB）
+  --no-prefetch-browser  安装时不预下载补丁 Chromium（默认会下载，约 200MB）
   --no-deps           跳过系统依赖安装
   --purge             卸载时连同数据目录一并删除
   --keep-user         卸载时保留系统账号
@@ -855,7 +859,7 @@ ${C_BOLD}zcode2api 管理脚本（Linux）${C_RST}
   -h, --help          显示本说明
 
 示例:
-  sudo $0 install --port 3010 --user zcode --prefetch-browser
+  sudo $0 install --port 3010 --user zcode
   sudo $0 update -y
   sudo $0 uninstall --purge
   sudo $0 docker-install
@@ -876,6 +880,7 @@ parse_args() {
 			--local) SOURCE="local"; shift ;;
 			--no-browser) ENABLE_BROWSER="false"; shift ;;
 			--prefetch-browser) PREFETCH_BROWSER="true"; shift ;;
+			--no-prefetch-browser) PREFETCH_BROWSER="false"; shift ;;
 			--no-deps) WITH_DEPS="false"; shift ;;
 			--purge) PURGE="true"; shift ;;
 			--keep-user) KEEP_USER="true"; shift ;;

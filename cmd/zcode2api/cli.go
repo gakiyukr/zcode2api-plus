@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -34,6 +35,7 @@ const cliUsage = `ZCode2api (Go)
   zcode2api remove-account <provider> <id|name>
   zcode2api quota                      查看各账号实时额度
   zcode2api status                     查看配置概览
+  zcode2api prefetch-browser           预下载验证码用的补丁 Chromium（约 200MB）
   zcode2api set-admin-key <key>        设置后台密码
   zcode2api export [file]              导出账号
   zcode2api import <file>              导入账号
@@ -71,6 +73,8 @@ func runCLI(cmd string, rest []string, serveFn func()) int {
 	case "status":
 		cmdStatus()
 		return 0
+	case "prefetch-browser":
+		return cmdPrefetchBrowser()
 	case "quota":
 		cmdQuota()
 		return 0
@@ -269,6 +273,30 @@ func cmdSetAdminKey(args []string) {
 }
 
 // ── status / quota ──────────────────────────────────────────────────────────
+
+// cmdPrefetchBrowser 预下载验证码求解用的补丁 Chromium。
+// 浏览器池是惰性启动的（首次 JWT 请求才下载），新机部署后先执行本命令
+// 可避免首个请求等待数分钟。返回进程退出码。
+func cmdPrefetchBrowser() int {
+	fmt.Println(web.Cyan + "\n--- 预下载补丁 Chromium ---" + web.Reset)
+	if !config.CaptchaBrowserEnabled {
+		fmt.Println(web.Yellow + "验证码浏览器未启用（ZCODE_CAPTCHA_BROWSER=false），无需下载" + web.Reset)
+		return 0
+	}
+	// 已存在则直接报告，不重复下载
+	if bin, err := captcha.DiscoverBrowserBinary(); err == nil {
+		fmt.Printf("%s已存在: %s%s\n", web.Green, bin, web.Reset)
+		return 0
+	}
+	fmt.Println("本地未发现，开始下载（约 200MB，可能需要数分钟）...")
+	path, err := captcha.EnsureBrowserBinary(context.Background())
+	if err != nil {
+		fmt.Printf("%s下载失败: %v%s\n", web.Red, err, web.Reset)
+		return 1
+	}
+	fmt.Printf("%s已就绪: %s%s\n", web.Green, path, web.Reset)
+	return 0
+}
 
 func cmdStatus() {
 	fmt.Println(web.Cyan + "\n--- zcode2api-plus (Go) 状态 ---" + web.Reset)
