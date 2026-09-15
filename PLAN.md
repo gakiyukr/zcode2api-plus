@@ -336,7 +336,9 @@ meta(key TEXT PK, value TEXT)
   二进制安装/更新（版本比对+回滚）/卸载/状态 + Docker 安装/更新/卸载 + 服务控制；
   systemd 单元模板内嵌于脚本，单文件可部署。另附 `Dockerfile` + `docker-compose.yml`
   参考实现，**未经验证、不保证可用**
-- [ ] **验收**：Release CI 产物可运行；`-race` 下全测试通过；两版本交替使用同一 db 无异常
+- [x] **验收（部分）**：`-race` 下全测试通过（2026-09-15 于 Debian 12 服务器实测，13 包全绿，
+  并发热点包连跑 5 轮无竞态）
+- [ ] **验收**：Release CI 产物可运行；两版本交替使用同一 db 无异常
 ### M7 `/v1/responses` 端点（代码完成，待真机验收）
 - [x] 请求/响应/流式转换 + 状态化划界（`previous_response_id` v1 先 400）—
   `internal/openai/{responses,responses_stream}.go`（7 组单测，含 2 组 e2e）
@@ -395,7 +397,9 @@ meta(key TEXT PK, value TEXT)
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
   最终用 openai 官方客户端（python）指向网关做真客户端回归（待真实账号环境）。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。
-- 全部测试在 `-race` 下通过（**待办**：本机无 gcc，需在有 C 工具链的环境补跑）。
+- 全部测试在 `-race` 下通过：**已验证**（2026-09-15，Debian 12 + Go 1.25.14 + gcc 12，
+  `CGO_ENABLED=1 go test -race -count=1 -p 1 ./...` 13 包全绿；并发热点包
+  captcha/asyncpool/quota 另连跑 5 轮无竞态报告）。
 - 数据互通夹具：把一份脱敏 `accounts.db` 提交到 `testdata/` 作为固定夹具（**尚未提交**）。
 
 ## 8. 风险与对策

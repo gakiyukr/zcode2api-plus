@@ -15,7 +15,7 @@
 | 倉庫 | `C:\Projects\zcode2api-plus`，分支 `go-rewrite`，remote `origin` = github.com/gakiyukr/zcode2api-plus |
 | 分支 | `go-rewrite`（Go 主線）、`python-legacy`（Python 版歸檔，僅作行為契約參照，**不再更新**） |
 | 里程碑 | M0-M8 代码全部完成：M0 骨架+數據層、M1 網關核心、M2 Admin API+SPA（**已驗收**）、M3 額度+async、M4 OpenAI 兼容層、M5 rod 驗證碼池、M6 OAuth+代理+CLI+交付、M7 `/v1/responses`、M8 套餐自動領取 |
-| 測試 | `go build ./... && go vet ./... && go test ./...` 全綠（13 個含測試的包、171 個 Test 函式）；`-race` 本機不可用（無 gcc），需在有 C 工具鏈的環境補跑 |
+| 測試 | `go build ./... && go vet ./... && go test ./...` 全綠（13 個含測試的包、171 個 Test 函式）；`-race` **已驗證**（2026-09-15 於 Debian 12 伺服器，Go 1.25.14 + gcc 12，13 包全綠） |
 | 行為契約 | Python 版（本倉庫 `python-legacy` 分支，`app/`）為權威對照；Go 版增量見 `PLAN.md` §5.7-§5.9 |
 
 ## 2. 新會話上手步驟
@@ -53,7 +53,7 @@
 - **M1**：真實賬號非流式 + 流式各打通一次。
 - **M4**：openai 官方 Python 客戶端指向網關跑通非流式/流式/工具調用三場景。
 - **M5**：真實賬號連續 20 次 JWT 請求全自動通過（無 F001）。
-- **M6**：Release CI 產物可運行（推 tag 觸發）；`-race` 全測試；兩版本交替用同一 db 無異常。
+- **M6**：Release CI 產物可運行（推 tag 觸發）；兩版本交替用同一 db 無異常。（`-race` 已完成）
 - **M7**：Codex CLI 指向網關無狀態模式完整會話。
 - **M8**：真機領取一次成功（billing/preview + claim + 激活上報全鏈路）。
 
@@ -129,7 +129,7 @@ cd C:\Projects\zcode2api-plus
 go build ./... && go vet ./... && go test ./...   # 全量驗證（當前全綠）
 go test ./internal/openai/ -v                     # OpenAI 轉換層詳情
 go build -o z2a ./cmd/zcode2api && ZCODE_DATA_DIR=/tmp/z2a ./z2a serve   # 臨時目錄起服務自測
-CGO_ENABLED=1 go test -race ./...                 # 競態檢查（需 gcc，本機無）
+CGO_ENABLED=1 go test -race ./...                 # 競態檢查（需 gcc；本機無，已於伺服器驗證）
 HTTPS_PROXY=http://127.0.0.1:7890 git push origin go-rewrite   # 推送
 
 # 部署腳本（僅 Linux；Windows 上可用 WSL 驗證語法與流程）
