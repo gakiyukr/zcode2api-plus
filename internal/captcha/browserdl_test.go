@@ -247,3 +247,69 @@ func TestExtractTarGzRejectsEscapingSymlink(t *testing.T) {
 		t.Fatal("逃逸目录的符号链接应被拒绝")
 	}
 }
+
+// 逃逸解包目录的硬链接必须被拒绝（与符号链接同级的压缩包投毒防护）。
+//
+// 硬链接分支曾只做 filepath.Clean 而缺少逃逸校验：filepath.Join 会把
+// "../../etc/passwd" Clean 成解包目录之外的路径，使 os.ReadFile 读到宿主
+// 任意文件并写进安装目录——与同函数中 Name / TypeSymlink 的防护不一致。
+func TestExtractTarGzRejectsEscapingHardlink(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	hdr := &tar.Header{Name: "evil", Typeflag: tar.TypeLink, Linkname: "../../etc/passwd", Mode: 0o644}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 必须因「路径非法」被拒，而不是因源文件恰好读不到——后者在源路径存在时
+	// 就会放行（例如宿主的 /etc/passwd），测试也就抓不到这个缺口。
+	err := extractTarGz(buf.Bytes(), t.TempDir())
+	if err == nil {
+		t.Fatal("逃逸目录的硬链接应被拒绝")
+	}
+	if !strings.Contains(err.Error(), "非法硬链接") {
+		t.Fatalf("应以路径非法为由拒绝，实际: %v", err)
+	}
+}
+
+// 解包目录内的硬链接仍应正常复制内容（不能因防护而破坏合法包）。
+func TestExtractTarGzAllowsInternalHardlink(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	body := []byte("binary-content")
+	if err := tw.WriteHeader(&tar.Header{Name: "dir/src", Typeflag: tar.TypeReg, Mode: 0o755, Size: int64(len(body))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "dir/link", Typeflag: tar.TypeLink, Linkname: "dir/src", Mode: 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := t.TempDir()
+	if err := extractTarGz(buf.Bytes(), dest); err != nil {
+		t.Fatalf("包内硬链接应被允许: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "dir", "link"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("硬链接内容不符: %q", got)
+	}
+}

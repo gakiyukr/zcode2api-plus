@@ -30,6 +30,7 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/web"
 )
 
 //go:embed AliyunCaptcha.js.txt
@@ -211,6 +212,13 @@ type RodWorker struct {
 	browser  *rod.Browser
 	page     *rod.Page
 
+	// browserCancel 取消绑定在 browser 上的 ctx。
+	// rod 的 Browser 默认用 context.Background()，其 CDP 调用（classify 的
+	// GetVersion 探针、Page 创建、Browser.Close）在浏览器假死时会永久阻塞——
+	// 这里运行在池的槽位 goroutine 上，卡住即槽位永不归队（workers 默认 1
+	// 时整池失效）。Close 时取消，让这些调用立即返回。
+	browserCancel context.CancelFunc
+
 	cfg          Config
 	solveTimeout time.Duration // 单次求解超时（对齐 --solve-timeout 默认 40s）
 	sdkLoadTTL   time.Duration // SDK 加载超时（对齐 --sdk-load-timeout 默认 20s）
@@ -241,23 +249,34 @@ func newRodWorker(ctx context.Context, bin string, cfg Config) (*RodWorker, erro
 	// NoDefaultDevice：rod 默认设备模拟（LaptopWithMDPI）会用 CDP 改写 UA 与视口，
 	// 覆盖补丁二进制的指纹输出，必须关闭（playwright 侧无设备模拟）。
 	if err := b.Connect(); err != nil {
-		_ = b.Close()
-		l.Cleanup()
+		// Connect 失败时 rod 的 client 仍是 nil（Browser.Connect 只在
+		// cdp.StartWithURL 成功后赋值），此时 Browser.Close 会走
+		// b.client.Call(...) 对 nil interface 调用方法 —— 直接 panic，
+		// 而这里运行在池的槽位 goroutine 上，一次浏览器启动异常就会
+		// 终止整个网关进程。只做进程侧清理。
+		closeLauncher(l)
 		return nil, fmt.Errorf("浏览器连接失败: %w", err)
 	}
 	page, err := loadSDKPage(ctx, b, cfg)
 	if err != nil {
 		_ = b.Close()
-		l.Cleanup()
+		closeLauncher(l)
 		return nil, fmt.Errorf("页面初始化失败: %w", err)
 	}
+	// 绑定一个可取消的 ctx 到 browser：Browser.Context 返回克隆，故必须
+	// 在此处替换，之后 w.browser 的所有 CDP 调用都受它约束。
+	browserCtx, browserCancel := context.WithCancel(context.Background())
+	b = b.Context(browserCtx)
+	page = page.Context(browserCtx)
+
 	return &RodWorker{
-		launcher:     l,
-		browser:      b,
-		page:         page,
-		cfg:          cfg,
-		solveTimeout: time.Duration(config.CaptchaSolveTimeout) * time.Second,
-		sdkLoadTTL:   sdkLoadTimeout,
+		launcher:      l,
+		browser:       b,
+		page:          page,
+		browserCancel: browserCancel,
+		cfg:           cfg,
+		solveTimeout:  time.Duration(config.CaptchaSolveTimeout) * time.Second,
+		sdkLoadTTL:    sdkLoadTimeout,
 	}, nil
 }
 
@@ -370,7 +389,13 @@ func (w *RodWorker) reload(ctx context.Context) error {
 }
 
 // Close 释放浏览器与会话资源。
+//
+// 顺序：先取消 ctx 让所有在途/后续 CDP 调用立即失败返回（浏览器假死时
+// Close/Page 都会永久阻塞），再关页面与浏览器，最后有界地杀进程。
 func (w *RodWorker) Close() error {
+	if w.browserCancel != nil {
+		w.browserCancel()
+	}
 	if w.page != nil {
 		_ = w.page.Close()
 		w.page = nil
@@ -378,10 +403,35 @@ func (w *RodWorker) Close() error {
 	if w.browser != nil {
 		_ = w.browser.Close()
 	}
-	if w.launcher != nil {
-		w.launcher.Cleanup() // 移除临时 user-data-dir
-	}
+	closeLauncher(w.launcher) // 有界：杀进程 + 移除临时 user-data-dir
 	return nil
+}
+
+// launcherCleanupTimeout 关闭启动器时的等待上限。
+//
+// rod 的 Launcher.Cleanup 是 `<-l.exit`（等浏览器进程退出），没有任何上限；
+// 浏览器假死或启动后既不打印 DevTools URL 也不退出时，它会永久阻塞——而这里
+// 运行在池的槽位 goroutine 上，卡住即等于该槽位永不归队（workers 默认 1 时
+// 整个池失效）。改为先杀进程、再有界等待。
+const launcherCleanupTimeout = 5 * time.Second
+
+// closeLauncher 有界地关闭启动器：杀掉浏览器进程，最多等 launcherCleanupTimeout
+// 让 rod 完成自身的退出处理与 user-data-dir 清理，超时则直接返回。
+func closeLauncher(l *launcher.Launcher) {
+	if l == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		l.Kill()
+		l.Cleanup()
+	}()
+	select {
+	case <-done:
+	case <-time.After(launcherCleanupTimeout):
+		web.Warn("captcha", "浏览器进程未在超时内退出，已放弃等待")
+	}
 }
 
 // sleepCtx 可中断睡眠。

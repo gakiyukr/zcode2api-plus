@@ -328,3 +328,35 @@ func (w *blockingWorker) Solve(ctx context.Context) (string, error) {
 }
 
 func (w *blockingWorker) Close() error { return nil }
+
+// 部分缺字段的配置也应被拒（不能只判「全空」）。
+//
+// sceneId/region/prefix 都是 SDK 初始化的必需参数；只判全空会让缺一项的配置
+// 照样拉起浏览器并加载 224KB SDK，失败还被归类为 ErrSolverFailure（不触发
+// 启动冷却），与错误文案「缺少 sceneId、region 或 prefix」不符。
+func TestBrowserSolverRejectsPartiallyMissingConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+	}{
+		{"缺 region", Config{Enabled: true, SceneID: "sc", Prefix: "px"}},
+		{"缺 prefix", Config{Enabled: true, SceneID: "sc", Region: "cn"}},
+		{"缺 sceneId", Config{Enabled: true, Region: "cn", Prefix: "px"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := NewBrowserSolver()
+			called := false
+			s.SetPoolFactory(func(Config) *Pool {
+				called = true
+				return nil
+			})
+			if _, err := s.Solve(context.Background(), c.cfg); !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("配置不完整应回 ErrUnavailable，实际: %v", err)
+			}
+			if called {
+				t.Fatal("配置不完整不应创建池（会白拉起浏览器）")
+			}
+		})
+	}
+}

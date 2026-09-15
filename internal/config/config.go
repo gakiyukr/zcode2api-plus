@@ -81,7 +81,10 @@ var (
 	CaptchaConfigCacheTTL = int64(envInt("CAPTCHA_CONFIG_CACHE_TTL", 600_000)) // ms，上游配置
 	CaptchaManualCacheTTL = int64(envInt("CAPTCHA_MANUAL_CACHE_TTL", 45_000))  // ms，人工回填
 
-	CaptchaSolveTimeout = envInt("ZCODE_CAPTCHA_TIMEOUT", 40) // 每次求解超时（秒）
+	// 每次求解超时（秒）。与同组 CaptchaBrowser* 一致做下界钳制：0 或负值会让
+	// deadline 立即过期（每次求解都瞬时超时且不触发冷却），极大值会在
+	// time.Duration 乘法处溢出成负值，同样立即超时。
+	CaptchaSolveTimeout = min(max(1, envInt("ZCODE_CAPTCHA_TIMEOUT", 40)), 3600)
 
 	// 真实 Chromium（rod 驱动 cloakbrowser 下载的浏览器二进制）。
 	CaptchaBrowserEnabled         = envBool("ZCODE_CAPTCHA_BROWSER", false)

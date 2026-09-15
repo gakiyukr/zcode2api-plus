@@ -7,6 +7,7 @@ package captcha
 import (
 	"archive/tar"
 	"archive/zip"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/ed25519"
@@ -277,7 +278,7 @@ func extractArchive(archive []byte, archiveName, dest string) error {
 }
 
 func extractTarGz(archive []byte, dest string) error {
-	gz, err := gzip.NewReader(strings.NewReader(string(archive)))
+	gz, err := gzip.NewReader(bytes.NewReader(archive))
 	if err != nil {
 		return err
 	}
@@ -331,7 +332,14 @@ func extractTarGz(archive []byte, dest string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			src := filepath.Join(dest, filepath.Clean(hdr.Linkname))
+			// Linkname 必须与 Name 一样做逃逸校验：filepath.Join 会 Clean 掉
+			// ".."，../../../../etc/passwd 会解析成解包目录之外的路径，
+			// 使 os.ReadFile 读到宿主任意文件并写进安装目录。
+			link := filepath.Clean(hdr.Linkname)
+			if filepath.IsAbs(link) || strings.HasPrefix(link, "..") {
+				return fmt.Errorf("压缩包含非法硬链接: %s -> %s", hdr.Name, hdr.Linkname)
+			}
+			src := filepath.Join(dest, link)
 			data, err := os.ReadFile(src)
 			if err != nil {
 				return fmt.Errorf("硬链接源不可读 %s: %w", hdr.Name, err)
@@ -347,7 +355,7 @@ func extractTarGz(archive []byte, dest string) error {
 }
 
 func extractZip(archive []byte, dest string) error {
-	zr, err := zip.NewReader(strings.NewReader(string(archive)), int64(len(archive)))
+	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
 	if err != nil {
 		return err
 	}
