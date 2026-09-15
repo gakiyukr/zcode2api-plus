@@ -500,30 +500,75 @@ Previous read at ... by goroutine 11:
    轮询再次轮到它时仍失败。现移入循环：逐个标记 tried 后重选，直到选到 JWT 账号或
    候选耗尽（`tried` 单调增长，必然终止）。回归测试 `TestSkipsAPIKeyAccountsInMixedPool`。
 
-**低**
+**低（均已修复，6da8df6）**
 
-10. **批次/单笔额度刷新不跳过已归档与已停用账号** — `internal/adminapi/accounts.go:398-403`、`:423-437`
+10. ~~**批次/单笔额度刷新不跳过已归档与已停用账号**~~
     与 `store.SetArchived` 注释声明的「调度、领取、刷新全部跳过」矛盾；刷新还会经
-    `handleBillingResponse` 把归档账号状态写回 active。
+    `handleBillingResponse` 把归档账号状态写回 active。现与周期监控同一套筛选。
 
-11. **`handleClaim` 与 preview 对「冷却已到期」判断不一致** — `internal/adminapi/claim.go:116`
-    用原始 `Status`，preview（`:67`）用 `IsSelectable(now)`。冷却已到期的账号 preview 可查、
-    claim 被拒。
+11. ~~**`handleClaim` 与 preview 对「冷却已到期」判断不一致**~~
+    冷却已到期的账号 preview 可查、claim 被拒。现统一用 `IsSelectable`。
 
-12. **`VerifyAdminKey` 失败计数表无全域清理** — `internal/auth/auth.go:35`、`:97-113`
+12. ~~**`VerifyAdminKey` 失败计数表无全域清理**~~
     仅在同一 host 再次请求时 prune，未鉴权即可用大量来源地址撑大内存（IPv6 /64）。
+    现超过 4096 条触发全表清理。回归测试 `TestFailureTableSweepsExpiredEntries`。
 
-13. **async 入口未做 `NormalizeBody`** — `internal/asyncpool/pool.go:97-108`
-    直接校验原始 model，与 `/v1/messages`（先 `NormalizeBody` 再校验）不一致，
-    `anthropic/GLM-5.3` 这类写法在前者可过、后者 400。
+13. ~~**async 入口未做 `NormalizeBody`**~~
+    `anthropic/GLM-5.3` 这类写法在 `/v1/messages` 可过、在 async 被 400。
 
-14. **请求建构失败被归咎为账号凭据无效** — `internal/gateway/engine.go:196-199`
+14. ~~**请求建构失败被归咎为账号凭据无效**~~
     `http.NewRequestWithContext` 失败源于 `ZAI_UPSTREAM_URL` 配置错误，却标 `StatusInvalid`，
-    会把整池账号逐个标失效并落库，且 `last_error` 误导排查方向。
+    会把整池账号逐个标失效并落库。现直接终止并指明配置项。
 
-15. **`handleEditAccount` 部分套用** — `internal/adminapi/accounts.go:277-306`
-    先 `Update` 落库 name/secret/disabled_models，再 `AssignProxyProfile`；
-    后者失败回 500 但前面的字段已生效。
+15. ~~**`handleEditAccount` 部分套用**~~
+    先落库 name/secret/disabled_models 再 `AssignProxyProfile`，后者失败回 500 但前者已生效。
+    现调整顺序（`AssignProxyProfile` 自带锁，不能并入 Update 闭包）。
+
+### M12 补审：先前未覆盖的包（2026-09-15）
+
+第一轮三路审查各有明确排除范围，导致下列包完全未被覆盖。补审分三路进行，发现并修复：
+
+**高（已修复）**
+
+- **`/v1/responses` 从不发 `response.output_item.done`**（bdbf641）— Codex 只在该事件里
+  排入工具任务并设置 `needs_follow_up`（`codex-rs/codex-api/src/sse/responses.rs` 的
+  `OutputItemDone` 分支是唯一入口），缺了它模型请求的工具永不执行，会话在第一次工具调用
+  处中断——这正是 M7 验收条件未通过的根因。同时文字增量前缺 message 的
+  `output_item.added`，Codex 的 `active_item` 为空会丢弃全部 `output_text.delta`
+  （debug 构建下 `error_or_panic`）。事件序列已补齐并端到端验证。
+
+**中（已修复）**
+
+- **`function_call_output.output` 为数组时被静默转成空串** — Codex 在工具结果无
+  `structured_content` 时固定发 content items 数组，只做字符串断言会让整段工具输出丢失。
+- **usage 合并用覆盖而非取最大** — `message_delta` 若重复携带 `input_tokens: 0` 会把真实
+  输入量归零；`gateway/usage.go` 对同一问题已用 `max`。
+- **Responses usage 漏算 cache tokens** — Codex 从 `input_tokens_details.cached_tokens`
+  读取命中量并据此判断上下文压缩阈值。
+- **`ConvertResponsesResponse` 的 id 检查用错运算符** — 嵌套 if 等价于「两者同时缺失才拒绝」，
+  会产出 `"resp_"` 空 id。
+- **CLI 抢先落库密钥导致启动横幅永不再显示**（ff7c63f）— `store.New()` 首次打开即生成并写入
+  admin/gateway 密钥，但只记在该实例上，仅 `printBanner` 显示。任何先于 serve 的子命令都会
+  吃掉这次交付；`Dockerfile` 构建期就跑 `accounts`（输出重定向到 /dev/null），使镜像里的
+  密钥谁都没见过。现 `openStore` 立即打印本次生成的密钥。
+- **`login` 开浏览器在 Windows 被 `cmd.exe` 的 `&` 截断** — 授权 URL 含多个查询参数，
+  `cmd /c start` 会在第一个 `&` 处截断并把余下参数当命令执行；非 Windows 则完全无效且错误
+  被丢弃。改用 rundll32/open/xdg-open 并回报失败。
+- **`export` 默认档名未被 .gitignore 覆盖** — 导出含明文凭证，`git add .` 即入库。
+- **HTTP server 无 IdleTimeout**（9238f23）— 空闲 keep-alive 连接永不回收，goroutine 与 fd
+  无界累积。实测空闲连接在 119.5s 被回收。注意 `WriteTimeout` 必须保持零值（SSE/async
+  响应阶段持续数分钟），两者语义不同。
+- **无优雅退出**（7f27746）— 无 signal 处理且错误路径用 `os.Exit`，defer 全部跳过：
+  浏览器池不停止（Chromium 子进程可能残留）、SQLite 不关闭、监控循环不等待。
+  现 `serve` 返回 error、`main` 统一收尾，SIGINT/SIGTERM 走 10s Shutdown。
+
+**低（已修复，随 ff7c63f）**
+
+- `claim` 把 `GetVerifyParam` 的 `(nil, nil)`（上游停用验证码）当失败终止，而 gateway/async
+  对同一语义放行——该状态下账号能正常转发却永远领不了套餐。
+- `set-admin-key` 接受空字符串，会让后台立即全量 401（`VerifyAdminKey` 对空密钥 fail-closed），
+  而后台 API 对同一字段已有拒绝逻辑。
+- `login` 忽略 `Store.Update` 的落库错误仍报「已保存」。
 
 ### 审查中确认**无缺陷**的范围
 
@@ -536,7 +581,7 @@ Previous read at ... by goroutine 11:
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
-  保持同名用例语义，便于两边对照。当前 23 个测试文件、190 个 `Test` 函数，`go test ./...` 全绿。
+  保持同名用例语义，便于两边对照。当前 24 个测试文件、197 个 `Test` 函数，`go test ./...` 全绿。
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
   最终用 openai 官方客户端（python）指向网关做真客户端回归（待真实账号环境）。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。
