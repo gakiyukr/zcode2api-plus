@@ -798,6 +798,69 @@ func TestSSEJSONEscapesNonASCII(t *testing.T) {
 
 // async 路径必须与 engine 用同一套分类：429 的额度上限码族标「该模型耗尽」，
 // 而非一律标 cooling（曾因两条路径各自实现而分歧）。
+// TestJSONBusinessErrorIsNotTreatedAsStream 上游用 HTTP 200 包装业务错误时，
+// 不得当成成功串流交付。
+//
+// ZCode 有时在 200 里回 {"code":1005,...}（每日额度用完）。引擎有专门的
+// content-type 分支处理它；async 曾直接 forwardSSE，于是客户端收到
+// ready→done 的「成功」串流但零 chunk，账号也不被标状态——额度耗尽的账号
+// 会一直留在轮询池里被反复选中、反复白耗上游请求。
+func TestJSONBusinessErrorIsNotTreatedAsStream(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "daily-exhausted")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "application/json",
+			body: `{"code":1005,"msg":"exceed quota limit"}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-1005", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-1005")
+	events := drainEvents(tk)
+
+	// 不得出现 chunk 或 done：这不是一次成功交付
+	for _, ev := range events {
+		if ev.Type == "chunk" || ev.Type == "done" {
+			t.Fatalf("业务错误不应交付为成功串流: %+v", events)
+		}
+	}
+	// 账号必须被标记该模型耗尽（与 engine 一致），否则会被反复选中
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if !containsStr(acc.ExhaustedModels, "glm-5.3") {
+		t.Fatalf("应标记模型耗尽: status=%s exhausted=%v", acc.Status, acc.ExhaustedModels)
+	}
+}
+
+// TestJSONNonZeroCodeDeliveredAsError 其余业务码应作为 error 事件投递，
+// 且携带上游 msg，而不是静默变成「成功但零 chunk」。
+func TestJSONNonZeroCodeDeliveredAsError(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "biz-err")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "application/json",
+			body: `{"code":1234,"msg":"something went wrong"}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-biz", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-biz")
+	events := drainEvents(tk)
+
+	last := events[len(events)-1]
+	if last.Type != "error" {
+		t.Fatalf("业务错误应投递 error 事件: %+v", events)
+	}
+	errObj, _ := last.Data.(map[string]any)["error"].(map[string]any)
+	if errObj == nil || errObj["type"] != "upstream_error" {
+		t.Fatalf("错误类型应为 upstream_error: %v", last.Data)
+	}
+	if msg, _ := errObj["message"].(string); msg != "something went wrong" {
+		t.Fatalf("应取上游 msg 字段: %v", errObj["message"])
+	}
+}
+
 func TestQuotaExhaustedCodeMarksModelNotCooling(t *testing.T) {
 	p, st, _, _ := newTestPool(t)
 	addJWTAccount(t, st, "quota-acc")
