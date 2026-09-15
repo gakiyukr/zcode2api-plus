@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeCloakSource 假下载源：内置私钥签发的 SHA256SUMS 与压缩包。
@@ -311,5 +313,42 @@ func TestExtractTarGzAllowsInternalHardlink(t *testing.T) {
 	}
 	if string(got) != string(body) {
 		t.Fatalf("硬链接内容不符: %q", got)
+	}
+}
+
+// 等待下载锁必须可被调用方 ctx 取消。
+//
+// 首次下载约 200MB、上限 downloadTimeout（10 分钟），而调用方的启动超时通常
+// 只有 90s。锁若是普通 sync.Mutex，调用方放弃后槽位 goroutine 仍被扣住，
+// cm.Close() 也取消不掉。
+func TestEnsureVersionDownloadLockIsCancellable(t *testing.T) {
+	forcePlatform(t)
+	src := newFakeSource(t, map[string]string{executableName(): "fake-binary"})
+	setupFakeEnv(t, src)
+
+	// 先占住下载锁，模拟另一个 worker 正在下载
+	if err := lockDownload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer unlockDownload()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := ensureVersion(ctx, fakeVersion, fakeArchiveName)
+		done <- err
+	}()
+
+	// 给等待方一点时间进入 lockDownload，再取消
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("等待下载锁应返回 ctx 取消，实际: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待下载锁不可取消（调用方放弃后仍被扣住）")
 	}
 }

@@ -345,7 +345,7 @@ func cmdPrefetchBrowser() int {
 		return 0
 	}
 	// 已存在则直接报告，不重复下载
-	if bin, err := captcha.DiscoverBrowserBinary(); err == nil {
+	if bin, err := captcha.DiscoverBrowserBinary(context.Background()); err == nil {
 		fmt.Printf("%s已存在: %s%s\n", web.Green, bin, web.Reset)
 		return 0
 	}

@@ -231,7 +231,7 @@ type RodWorker struct {
 // NewRodWorkerFactory 构造绑定验证码配置的真实求解工厂。
 func NewRodWorkerFactory(cfg Config) WorkerFactory {
 	return func(ctx context.Context) (Worker, error) {
-		bin, err := DiscoverBrowserBinary()
+		bin, err := DiscoverBrowserBinary(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -452,7 +452,7 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 //  3. CLOAKBROWSER_CACHE_DIR（默认 ~/.cloakbrowser）下 chromium-<版本>[<suffix>]
 //     目录，取版本号最高者。可执行文件名按平台：Linux chrome、Windows chrome.exe、
 //     macOS Chromium.app 包（对齐 cloakbrowser get_binary_path）。
-func DiscoverBrowserBinary() (string, error) {
+func DiscoverBrowserBinary(ctx context.Context) (string, error) {
 	if bin := strings.TrimSpace(config.CaptchaBrowserBin); bin != "" {
 		if info, err := os.Stat(bin); err == nil && !info.IsDir() {
 			return bin, nil
@@ -478,7 +478,7 @@ func DiscoverBrowserBinary() (string, error) {
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
 		// 缓存目录不可读（首次部署）：走自动下载，无需 Python 预下载。
-		return discoverViaDownload()
+		return discoverViaDownload(ctx)
 	}
 	type candidate struct {
 		version []int
@@ -501,7 +501,7 @@ func DiscoverBrowserBinary() (string, error) {
 		}
 	}
 	if len(candidates) == 0 {
-		return discoverViaDownload()
+		return discoverViaDownload(ctx)
 	}
 	// 版本降序，取最高
 	sort.Slice(candidates, func(i, j int) bool {
@@ -518,8 +518,12 @@ func DiscoverBrowserBinary() (string, error) {
 
 // discoverViaDownload 发现链落空后的兜底：自动下载补丁 Chromium 再重扫缓存目录。
 // 下载失败返回原始错误（人工回填兜底不受影响）。
-func discoverViaDownload() (string, error) {
-	version, err := EnsureBrowserBinary(context.Background())
+//
+// 传入 ctx 而非自建 Background：首次下载约 200MB，可能远超调用方的
+// CaptchaBrowserStartupTimeout；不自建 ctx 会让调用方放弃后下载仍在跑，
+// 槽位 goroutine 与 cm.Close() 都无法取消它。
+func discoverViaDownload(ctx context.Context) (string, error) {
+	version, err := EnsureBrowserBinary(ctx)
 	if err != nil {
 		return "", fmt.Errorf("自动下载补丁 Chromium 失败（可手动执行 python -m cloakbrowser install 或设 ZCODE_CAPTCHA_BROWSER_BIN）: %w", err)
 	}

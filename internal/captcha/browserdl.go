@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"zcode2api/internal/web"
@@ -46,7 +45,24 @@ var (
 )
 
 // downloadMutex 串行化并发下载（多 worker 同时冷启动只下载一次）。
-var downloadMutex sync.Mutex
+//
+// 用 channel 而非 sync.Mutex：等待方需要能被调用方的 ctx 取消。首次下载
+// 约 200MB、上限 downloadTimeout（10 分钟），而调用方的启动超时通常只有
+// 90s——不可取消的等待会让槽位 goroutine 在调用方早已放弃后继续被扣住，
+// cm.Close() 也取消不掉。
+var downloadMutex = make(chan struct{}, 1)
+
+// lockDownload 获取下载锁，等待可被 ctx 取消。
+func lockDownload(ctx context.Context) error {
+	select {
+	case downloadMutex <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func unlockDownload() { <-downloadMutex }
 
 // cloakBinaryDir 版本对应的安装目录（对齐 cloakbrowser get_binary_dir）。
 func cloakBinaryDir(version string) string {
@@ -173,8 +189,10 @@ func EnsureBrowserBinary(ctx context.Context) (string, error) {
 
 // ensureVersion 指定版本与包名的下载安装链路（测试可注入假源）。
 func ensureVersion(ctx context.Context, version, archiveName string) (string, error) {
-	downloadMutex.Lock()
-	defer downloadMutex.Unlock()
+	if err := lockDownload(ctx); err != nil {
+		return "", err
+	}
+	defer unlockDownload()
 
 	dir := cloakBinaryDir(version)
 	if info, err := os.Stat(filepath.Join(dir, executableName())); err == nil && !info.IsDir() {

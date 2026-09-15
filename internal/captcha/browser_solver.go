@@ -26,6 +26,13 @@ type BrowserSolver struct {
 	// 而是标记 retired，由最后一个归还者负责关闭（避免中止在途求解）。
 	inFlight int
 	retired  *Pool
+	// starting 正在锁外启动的池及其配置键。
+	// Start 最长等 CaptchaBrowserStartupTimeout（默认 90s），必须在锁外执行，
+	// 否则所有并发 Solve 会卡在同一把锁上、各自请求的 ctx 取消完全无效。
+	// 启动期间到达的调用者等待这个信号而非重复启动。
+	starting    *Pool
+	startingKey string
+	startDone   chan struct{}
 	// failureUntil 启动失败后的冷却截止（单调时钟）。
 	failureUntil time.Time
 
@@ -79,7 +86,7 @@ func (s *BrowserSolver) Solve(ctx context.Context, cfg Config) (string, error) {
 	}
 	key := strings.Join([]string{scene, region, prefix}, "|")
 
-	pool, release, err := s.acquirePool(cfg, key)
+	pool, release, err := s.acquirePool(ctx, cfg, key)
 	if err != nil {
 		return "", err
 	}
@@ -99,18 +106,66 @@ func (s *BrowserSolver) Solve(ctx context.Context, cfg Config) (string, error) {
 // acquirePool 取（必要时启动/重建）可用的池，并登记一次在途使用。
 // 返回的 release 必须在求解结束后调用：它负责在池已被配置变更淘汰时关闭旧池，
 // 从而保证「不中止在途求解」与「旧池最终被回收」两者兼得。
-func (s *BrowserSolver) acquirePool(cfg Config, key string) (*Pool, func(), error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.now().Before(s.failureUntil) {
-		return nil, nil, fmt.Errorf("%w：浏览器池冷却中", ErrUnavailable)
+func (s *BrowserSolver) acquirePool(ctx context.Context, cfg Config, key string) (*Pool, func(), error) {
+	for {
+		s.mu.Lock()
+		if s.now().Before(s.failureUntil) {
+			s.mu.Unlock()
+			return nil, nil, fmt.Errorf("%w：浏览器池冷却中", ErrUnavailable)
+		}
+		// 已有可用池：直接登记使用
+		if s.pool != nil && s.poolKey == key && s.pool.IsStarted() {
+			pool := s.pool
+			s.inFlight++
+			s.mu.Unlock()
+			return pool, s.releaseFunc(), nil
+		}
+		// 他人正在启动同一配置：等它结束（可被 ctx 取消）后重试
+		if s.starting != nil && s.startingKey == key {
+			wait := s.startDone
+			s.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+		}
+		// 本调用者负责启动：先在锁内完成旧池淘汰与新池登记，再出锁 Start
+		pool, err := s.preparePoolLocked(cfg, key)
+		if err != nil {
+			s.mu.Unlock()
+			return nil, nil, err
+		}
+		s.starting, s.startingKey, s.startDone = pool, key, make(chan struct{})
+		done := s.startDone
+		s.mu.Unlock()
+
+		// 锁外启动：最长 CaptchaBrowserStartupTimeout，期间不阻塞其他调用者
+		startErr := pool.Start()
+
+		s.mu.Lock()
+		s.starting, s.startingKey, s.startDone = nil, "", nil
+		close(done)
+		if startErr != nil {
+			cooldown := time.Duration(config.CaptchaBrowserFailureCooldown) * time.Second
+			s.failureUntil = s.now().Add(cooldown)
+			s.mu.Unlock()
+			web.Warn("captcha", fmt.Sprintf(
+				"真实浏览器池不可用，%s 内回退人工回填: %s", cooldown, redact(startErr.Error())))
+			return nil, nil, fmt.Errorf("%w：浏览器池启动失败", ErrUnavailable)
+		}
+		s.pool, s.poolKey = pool, key
+		s.inFlight++
+		s.mu.Unlock()
+		web.Ok("captcha", fmt.Sprintf("真实浏览器验证码池已就绪（%d 个 worker）", config.CaptchaBrowserWorkers))
+		return pool, s.releaseFunc(), nil
 	}
-	pool, err := s.ensurePoolLocked(cfg, key)
-	if err != nil {
-		return nil, nil, err
-	}
-	s.inFlight++
-	release := func() {
+}
+
+// releaseFunc 返回一次在途使用的归还函数。
+func (s *BrowserSolver) releaseFunc() func() {
+	return func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.inFlight--
@@ -120,14 +175,10 @@ func (s *BrowserSolver) acquirePool(cfg Config, key string) (*Pool, func(), erro
 			s.retired = nil
 		}
 	}
-	return pool, release, nil
 }
 
-// ensurePoolLocked 取已启动的池，必要时启动；配置键变化时重建（调用方持锁）。
-func (s *BrowserSolver) ensurePoolLocked(cfg Config, key string) (*Pool, error) {
-	if s.pool != nil && s.poolKey == key && s.pool.IsStarted() {
-		return s.pool, nil
-	}
+// preparePoolLocked 在锁内淘汰旧池并为新配置建池（不启动）；调用方持锁。
+func (s *BrowserSolver) preparePoolLocked(cfg Config, key string) (*Pool, error) {
 	if s.pool != nil {
 		// 配置变更：有在途求解时延迟关闭（标记 retired，由最后一个归还者 Stop），
 		// 否则立即关闭（对齐 _stop_browser_pool）。
@@ -142,20 +193,7 @@ func (s *BrowserSolver) ensurePoolLocked(cfg Config, key string) (*Pool, error) 
 		s.pool = nil
 		s.poolKey = ""
 	}
-
-	pool := s.newPool(cfg)
-	if err := pool.Start(); err != nil {
-		cooldown := time.Duration(config.CaptchaBrowserFailureCooldown) * time.Second
-		s.failureUntil = s.now().Add(cooldown)
-		web.Warn("captcha", fmt.Sprintf(
-			"真实浏览器池不可用，%s 内回退人工回填: %s", cooldown, redact(err.Error())))
-		return nil, fmt.Errorf("%w：浏览器池启动失败", ErrUnavailable)
-	}
-
-	s.pool = pool
-	s.poolKey = key
-	web.Ok("captcha", fmt.Sprintf("真实浏览器验证码池已就绪（%d 个 worker）", config.CaptchaBrowserWorkers))
-	return pool, nil
+	return s.newPool(cfg), nil
 }
 
 // Close 关闭浏览器池（Manager.Close 转发）。
@@ -163,6 +201,14 @@ func (s *BrowserSolver) ensurePoolLocked(cfg Config, key string) (*Pool, error) 
 // 避免阻塞其他仍在使用求解器的调用者。
 func (s *BrowserSolver) Close() error {
 	s.mu.Lock()
+	// 等待正在进行的启动结束：否则该池会在 Close 返回后才被赋给 s.pool，
+	// 既漏关又让已关闭的求解器继续持有浏览器进程。
+	for s.starting != nil {
+		wait := s.startDone
+		s.mu.Unlock()
+		<-wait
+		s.mu.Lock()
+	}
 	pool := s.pool
 	retired := s.retired
 	s.pool = nil

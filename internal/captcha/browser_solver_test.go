@@ -360,3 +360,58 @@ func TestBrowserSolverRejectsPartiallyMissingConfig(t *testing.T) {
 		})
 	}
 }
+
+// 池启动期间不得持锁：其他调用者必须能立刻看到自己的 ctx 取消并返回。
+//
+// acquirePool 曾在锁内执行 pool.Start()（最长 CaptchaBrowserStartupTimeout，
+// 默认 90s）。所有并发 GetVerifyParam 会卡在同一把锁上，各自请求的 ctx 取消
+// 完全无效——客户端早已断开，goroutine 仍被扣住。配合网关的
+// MaxCaptchaRetries×MaxAccountAttempts 重试链会放大成延迟尖峰。
+func TestBrowserSolverStartDoesNotHoldLock(t *testing.T) {
+	setBrowserEnabled(t, true)
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+
+	s := NewBrowserSolver()
+	s.SetPoolFactory(func(Config) *Pool {
+		f := &scriptFactory{}
+		// 首个 worker 的创建阻塞到测试放行，模拟启动慢
+		f.make = func(int) ([]stepFunc, error) {
+			close(started)
+			<-release
+			return []stepFunc{tokenStep("tok")}, nil
+		}
+		return newTestPool(t, f.create, 1)
+	})
+
+	// 第一个调用者触发启动（会阻塞在 Start）
+	first := make(chan error, 1)
+	go func() {
+		_, err := s.Solve(context.Background(), solveCfg("cn"))
+		first <- err
+	}()
+	<-started
+
+	// 第二个调用者带可取消 ctx：启动期间它必须能立即返回 ctx 错误，
+	// 而不是等启动完成（若持锁就会一直等到 release）。
+	ctx, cancel := context.WithCancel(context.Background())
+	second := make(chan error, 1)
+	go func() {
+		_, err := s.Solve(ctx, solveCfg("cn"))
+		second <- err
+	}()
+	cancel()
+
+	select {
+	case err := <-second:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("启动期间应返回 ctx 取消，实际: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("启动期间第二个调用者被阻塞（Start 仍在锁内）")
+	}
+
+	close(release)
+	<-first
+}
