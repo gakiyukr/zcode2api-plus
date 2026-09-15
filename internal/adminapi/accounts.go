@@ -119,9 +119,12 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else if hasProxy {
-			h.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+			if err := h.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
 				a.ProxyURL = proxyURL
-			})
+			}); err != nil {
+				writeError500(w, err)
+				return
+			}
 		}
 		added = append(added, acc.ID)
 	}
@@ -234,7 +237,8 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 	var (
 		setName           *string
 		setSecret         *model.Account // 仅借其 Mode/JWTToken/APIKey 三字段
-		setProxyURL       *string
+		setProxy          bool           // proxy_url 字段是否出现（值可为 nil = 清空）
+		proxyURL          *string
 		clearProxyID      bool
 		setDisabledModels []string
 	)
@@ -255,7 +259,10 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 		setSecret = cred
 	}
 	if v, ok := payload["proxy_url"]; ok && !hasProfile {
-		proxyURL, err := proxy.NormalizeProxyURL(strOf(v))
+		// 用 = 而非 := 赋值到外层 proxyURL：:= 会新建内层变量，
+		// 闭包捕获的仍是外层那个，写入就变成了空操作。
+		var err error
+		proxyURL, err = proxy.NormalizeProxyURL(strOf(v))
 		if err != nil {
 			writeAPIError(w, errBadRequest(err.Error()))
 			return
@@ -263,7 +270,9 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 		if !sameStringPtr(proxyURL, acc.ProxyURL) {
 			clearProxyID = true // 改为手工代理时解除线路指派
 		}
-		setProxyURL = proxyURL
+		// NormalizeProxyURL("") 返回 nil 表示「清空代理」，与「字段未提供」
+		// 是两种语义，必须用 setProxy 区分，不能只看值是否为 nil。
+		setProxy = true
 	}
 	if v, ok := payload["disabled_models"]; ok {
 		models, apiErr := parseDisabledModels(v)
@@ -274,7 +283,7 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 		setDisabledModels = models
 	}
 
-	if !h.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+	if err := h.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
 		if setName != nil {
 			a.Name = *setName
 		}
@@ -285,8 +294,8 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 			a.Status = model.StatusActive
 			a.LastError = nil
 		}
-		if setProxyURL != nil {
-			a.ProxyURL = setProxyURL
+		if setProxy {
+			a.ProxyURL = proxyURL
 			if clearProxyID {
 				a.ProxyID = nil
 			}
@@ -294,8 +303,8 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 		if setDisabledModels != nil {
 			a.SetDisabledModels(setDisabledModels)
 		}
-	}) {
-		writeAPIError(w, errNotFound("账号不存在"))
+	}); err != nil {
+		writeError500(w, err)
 		return
 	}
 	if hasProfile {
@@ -453,10 +462,10 @@ func (h *Handler) handleResetStats(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound("账号不存在"))
 		return
 	}
-	if !h.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+	if err := h.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
 		a.ResetTokenStats()
-	}) {
-		writeAPIError(w, errNotFound("账号不存在"))
+	}); err != nil {
+		writeError500(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})

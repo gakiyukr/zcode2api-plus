@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -186,9 +187,11 @@ func TestSelectRotationAndModelFilter(t *testing.T) {
 	a1, _ := s.AddAccount(model.ProviderZai, "a1", "h1.p.s3")
 	a2, _ := s.AddAccount(model.ProviderZai, "a2", "h2.p.s3")
 	for _, a := range []*model.Account{a1, a2} {
-		a.Quota = map[string]map[string]any{
-			"GLM-5.3": {"remaining": float64(10), "model": "GLM-5.3"},
-		}
+		s.Update(a.Provider, a.ID, func(x *model.Account) {
+			x.Quota = map[string]map[string]any{
+				"GLM-5.3": {"remaining": float64(10), "model": "GLM-5.3"},
+			}
+		})
 	}
 
 	first := s.Select("zai", nil, "GLM-5.3")
@@ -210,11 +213,20 @@ func TestSelectRotationAndModelFilter(t *testing.T) {
 		t.Fatalf("available 空时应回退 unknown: %v", got)
 	}
 
-	// 模型额度耗尽的账号被排除
-	a2.Quota["GLM-5.3"]["remaining"] = float64(0)
-	got = s.Select("zai", nil, "GLM-5.3")
-	if got == nil || got.ID == a2.ID {
-		t.Fatalf("耗尽账号不应被选中: %v", got)
+	// 模型额度耗尽的账号被排除：必须多次轮询都选不到它。
+	// 只断言一次是不够的——rotation 游标恰好指向 a1 时，即使过滤逻辑失效
+	// 也会「通过」，那种断言无法保护这段逻辑。
+	s.Update(a2.Provider, a2.ID, func(x *model.Account) {
+		x.Quota["GLM-5.3"]["remaining"] = float64(0)
+	})
+	for range 6 {
+		got = s.Select("zai", nil, "GLM-5.3")
+		if got == nil {
+			t.Fatal("应选到 a1")
+		}
+		if got.ID == a2.ID {
+			t.Fatalf("耗尽账号不应被选中: %v", got.ID)
+		}
 	}
 	// 且耗尽账号不在 available 池 → available=[a1]；skip a1 后回退 unknown [a3]
 	got = s.Select("zai", map[string]bool{a1.ID: true}, "GLM-5.3")
@@ -269,6 +281,46 @@ func TestSelectPromoAccountsFirst(t *testing.T) {
 	}
 }
 
+// Update 的 fn 由调用方提供，一旦 panic 必须仍释放锁——否则整个 Store
+// 会永久死锁（所有请求都经过 Select/Update）。本测试在 panic 后继续调用
+// Store 方法，若锁未释放会直接卡死（由 -timeout 兜底）。
+func TestUpdatePanicReleasesLock(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "boom", "h.p.s4")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("fn panic 应向外传播，不得被吞掉")
+			}
+		}()
+		s.Update(acc.Provider, acc.ID, func(*model.Account) {
+			panic("boom")
+		})
+	}()
+
+	// 锁必须已释放：下面的调用若阻塞即说明死锁
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+			a.UseCount = 7
+		}); err != nil {
+			t.Errorf("panic 后 Update 应正常工作: %v", err)
+		} else if got := s.Find(acc.Provider, acc.ID); got.UseCount != 7 {
+			t.Errorf("use_count 应已更新: %d", got.UseCount)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("panic 后锁未释放，Store 已死锁")
+	}
+}
+
 func TestUpdateDeletedAccountRejected(t *testing.T) {
 	s := newTestStore(t)
 	acc, _ := s.AddAccount(model.ProviderZai, "ghost", "h.p.s3")
@@ -276,10 +328,10 @@ func TestUpdateDeletedAccountRejected(t *testing.T) {
 		t.Fatal("删除失败")
 	}
 	// 模拟后台流长期持有旧 ID、删除后回写：Update 必须拒绝而非复活账号
-	if s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+	if err := s.Update(acc.Provider, acc.ID, func(a *model.Account) {
 		a.UseCount = 999
-	}) {
-		t.Fatal("对已删除账号的 Update 应返回 false")
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("对已删除账号的 Update 应返回 ErrNotFound: %v", err)
 	}
 	if s.Find(model.ProviderZai, acc.ID) != nil {
 		t.Fatal("已删除账号不得复活")

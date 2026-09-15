@@ -114,18 +114,22 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult) (*model.Account
 		return nil, errUpstream(fmt.Sprintf("凭证入池失败: %v", err))
 	}
 	if email != "" {
-		h.Store.Update(account.Provider, account.ID, func(a *model.Account) {
+		if err := h.Store.Update(account.Provider, account.ID, func(a *model.Account) {
 			a.Email = &email
 			if a.Name == "oauth-login" {
 				a.Name = email
 			}
-		})
+		}); err != nil {
+			return nil, errUpstream(fmt.Sprintf("账号信息落库失败: %v", err))
+		}
 	}
 	if result.AccessToken != "" {
 		if apiKey, err := oauth.ExchangeAPIKey(result.AccessToken); err == nil && apiKey != "" {
-			h.Store.Update(account.Provider, account.ID, func(a *model.Account) {
+			if err := h.Store.Update(account.Provider, account.ID, func(a *model.Account) {
 				a.APIKey = &apiKey
-			})
+			}); err != nil {
+				web.Warn("adminapi", fmt.Sprintf("API Key 落库失败: %v", err))
+			}
 		} else if err != nil {
 			web.Warn("adminapi", fmt.Sprintf("兑换 API Key 失败: %v", err))
 		}
@@ -134,6 +138,11 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult) (*model.Account
 		h.Quota.RefreshAccounts([]*model.Account{account})
 		// 授权完成即激活 + 自动领取（入池即吃满活动；对齐 Python _save_oauth_account）
 		h.scheduleAutoClaim(account)
+	}
+	// 上面的 Update 改的是 Store 内部对象，account 仍是 AddAccount 时的副本；
+	// 重新取快照，避免调用方渲染出 email/name 尚未写入的旧值。
+	if fresh := h.Store.Find(account.Provider, account.ID); fresh != nil {
+		account = fresh
 	}
 	return account, nil
 }

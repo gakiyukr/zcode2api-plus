@@ -170,8 +170,8 @@ func (a *Account) Clone() *Account {
 	c.ProxyURL = clonePtr(a.ProxyURL)
 	c.ProxyID = clonePtr(a.ProxyID)
 	c.ArchivedAt = clonePtr(a.ArchivedAt)
-	c.ExhaustedModels = append([]string(nil), a.ExhaustedModels...)
-	c.DisabledModels = append([]string(nil), a.DisabledModels...)
+	c.ExhaustedModels = CloneStrings(a.ExhaustedModels)
+	c.DisabledModels = CloneStrings(a.DisabledModels)
 	c.Quota = cloneQuota(a.Quota)
 	c.Plan = cloneAnyMap(a.Plan)
 	c.Plans = cloneAnyMapSlice(a.Plans)
@@ -185,6 +185,18 @@ func clonePtr[T any](p *T) *T {
 	}
 	v := *p
 	return &v
+}
+
+// CloneStrings 复制字符串切片并保持 nil/非 nil 语义。
+// 不能用 append([]string(nil), src...)——src 为非 nil 空切片时它会返回 nil，
+// 而 JSON 契约要求这类容器字段序列化成 [] 而不是 null。
+func CloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
 }
 
 func cloneQuota(in map[string]map[string]any) map[string]map[string]any {

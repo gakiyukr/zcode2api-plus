@@ -27,7 +27,6 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
-	"zcode2api/internal/web"
 )
 
 const (
@@ -620,23 +619,37 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 	return true, nil
 }
 
-// Update 在锁内对指定账号执行修改并持久化，返回 false 表示账号不存在。
+// Update 在锁内对指定账号执行修改并持久化。
 //
 // fn 收到的是 Store 内部持有的账号对象，字段读写全程在锁内完成，
 // 因此与 Select/ListAccounts 的读取不会竞争。并发路径应使用本方法
 // 而非「取指针 → 改字段 → UpdateAccount」。
-func (s *Store) Update(provider, id string, fn func(acc *model.Account)) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	acc := s.findLocked(provider, id)
-	if acc == nil {
-		return false
+//
+// 返回 error 与其它写路径（SetEnabled/SetArchived/AddAccount 等）一致：
+// 账号不存在返回 ErrNotFound，落库失败返回底层错误。
+// 落库失败时内存状态已改（Store 内部对象是唯一的真相来源），
+// 但调用方应把错误报给用户，否则会出现「界面显示已保存、重启后回滚」。
+func (s *Store) Update(provider, id string, fn func(acc *model.Account)) error {
+	var failed error
+
+	// 内层闭包保留 defer 解锁：fn 由调用方提供，一旦 panic 必须仍释放锁，
+	// 否则整个 Store 会永久死锁。
+	ok := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		acc := s.findLocked(provider, id)
+		if acc == nil {
+			return false
+		}
+		fn(acc)
+		failed = s.persistAccountLocked(acc)
+		return true
+	}()
+
+	if !ok {
+		return ErrNotFound
 	}
-	fn(acc)
-	if err := s.persistAccountLocked(acc); err != nil {
-		web.Warn("store", fmt.Sprintf("账号 %s 状态落库失败: %v", acc.ID, err))
-	}
-	return true
+	return failed
 }
 
 // SetEnabled 启用/禁用账号（禁用同时置 DISABLED 状态）。
@@ -799,7 +812,9 @@ func (s *Store) Export() ExportPayload {
 	for _, p := range Providers {
 		list := []exportAccount{}
 		for _, a := range s.accounts[p] {
-			disabled := a.DisabledModels
+			// 必须复制：直接别名会让内部切片的底层数组随 payload 逃出锁，
+			// 调用方之后改它就会与 Clone/Update 的读取并发。
+			disabled := model.CloneStrings(a.DisabledModels)
 			if disabled == nil {
 				disabled = []string{}
 			}
@@ -850,9 +865,11 @@ func (s *Store) ImportAccounts(payload ImportPayload) (int, error) {
 				return count, err
 			}
 			if item.DisabledModels != nil {
-				s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+				if err := s.Update(acc.Provider, acc.ID, func(a *model.Account) {
 					a.SetDisabledModels(item.DisabledModels)
-				})
+				}); err != nil {
+					return count, err
+				}
 			}
 			count++
 		}

@@ -165,6 +165,11 @@ func cmdLogin(args []string) {
 				a.Email = result.Email
 				a.Name = *result.Email
 			})
+			// Update 改的是 Store 内部对象，acc 仍是 AddAccount 时的副本；
+			// 重新取快照，否则下面会打印出改名前的旧名字。
+			if fresh := st.Find(acc.Provider, acc.ID); fresh != nil {
+				acc = fresh
+			}
 		}
 		fmt.Println(web.Green + fmt.Sprintf("\n✔ 已保存 Coding Plan JWT 账号: %s (%s)", acc.Name, acc.ID) + web.Reset)
 		// 入池即激活上报 + 自动领取全部可领活动套餐（失败仅提示，不中断；
@@ -345,6 +350,12 @@ func cmdQuota() {
 	qs := quota.NewService(st)
 	for _, a := range jwtAccounts {
 		qs.FetchQuota(a)
+		// FetchQuota 只把结果经 Store.Update 写回 Store 内部对象，调用方手上的
+		// 副本不会被更新——必须重新取快照才能看到刚拉到的额度。
+		a = st.Find(model.ProviderZai, a.ID)
+		if a == nil {
+			continue
+		}
 		fmt.Println(web.Bold + fmt.Sprintf("\n账号: %s (%s)", a.Name, a.EffectiveStatus(now)) + web.Reset)
 		if len(a.Quota) == 0 {
 			fmt.Println("  无额度数据")
