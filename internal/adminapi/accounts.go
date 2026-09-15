@@ -283,6 +283,16 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 		setDisabledModels = models
 	}
 
+	// 先指派线路再套用其他字段：AssignProxyProfile 自带锁，不能放进 Update
+	// 闭包（会死锁），而它可能因 profile 已被并发删除而失败。放在前面，失败时
+	// 其余字段尚未落库，避免「回 500 但 name/secret 已生效」的半套用。
+	if hasProfile {
+		if _, err := h.Store.AssignProxyProfile(acc.ID, profileID); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+
 	if err := h.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
 		if setName != nil {
 			a.Name = *setName
@@ -306,12 +316,6 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		writeError500(w, err)
 		return
-	}
-	if hasProfile {
-		if _, err := h.Store.AssignProxyProfile(acc.ID, profileID); err != nil {
-			writeError500(w, err)
-			return
-		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -403,10 +407,13 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 与后台周期监控同一套筛选（quota.Monitor）：跳过已归档与已停用账号。
+	// store.SetArchived 的契约是「调度、领取、刷新全部跳过」，而刷新还会经
+	// handleBillingResponse 把归档账号的状态写回 active，与归档语义冲突。
 	var targets []*model.Account
 	if truthy(payload["all"]) {
 		for _, a := range h.Store.ListAccounts(model.ProviderZai) {
-			if a.Mode == "jwt" {
+			if a.Mode == "jwt" && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
 				targets = append(targets, a)
 			}
 		}
@@ -420,7 +427,7 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		for _, a := range h.Store.ListAccounts("") {
-			if ids[a.ID] && a.Mode == "jwt" {
+			if ids[a.ID] && a.Mode == "jwt" && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
 				targets = append(targets, a)
 			}
 		}
@@ -433,6 +440,15 @@ func (h *Handler) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	acc := h.Store.FindAny(r.PathValue("account_id"))
 	if acc == nil {
 		writeAPIError(w, errNotFound("账号不存在"))
+		return
+	}
+	// 归档账号不参与刷新（与周期监控、批量刷新一致）：刷新会把它写回 active，
+	// 与「归档即停止调用」的语义冲突。
+	if acc.ArchivedAt != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      false,
+			"message": "账号已归档，不参与额度刷新",
+		})
 		return
 	}
 	if acc.Mode != "jwt" {

@@ -95,6 +95,11 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 入口整形一次，与 /v1/messages 一致（去掉 provider/ 前缀、套用名称映射）。
+	// 缺了它，`anthropic/GLM-5.3` 这类写法在前者能过、在这里 400，
+	// 与「模型白名单与 /v1/messages 一致」的注释承诺不符。
+	gateway.NormalizeBody(body, false)
+
 	// 模型白名單與 /v1/messages 一致：僅開放清單內模型，其餘在建票前一律拒絕
 	if !gateway.ModelAllowed(body["model"]) {
 		modelName := anyToString(body["model"])

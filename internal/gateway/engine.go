@@ -196,8 +196,12 @@ func (e *Engine) tryAccount(
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, bytes.NewReader(payload))
 		if err != nil {
-			e.mark(acc, model.StatusInvalid, err.Error())
-			return attemptResult{switchAccount: true}
+			// 失败源于 req.URL（即 ZAI_UPSTREAM_URL 配置），与账号凭证无关。
+			// 标 invalid 会把整池账号逐个标失效并落库，且 last_error 指向错误方向。
+			// 配置错误换号也修不好，直接终止并如实报告。
+			web.Err(reqID, fmt.Sprintf("上游地址无效（检查 ZAI_UPSTREAM_URL）: %v", err))
+			return attemptResult{final: errResult(http.StatusBadGateway, "invalid_upstream_url",
+				"上游地址配置无效，请检查 ZAI_UPSTREAM_URL")}
 		}
 		for k, v := range req.Headers {
 			httpReq.Header.Set(k, v)

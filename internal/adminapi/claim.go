@@ -113,7 +113,10 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 	candidates := h.jwtAccounts(ids)
 	outcomes := []map[string]any{}
 	for _, acc := range candidates {
-		if acc.Status == model.StatusCooling {
+		// 用 IsSelectable 判断（与 preview 一致）：EffectiveStatus 把「冷却
+		// 已到期」视为 active，只看原始 Status 会让同一账号 preview 可查、
+		// claim 被拒，用户看到自相矛盾的结果。
+		if !acc.IsSelectable(time.Now()) && acc.Status == model.StatusCooling {
 			outcomes = append(outcomes, map[string]any{
 				"account_id": acc.ID, "account_name": acc.Name, "ok": false,
 				"message": "賬號冷卻中（風控/限流），已跳過領取",

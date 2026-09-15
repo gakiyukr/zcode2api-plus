@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/store"
@@ -112,5 +113,32 @@ func TestVerifyGatewayKey(t *testing.T) {
 	r.Header.Set("x-api-key", key)
 	if e := svc.VerifyGatewayKey(r); e != nil {
 		t.Fatalf("x-api-key 应通过: %+v", e)
+	}
+}
+
+// TestFailureTableSweepsExpiredEntries 失败计数表必须能回收过期条目。
+//
+// pruneLocked 只在同一 host 再次请求时触发；未鉴权的请求可以用大量不同
+// 来源地址（IPv6 /64 逐请求换地址）把表撑到无界。超过阈值时应全表清理，
+// 把已过窗口的条目删掉。
+func TestFailureTableSweepsExpiredEntries(t *testing.T) {
+	st := openStore(t)
+	svc := New(st)
+
+	old := time.Now().Add(-2 * failureWindow)
+	svc.mu.Lock()
+	for i := range failureSweepThreshold {
+		host := fmt.Sprintf("10.0.%d.%d", i/256, i%256)
+		svc.failures[host] = []time.Time{old} // 全部已过期
+	}
+	svc.mu.Unlock()
+
+	svc.recordFailure("192.0.2.1", time.Now())
+
+	svc.mu.Lock()
+	remaining := len(svc.failures)
+	svc.mu.Unlock()
+	if remaining > 2 {
+		t.Fatalf("过期条目应被清理，实际剩 %d 条", remaining)
 	}
 }

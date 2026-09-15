@@ -106,9 +106,37 @@ func (s *Service) pruneLocked(host string, now time.Time) []time.Time {
 	return kept
 }
 
+// sweepLocked 清理全表中已过窗口的条目。
+//
+// pruneLocked 只在「同一 host 再次请求」时触发，未鉴权的请求可以用大量不同
+// 来源地址（IPv6 /64 逐请求换地址）把这张表撑到无界。按 host 数阈值触发一次
+// 全表扫描，把内存收回。
+func (s *Service) sweepLocked(now time.Time) {
+	for host, attempts := range s.failures {
+		kept := attempts[:0]
+		for _, t := range attempts {
+			if now.Sub(t) <= failureWindow {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.failures, host)
+			continue
+		}
+		s.failures[host] = kept
+	}
+}
+
+// failureSweepThreshold 触发全表清理的条目数阈值。
+// 限速窗口内正常客户端数量远低于此值。
+const failureSweepThreshold = 4096
+
 func (s *Service) recordFailure(host string, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.failures) >= failureSweepThreshold {
+		s.sweepLocked(now)
+	}
 	s.failures[host] = append(s.pruneLocked(host, now), now)
 }
 
