@@ -434,10 +434,93 @@ Previous read at ... by goroutine 11:
 （把 `Select` 改回 `return acc`）下 `TestSelectAndMutateConcurrently` 立刻报
 `DATA RACE`，确认该测试真能抓住此缺陷而非偶然通过。
 
+### M11 缺陷审查发现（2026-09-15，待排期）
+
+一次针对 Store 指针重构的三路审查（store 并发契约 / 网关主路径 / async 池与后台 API），
+除已修复的项外，确认以下**既存缺陷**（均早于本次重构，非其引入）。按后果排序：
+
+**高**
+
+1. **客户端中断被误判为上游连接失败** — `internal/gateway/engine.go:205-210`
+   `Do` 返回的 `err` 不分来源一律标 `cooling`。`handler.go:56` 把 `r.Context()` 交给引擎，
+   客户端断线时 ctx 立即取消，后续每轮 `Select`→`Do` 都立即失败，会把最多
+   `MaxAccountAttempts=5` 个账号各标一次冷却（默认 300s）并落库。账号池小的部署
+   几次中断即全池冷却，全部请求收到 503。修法：`err` 为 `context.Canceled`/`DeadlineExceeded`
+   时不标状态、直接终止（async 池 `pool.go:346-348` 已有正确做法）。
+
+2. **async 池完全绕过账号 `proxy_url`** — `internal/asyncpool/pool.go:559-570`
+   `p.client()` 写死直连（连环境变量代理也不生效），`acc` 只用于取 ID/Name。
+   README §账号级出站代理与 PLAN §5.9 均承诺「网关请求、额度查询与套餐领取均走对应代理」。
+   配置代理的账号在 `/async/v1/messages` 会以真实出口 IP 直连上游——泄露部署 IP 并触发风控。
+   修法：比照 `engine.clientFor`，按 `acc.ProxyURL` 建 client 并缓存。
+
+**中**
+
+3. **async 池把「HTTP 200 + JSON 业务错误」当成功串流** — `internal/asyncpool/pool.go:485`
+   引擎有 `content-type: application/json` 分支（`engine.go:226` → `handleUpstreamJSON`），
+   async 直接 `forwardSSE`。上游回 200 带 `{"code":1005}`（额度耗尽）时，客户端收到
+   ready→done 的「成功」串流但零 chunk，账号状态不被标记，同一账号会被反复选中反复失败。
+
+4. **async 成功路径不累计 use_count/last_used_at，也不复位 cooling/exhausted** —
+   `internal/asyncpool/pool.go:542-547`（对照 `engine.go:503-511`）。后台用量页少算 async 流量；
+   冷却到期的账号即使 async 已成功也停在 cooling，需等下一轮额度轮询。
+
+5. **`MarkModelExhausted` 无条件把 invalid/cooling 账号刷回 active** — `internal/gateway/engine.go:483-489`
+   「不是全部模型都耗尽」即写 `StatusActive` 并清空 `CoolingUntil`，不区分账号当前是
+   `invalid`（凭据失效）还是 `cooling`（刚被限流）。并发请求下 A 标的 invalid 会被 B 覆盖。
+   修法：只在当前状态为 `active`/`exhausted` 时才改，不碰 `invalid`/`cooling`。
+
+6. **客户端可覆写上游 `X-Device-Mid` 指纹头** — `internal/upstream/request.go:40-52`
+   `dropHeaders` 不含 `x-device-mid`，而固定头 map 的 key 与 Go 规范化后的客户端头同名，
+   `headers[key] = value` 直接覆盖。同理 `Content-Type`/`Anthropic-Version` 因大小写 key
+   不同而出现「两者都 Set、最终值取决于 map 迭代顺序」的随机覆盖。
+   修法：把 `x-device-mid` 加入 dropHeaders；固定头统一用规范化 key 并在透传后强制回写。
+
+7. **`handleEditAccount` 无法清空 `proxy_url`** — 已随 9b24dcc 修复。
+
+8. **`Update` 吞掉落库错误** — 已随 9b24dcc 修复（改为返回 error）。
+
+9. **混合池下 async 选中 apiKey 账号即终止票据** — `internal/asyncpool/pool.go:275-280`
+   `acc.Mode != "jwt"` 时直接 `return`，且 `tried` 标记在检查之后，该账号不会被跳过，
+   轮询再次轮到它时仍失败。修法：把检查移入循环并 `tried[acc.ID] = true` 后 continue。
+
+**低**
+
+10. **批次/单笔额度刷新不跳过已归档与已停用账号** — `internal/adminapi/accounts.go:398-403`、`:423-437`
+    与 `store.SetArchived` 注释声明的「调度、领取、刷新全部跳过」矛盾；刷新还会经
+    `handleBillingResponse` 把归档账号状态写回 active。
+
+11. **`handleClaim` 与 preview 对「冷却已到期」判断不一致** — `internal/adminapi/claim.go:116`
+    用原始 `Status`，preview（`:67`）用 `IsSelectable(now)`。冷却已到期的账号 preview 可查、
+    claim 被拒。
+
+12. **`VerifyAdminKey` 失败计数表无全域清理** — `internal/auth/auth.go:35`、`:97-113`
+    仅在同一 host 再次请求时 prune，未鉴权即可用大量来源地址撑大内存（IPv6 /64）。
+
+13. **async 入口未做 `NormalizeBody`** — `internal/asyncpool/pool.go:97-108`
+    直接校验原始 model，与 `/v1/messages`（先 `NormalizeBody` 再校验）不一致，
+    `anthropic/GLM-5.3` 这类写法在前者可过、后者 400。
+
+14. **请求建构失败被归咎为账号凭据无效** — `internal/gateway/engine.go:196-199`
+    `http.NewRequestWithContext` 失败源于 `ZAI_UPSTREAM_URL` 配置错误，却标 `StatusInvalid`，
+    会把整池账号逐个标失效并落库，且 `last_error` 误导排查方向。
+
+15. **`handleEditAccount` 部分套用** — `internal/adminapi/accounts.go:277-306`
+    先 `Update` 落库 name/secret/disabled_models，再 `AssignProxyProfile`；
+    后者失败回 500 但前面的字段已生效。
+
+### 审查中确认**无缺陷**的范围
+
+- 死锁：22 个 `Update` 调用点的闭包体逐一核对，无嵌套加锁（`model` 包方法皆不引用 `Store`）。
+- `Select` 语义：rotation 游标、promo 优先、modelName 分层皆在锁内完成，Clone 发生在游标推进之后。
+- `resp.Body` 关闭、usage 统计三条路径（非流式/SSE/中断）、重试循环上界（5×3）、
+  skipIDs 累积、proxy 包的 CONNECT/SOCKS5 解析与超时、SSRF 面（proxy_url 只能经后台 API 设置且经
+  `NormalizeProxyURL`）、后台 32 条路由全部挂 `guard`、`VerifyAdminKey` 滑动窗与 `hmac.Equal` 定时常量比较。
+
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
-  保持同名用例语义，便于两边对照。当前 23 个测试文件、182 个 `Test` 函数，`go test ./...` 全绿。
+  保持同名用例语义，便于两边对照。当前 23 个测试文件、183 个 `Test` 函数，`go test ./...` 全绿。
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
   最终用 openai 官方客户端（python）指向网关做真客户端回归（待真实账号环境）。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。
