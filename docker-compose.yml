@@ -1,0 +1,53 @@
+# zcode2api Docker Compose 部署（Linux）。
+#
+# ⚠️ 未經驗證：本檔與 Dockerfile 從未經實際構建測試，不保證可用，請自行驗證與調整。
+#    推薦改用裸二進制方案：sudo ./deploy/manage.sh install
+#
+# 預期用法（未驗證，不保證成功）：
+#   docker compose up -d --build        # 構建並啟動
+#   docker compose logs -f              # 查看日誌（首次啟動會輸出後台密碼與網關密鑰）
+#   docker compose down                 # 停止（數據保留在具名卷中）
+#
+# 鏡像構建需要能訪問 Go 模組代理與 Debian 套件源。
+
+services:
+  zcode2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 設為 "true" 可在構建時預下載補丁 Chromium（約 200MB）：
+        # 映像更大，但首次啟動即可用，且無需在運行時保留瀏覽器卷。
+        PREFETCH_BROWSER: "false"
+    image: zcode2api:latest
+    container_name: zcode2api
+    restart: unless-stopped
+    ports:
+      # 僅綁定本機時改為 "127.0.0.1:3000:3000"（建議配合反向代理）
+      - "3000:3000"
+    environment:
+      ZCODE_PORT: "3000"
+      ZCODE_HOST: "0.0.0.0"
+      ZCODE_DATA_DIR: "/app/data"
+      CLOAKBROWSER_CACHE_DIR: "/app/browser"
+      # 驗證碼：true 啟用補丁 Chromium 自動求解；false 回退後台人工回填
+      ZCODE_CAPTCHA_BROWSER: "true"
+      # 後台密碼與網關金鑰：留空則首次啟動隨機生成並打印於日誌
+      # ZCODE_ADMIN_KEY: "改成你的后台密码"
+      # ZCODE_GATEWAY_KEY: "改成你的网关金钥"
+      TZ: "Asia/Shanghai"
+    volumes:
+      # 賬號庫與密鑰（必須持久化，否則重建容器即丟失賬號）
+      - zcode2api-data:/app/data
+      # 補丁 Chromium 緩存（持久化可避免每次重建都重新下載約 200MB）
+      - zcode2api-browser:/app/browser
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/meta"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  zcode2api-data:
+  zcode2api-browser:

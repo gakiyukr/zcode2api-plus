@@ -1,0 +1,24 @@
+# Docker 構建上下文排除項。
+# 關鍵：data/ 含真實賬號憑證，絕不可進入映像層。
+.git
+.gitignore
+.github
+data/
+data_test/
+temp/
+
+# 前端依賴與構建中間產物（dist 需保留——go:embed 引用它）
+frontend/node_modules/
+
+# 文檔與本地環境
+*.md
+!README.md
+.env
+.env.local
+nginx.conf
+
+# 二進制與臨時文件
+zcode2api
+zcode2api-*
+*.exe
+*.test

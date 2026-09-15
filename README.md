@@ -26,7 +26,7 @@ Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主�
 ## 快速開始
 
 ```bash
-# 下載現成產物（Releases 頁：linux / darwin / windows × amd64 / arm64）
+# 下載現成產物（Releases 頁：linux × amd64/arm64、darwin × amd64/arm64、windows × amd64）
 # 或源碼構建：
 go build -o zcode2api ./cmd/zcode2api
 ./zcode2api serve            # http://127.0.0.1:3000
@@ -53,24 +53,40 @@ zcode2api set-admin-key <key>        設置後台密碼
 zcode2api export [file] / import <file>   賬號導出/導入（與 python-legacy 互通）
 ```
 
-## 部署（裸二進制 + systemd，推薦）
+## 部署（Linux）
 
-```ini
-# /etc/systemd/system/zcode2api.service
-[Service]
-WorkingDirectory=/opt/zcode2api
-Environment=ZCODE_PORT=3010
-Environment=ZCODE_DATA_DIR=/opt/zcode2api/data
-Environment=ZCODE_CAPTCHA_BROWSER=true
-ExecStart=/opt/zcode2api/zcode2api serve
-Restart=on-failure
+交互式管理腳本與 Docker 方案見 [`deploy/README.md`](deploy/README.md)。
+
+```bash
+sudo ./deploy/manage.sh            # 交互式選單：安裝/更新/卸載/狀態/服務控制
 ```
 
-> 💡 驗證碼瀏覽器：啟動時自動從 cloakbrowser.dev 下載補丁 Chromium（SHA256SUMS +
-> Ed25519 簽名校驗，GitHub Releases 兜底），緩存於 `~/.cloakbrowser/`，零 Python 依賴。
-> 下載源可用 `CLOAKBROWSER_DOWNLOAD_URL` 覆蓋；`ZCODE_CAPTCHA_BROWSER_BIN` 可指向
-> 任意已有瀏覽器。實測部分發行版自帶 Chromium（如 Debian 150）會被風控拒絕——
-> 自動下載的補丁二進制即為此問題的內建解法。
+或非交互：
+
+```bash
+sudo ./deploy/manage.sh install                # 二進制 + systemd（已實測）
+sudo ./deploy/manage.sh install --port 3010 --user zcode --prefetch-browser
+sudo ./deploy/manage.sh update                 # 更新（自動比對 Release 版本）
+sudo ./deploy/manage.sh uninstall              # 卸載（--purge 連數據刪除）
+sudo ./deploy/manage.sh docker-install         # Docker（未驗證）
+```
+
+安裝完成後自動啟動服務，**首次啟動的後台密碼與網關 API Key 只顯示一次，請立即保存**。
+
+> ⚠️ **Docker 方案未經驗證，不保證可用。** 倉庫內的 `Dockerfile` 與
+> `docker-compose.yml` 為參考實作，從未經 `docker build` 實測（開發環境無容器運行時）。
+> 請自行驗證與調整；本專案不對 Docker 路徑提供支援承諾。
+
+> 💡 驗證碼瀏覽器：首次使用時自動從 cloakbrowser.dev 下載補丁 Chromium
+> （SHA256SUMS + Ed25519 簽名校驗，GitHub Releases 兜底），緩存於
+> `CLOAKBROWSER_CACHE_DIR`，零 Python 依賴。`manage.sh` 會一併裝好其系統依賴
+> （按發行版命名差異自動解析）。下載源可用 `CLOAKBROWSER_DOWNLOAD_URL` 覆蓋；
+> `ZCODE_CAPTCHA_BROWSER_BIN` 可指向任意已有瀏覽器。實測部分發行版自帶的
+> Chromium（如 Debian 13）會被風控拒絕——自動下載的補丁二進制即為此問題的內建解法。
+
+> ⚠️ 放在反向代理後時注意：後台登入失敗限速以 `RemoteAddr` 為鍵，不信任
+> `X-Forwarded-For`，所有客戶端會共用同一失敗桶（5 分鐘 10 次即整站 429）。
+> 建議後台僅綁定內網。
 
 ## 配置（環境變量）
 
@@ -82,7 +98,7 @@ Restart=on-failure
 | `ZCODE_DATA_DIR` | `./data` | 賬號庫、密鑰、設備指紋 |
 | `ZCODE_CAPTCHA_BROWSER` | false | 啟用 rod 瀏覽器池自動求解 |
 | `ZCODE_CAPTCHA_BROWSER_BIN` | 自動發現 | Chromium 二進制路徑 |
-| `ZCODE_ASYNC_ENABLED` | — | 掛載 /async/v1/messages 空閒池 |
+| `ZCODE_ASYNC_ENABLED` | true | 掛載 /async/v1/messages 空閒池 |
 
 ## 賬號級出站代理
 
@@ -98,8 +114,12 @@ JWT 賬號入池（批量添加 / OAuth / CLI login）後自動：激活事件�
 
 ## 發佈與開發
 
-- 推 `v*` tag → GitHub Actions 自動交叉編譯五平台產物並上傳 Releases。
-- 全量驗證：`go build ./... && go vet ./... && go test ./...`；併發檢查 `go test -race ./...`。
+- 推 `v*` tag → GitHub Actions 自動交叉編譯五平台產物（linux/amd64、linux/arm64、
+  darwin/amd64、darwin/arm64、windows/amd64）並上傳 Releases。
+- 全量驗證：`go build ./... && go vet ./... && go test ./...`；併發檢查 `go test -race ./...`
+  （需 C 工具鏈）。
+- 前端改動：`cd frontend && npm install && npm run build`，並把更新後的 `frontend/dist` 一併提交
+  （`dist` 已入庫並由 `go:embed` 打包）。
 - 行為契約與里程碑台账見 `PLAN.md`；交接注意事項見 `HANDOFF.md`。
 
 ## 賬號歸檔

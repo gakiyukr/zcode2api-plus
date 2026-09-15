@@ -1,4 +1,5 @@
-# 部署腳本必須保持 LF，否則 bash 在 Linux 上會因 CRLF 執行失敗
-deploy/*.sh text eol=lf
-deploy/zcode2api.service text eol=lf
-deploy/zcode2api.env.example text eol=lf
+# 仓库内所有文本文件统一以 LF 存储（Windows 工作区 checkout 时自动转换）
+* text=auto
+# 部署脚本与 systemd 单元必须在 Linux 上以 LF 执行，禁止 CRLF
+*.sh      text eol=lf
+*.service text eol=lf

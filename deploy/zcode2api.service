@@ -1,0 +1,37 @@
+[Unit]
+Description=zcode2api - Z.AI ZCode Coding Plan 网关
+Documentation=https://github.com/gakiyukr/zcode2api-plus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 由 install.sh 按 --user 参数渲染；默认 root，可用非特权账号（需对该账号开放数据目录）
+User=__ZCODE_USER__
+Group=__ZCODE_GROUP__
+WorkingDirectory=__ZCODE_DIR__
+ExecStart=__ZCODE_DIR__/zcode2api serve
+EnvironmentFile=-__ZCODE_DIR__/.env
+Environment=ZCODE_HOST=0.0.0.0
+Environment=ZCODE_PORT=__ZCODE_PORT__
+Environment=ZCODE_DATA_DIR=__ZCODE_DIR__/data
+# 验证码浏览器：启用后在数据目录内下载补丁 Chromium（约 200MB，首次启动时）
+Environment=ZCODE_CAPTCHA_BROWSER=__ZCODE_BROWSER__
+Environment=CLOAKBROWSER_CACHE_DIR=__ZCODE_DIR__/browser
+Restart=on-failure
+RestartSec=5s
+
+# 仅需网络与自身目录读写；Chromium 无沙箱运行（启动参数已含 --no-sandbox）
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=__ZCODE_DIR__
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,8 +1,9 @@
 # zcode2api Go 版重写计划
 
-> 本仓库 `C:\Projects\zcode2api-go` 即 Go 重写仓库（原 `go/` 子目录已上提到仓库根，
-> Python 版实验工作区内容已移除）。计划与行为契约参照主仓库
-> `C:\Projects\zcode2api` 的 Python 版（`app/` + `main.py`）与 `HANDOFF.md`。
+> 本仓库 `C:\Projects\zcode2api-plus`（分支 `go-rewrite`）即 Go 重写仓库（原 `go/`
+> 子目录已上提到仓库根，Python 版实验工作区内容已移除）。计划与行为契约参照
+> Python 版（原主仓库 `app/` + `main.py`，现归档于本仓库 `python-legacy` 分支）
+> 与 `HANDOFF.md`。
 > 目标：用 Go 重写 Python 版的全部后端功能，
 > 做到**与 Python 版行为对齐、数据互通（共用同一个 `data/accounts.db`）、前端零改动**。
 > 本文档是唯一的计划与进度台账，每完成一项就勾选对应 `- [ ]`。
@@ -20,25 +21,30 @@
 
 **移植（与 Python 版 1:1 对齐）：**
 
-- [ ] `/v1/messages` 网关：多账号轮询、SSE/JSON 流式透传、错误分类与自动换号
-- [ ] `/v1/models`（Anthropic / OpenAI 双兼容超集形态，见 §5.7）
-- [ ] `/v1/chat/completions` **OpenAI（GPT）兼容层——Go 版增量功能**：请求/响应双向转换 +
+- [x] `/v1/messages` 网关：多账号轮询、SSE/JSON 流式透传、错误分类与自动换号
+- [x] `/v1/models`（Anthropic / OpenAI 双兼容超集形态，见 §5.7）
+- [x] `/v1/chat/completions` **OpenAI（GPT）兼容层——Go 版增量功能**：请求/响应双向转换 +
   流式 SSE 重编码 + 工具调用，同步走网关引擎（详见 §5.7）
-- [ ] `/v1/responses`（OpenAI Responses API，服务 Codex CLI 生态；**排期在 completions 验收之后**，划界见 §5.8）
-- [ ] `/async/v1/messages`：ticket + SSE keepalive + 流中断终止语义（`_MidStreamError`）
-- [ ] 账号状态机（active/exhausted/cooling/invalid/disabled）+ 按模型可用性调度
-- [ ] 额度监控（`billing/balance` 解析、多订阅合并、15s 缓存 + 并发去重、后台周期刷新）
-- [ ] 调度 token 统计（UsageCollector：SSE `message_start`/`message_delta`、JSON 顶层 usage）
-- [ ] Admin API `/admin/api/*` 全部端点 + SPA 托管（`/admin/*` catch-all 回落 index.html）
-- [ ] 鉴权：后台密钥（含单 IP 失败限速 10 次/5 分钟）+ 网关密钥（fail-closed）
-- [ ] OAuth 登录（Z.AI 授权 → JWT 入池 → API Key 兑换链）
-- [ ] 账号级出站代理（http/https/socks4/socks5/socks5h）+ 命名代理管理 + 出口探测
-- [ ] 验证码：真实 Chromium 池（rod）+ 人工回填兜底
-- [ ] SQLite 持久化（accounts + meta，WAL）与 **Python 版数据库互通**
-- [ ] CLI 子命令（serve / login / add-account / accounts / remove-account / quota / status / set-admin-key / export / import）
-- [x] Release CI（2026-09-11 定案：放弃 Docker 裸二进制交付；GitHub Actions 推 v* tag 构建 linux/darwin/windows × amd64/arm64 并上传 Releases）— `.github/workflows/release.yml`
-- [ ] **套餐自动领取（Go 版增量，2026-09-10 后新增，Python 主仓已上线）**：billing/preview + billing/claim、
-  激活事件上报、业务码翻译、3007 换码重试、入池自动领取（对照 Python 主仓 `app/claim.py` + `app/telemetry.py`，见 §5.9）
+- [x] `/v1/responses`（OpenAI Responses API，服务 Codex CLI 生态；划界见 §5.8）
+- [x] `/async/v1/messages`：ticket + SSE keepalive + 流中断终止语义（`_MidStreamError`）
+- [x] 账号状态机（active/exhausted/cooling/invalid/disabled）+ 按模型可用性调度
+- [x] 额度监控（`billing/balance` 解析、多订阅合并、15s 缓存 + 并发去重、后台周期刷新）
+- [x] 调度 token 统计（UsageCollector：SSE `message_start`/`message_delta`、JSON 顶层 usage）
+- [x] Admin API `/admin/api/*` 全部端点 + SPA 托管（`/admin/*` catch-all 回落 index.html）
+- [x] 鉴权：后台密钥（含单 IP 失败限速 10 次/5 分钟）+ 网关密钥（fail-closed）
+- [x] OAuth 登录（Z.AI 授权 → JWT 入池 → API Key 兑换链）
+- [x] 账号级出站代理（http/https/socks4/socks5/socks5h）+ 命名代理管理 + 出口探测
+- [x] 验证码：真实 Chromium 池（rod）+ 人工回填兜底
+- [x] SQLite 持久化（accounts + meta，WAL）与 **Python 版数据库互通**
+- [x] CLI 子命令（serve / login / add-account / accounts / remove-account / quota / status / set-admin-key / export / import）
+- [x] Release CI（2026-09-11 定案：放弃 Docker 裸二进制交付；GitHub Actions 推 v* tag 构建五平台
+  linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64 并上传 Releases）— `.github/workflows/release.yml`
+- [x] **Linux 一键部署**（仅 Linux）：`deploy/manage.sh` 单一交互式管理脚本
+  （二进制的安装/更新/卸载/状态 + Docker 的安装/更新/卸载 + 服务控制，**已实测**）
+  + systemd 单元模板。另有 `Dockerfile` + `docker-compose.yml` 作为参考实现，
+  **未经验证、不保证可用**（需在自有服务器构建，不提供 CI 编译服务）
+- [x] **套餐自动领取（Go 版增量，2026-09-10 后新增）**：billing/preview + billing/claim、
+  激活事件上报、业务码翻译、3007 换码重试、入池自动领取（← Python 版 `app/claim.py` + `app/telemetry.py`，见 §5.9）
 
 **明确不移植：**
 
@@ -52,50 +58,84 @@
 
 | 领域 | 选择 | 理由 |
 |------|------|------|
-| Go | 1.22+ | 需要.ServeMux 的 method + wildcard 路由增强 |
+| Go | 1.25 | 需要 `ServeMux` 的 method + wildcard 路由增强（`go.mod` 锁定 `go 1.25.0`） |
 | HTTP | 标准库 `net/http` | 不引框架；SSE 用 `http.Flusher` 手写透传 |
 | SQLite | `modernc.org/sqlite` | 纯 Go 无 CGo → 可交叉编译单文件 |
 | 浏览器自动化 | `github.com/go-rod/rod` | 验证码求解；复用 cloakbrowser 下载的 Chromium 二进制 |
 | 前端嵌入 | `embed` | dist 打进二进制，单文件交付 |
-| 配置 | 环境变量（沿用 `ZCODE_*` 命名）+ `.env`（`godotenv` 或自写 30 行） | 与 Python 版配置兼容 |
-| 日志 | `log/slog` | 标准库；彩色终端输出按需自写 |
-| 依赖原则 | 最少依赖：sqlite、rod、godotenv，其余标准库 | 便于审计与长期维护 |
+| 配置 | 环境变量（沿用 `ZCODE_*` 命名），不引入 `.env` 加载 | 与 Python 版配置兼容；`.env` 需由部署方自行 source |
+| 日志 | 自写彩色终端输出（`internal/web/logs.go`） | 对齐 Python 版日志形态；只记元信息不记消息内容 |
+| 依赖原则 | 最少依赖：sqlite、rod，其余标准库 | 便于审计与长期维护 |
 
-## 4. 目标目录结构
+## 4. 目录结构（实际）
 
 ```text
 .（仓库根，即原 go/ 上提）
 ├── PLAN.md                      # 本文件（计划 + 进度台账）
-├── go.mod
-├── cmd/zcode2api/main.go        # CLI 入口（serve / login / accounts / ...）
+├── go.mod / go.sum
+├── webui.go                     # go:embed frontend/dist（embed 只能引用本包目录树，
+│                                #   故声明放在仓库根包，由 cmd 引入）
+├── frontend/                    # React SPA（不重写；dist 已入库并 embed）
+├── deploy/                      # Linux 一键部署（见 deploy/README.md）
+│   ├── manage.sh                # 交互式管理：安装/更新/卸载/状态/服务控制（二进制 + Docker）
+│   ├── zcode2api.service        # systemd 单元模板（占位符由 manage.sh 渲染；亦内嵌于脚本）
+│   └── README.md                # 部署指南（含疑难排解与注意事项）
+├── Dockerfile                   # 参考实现（未验证，不保证可用；含 Chromium 依赖）
+├── docker-compose.yml
+├── .dockerignore
+├── cmd/zcode2api/
+│   ├── main.go                  # 入口 + serve()（依赖装配、横幅、监听）
+│   └── cli.go                   # 全部 CLI 子命令（serve / login / accounts / ...）
 └── internal/
     ├── config/config.go         # ← app/settings.py（环境变量、路径、上游端点、常量）
     ├── model/account.go         # ← app/models.py（Account、状态机、模型可用性、JSON 字段对齐）
     ├── store/store.go           # ← app/store.py（SQLite 单连接 + 轮询游标 + meta + 密钥引导）
     ├── gateway/
-    │   ├── engine.go            # 选号重试循环 + 上游调用核心（/v1/messages 与 chat/completions 共用）
+    │   ├── engine.go            # 选号重试循环 + 上游调用核心（三个端点共用）
     │   ├── handler.go           # ← routes/gateway.py（/v1/messages、/v1/models 字节级透传）
+    │   ├── body.go              # ← _normalize_body（模型名映射、content 桥接、system 注入）
     │   ├── classify.go          # 错误分类（鉴权/402/429 码族/3010/3007/F001/captcha 头）
     │   └── usage.go             # ← app/usage.py（UsageCollector）
-    ├── openai/
-    │   ├── convert.go           # OpenAI ↔ Anthropic 请求/响应/工具转换（契约见 §5.7）
-    │   └── relay.go             # /v1/chat/completions 流式 SSE 重编码（content_block_delta → chunk）
-    ├── upstream/request.go      # ← app/agent.py（build_request + zcode_system.json 注入）
+    ├── openai/                  # Go 版增量（Python 版无对应实现）
+    │   ├── convert.go           # OpenAI Chat Completions → Anthropic 请求转换（§5.7）
+    │   ├── respond.go           # Anthropic → OpenAI 响应转换（非流式）
+    │   ├── stream.go            # /v1/chat/completions 流式 SSE 重编码
+    │   ├── responses.go         # /v1/responses 请求/响应转换（§5.8）
+    │   ├── responses_stream.go  # /v1/responses 流式 response.* 事件序列
+    │   └── handler.go           # 两个端点的 HTTP 层（复用 gateway.Engine）
+    ├── upstream/
+    │   ├── request.go           # ← app/agent.py（build_request + 头剔除表）
+    │   └── zcode_system.json    # ← app/zcode_system.json（embed 注入）
     ├── quota/quota.go           # ← app/quota.py（fetch_quota、多订阅合并、monitor）
     ├── captcha/
-    │   ├── manager.go           # ← app/captcha.py（缓存、人工回填、浏览器失败冷却回退）
-    │   ├── pool.go              # ← app/captcha_browser.py（goroutine 池，语义对齐：超时杀页不误投）
-    │   └── solve.go             # 页面 HTML + 求解 JS（从 Python 版逐字抄写）
+    │   ├── captcha.go           # ← app/captcha.py（缓存、人工回填、Solver 编排）
+    │   ├── pool.go              # ← app/captcha_browser.py（有界 worker 池：超时判死不误投）
+    │   ├── browser_solver.go    # Solver 实现（惰性启动 + 配置键重建 + 失败冷却）
+    │   ├── solve.go             # rod worker：页面 HTML + 求解 JS（从 Python 版逐字抄写）
+    │   ├── browserdl.go         # cloakbrowser Chromium 自动下载（SHA256SUMS + Ed25519 验签）
+    │   └── AliyunCaptcha.js.txt # 阿里云无痕 SDK（embed 素材）
     ├── oauth/oauth.go           # ← app/oauth.py
     ├── auth/auth.go             # ← app/auth_admin.py（Bearer 校验 + 失败限速）
-    ├── adminapi/handlers.go     # ← routes/admin_api.py（账号/代理/设置/登录/导出导入/监控）
+    ├── adminapi/                # ← routes/admin_api.py
+    │   ├── adminapi.go          # 路由注册 + guard + 响应工具
+    │   ├── accounts.go          # 账号 CRUD / 额度刷新 / 设置 / 验证码 / 导出导入
+    │   ├── proxies.go           # 代理线路 CRUD + 出口探测
+    │   ├── login.go             # OAuth 登录 start/complete
+    │   ├── claim.go             # 套餐 preview / claim
+    │   └── monitor.go           # 监控与用量
+    ├── claim/                   # Go 版增量（← app/claim.py + app/telemetry.py）
+    │   ├── claim.go             # billing/preview + billing/claim + 3007 换码重试
+    │   └── telemetry.go         # 激活事件上报
     ├── asyncpool/pool.go        # ← routes/async_pool.py（ticket + SSE + 泄漏防护）
+    ├── proxy/                   # ← app/proxy.py（Transport 缓存 + socks4/4a/5/5h 拨号器）
+    │   ├── proxy.go             # URL 归一化与 scheme 白名单
+    │   └── client.go            # TransportFor / ClientFor / socks 握手
     └── web/
-        ├── embed.go             # go:embed frontend/dist + /admin catch-all
+        ├── spa.go               # /admin catch-all + /assets 静态 + /meta
         └── logs.go              # ← app/logs.py（彩色终端）
 ```
 
-主仓库 `app/zcode_system.json` 已复制为 `internal/upstream/zcode_system.json` 并 `embed`。
+Python 版 `app/zcode_system.json` 已复制为 `internal/upstream/zcode_system.json` 并 `embed`。
 
 ## 5. 行为契约（必须与 Python 版逐字对齐的部分）
 
@@ -157,16 +197,18 @@ meta(key TEXT PK, value TEXT)
 
 ### 5.5 验证码（照抄 `captcha_browser.py` 的思路与字符串）
 
-- **HTML 与求解 JS 逐字抄写**：`AliyunCaptchaConfig` 先于内联 SDK（SDK 取自 `captcha_node/AliyunCaptcha.js.txt`，
-  `</script>` 替换为 `<\/script>`）；`initAliyunCaptcha` 配置（mode=popup、language=en、`#cap`/`#btn`）、
-  `getInstance` 内 `startTracelessVerification ?? show`、`success` 写 `window.__zcodeOutcome`、
-  轮询间隔 250ms、SDK 加载 20s / 单次求解 40s。
+- **HTML 与求解 JS 逐字抄写**：`AliyunCaptchaConfig` 先于内联 SDK（SDK 内嵌于
+  `internal/captcha/AliyunCaptcha.js.txt`，`</script>` 替换为 `<\/script>`）；`initAliyunCaptcha` 配置
+  （mode=popup、language=en、`#cap`/`#btn`）、`getInstance` 内 `startTracelessVerification ?? show`、
+  `success` 写 `window.__zcodeOutcome`、轮询间隔 250ms、SDK 加载 20s / 单次求解 40s。
 - **成功复用同一页面，失败重载页面清 SDK 内部状态**；token 只在内存。
-- **池语义对齐**：goroutine worker 槽位 = 并发上限；请求超时 → 关闭该页面/浏览器实例并替换，
+- **池语义对齐**：worker 槽位 = 并发上限；请求超时 → 关闭该浏览器实例并替换，
   迟到的 TOKEN 通过 context 取消保证**绝不误投**后续请求；启动阶段失败 → 60s 冷却回退人工回填提示。
-- **浏览器二进制复用**：rod 通过 `launcher.Bin(...)` 启动 cloakbrowser 下载到 `CLOAKBROWSER_CACHE_DIR`
-  的同一 Chromium + 相同 `_BROWSER_ARGS`（`--disable-dev-shm-usage` 等 5 项），驱动差异极小化。
-  构建期仍执行 `python -m cloakbrowser install` 预下载（仅构建期需要 Python）。
+- **浏览器二进制复用**：rod 通过 `launcher.Bin(...)` 启动 cloakbrowser 的同一 Chromium + 相同
+  `_BROWSER_ARGS`（`--disable-dev-shm-usage` 等 5 项），驱动差异极小化。
+  二进制发现链：`ZCODE_CAPTCHA_BROWSER_BIN` → `CLOAKBROWSER_BINARY_PATH` → `CLOAKBROWSER_CACHE_DIR`
+  下版本最高者 → **自动下载**（`browserdl.go`：cloakbrowser.dev 主站 + GitHub Releases 兜底，
+  SHA256SUMS 的 Ed25519 验签，失败不降级），因此**无需 Python 预下载**。
 - 回退链：浏览器池不可用/失败冷却 → 返回 503 `captcha_required`（提示后台 `/admin/captcha` 人工回填），
   人工令牌缓存 45s。
 
@@ -217,7 +259,7 @@ meta(key TEXT PK, value TEXT)
   `stream_options.include_usage` 时在终止前附 usage chunk。
 - UsageCollector 在重编码旁路照常解析 Anthropic 事件——账号调度统计不受转换影响。
 
-### 5.8 `/v1/responses`（已规划，延后实现——决策：先 completions，后 Responses）
+### 5.8 `/v1/responses`（Go 版增量，见 M7）
 
 - 定位：服务 Codex CLI 等 Responses 生态客户端；复用 §5.7 的引擎与转换基建，增量约 300-500 行。
 - v1 范围：`instructions` → system；`input`（字符串 / 类型化 item 数组：message、function_call、
@@ -226,12 +268,12 @@ meta(key TEXT PK, value TEXT)
   item；流式重编码为 `response.*` 事件序列（`response.output_text.delta` 等）。
 - **状态化划界**：无状态用法全支持（`store:false` + 每轮完整历史，Codex 默认即此）；
   带 `previous_response_id` 的请求 v1 返回明确 400；内存 LRU 回放列为后续可选增强，不阻塞。
-- 排期：M4 的 completions 验收通过后启动，避免两个转换层并行开发。
+- 实现状态：M7 已完成（`internal/openai/responses.go` + `responses_stream.go`）。
 
 ### 5.9 套餐自动领取（Go 版增量，2026-09-10 新增）
 
-- 定位：Python 主仓 2026-09-10 上线的活动套餐自动领取（`app/claim.py` + `app/telemetry.py`），
-  Go 版对齐移植，排期 M8（M6 交付后）。
+- 定位：Python 版 2026-09-10 上线的活动套餐自动领取（`app/claim.py` + `app/telemetry.py`），
+  Go 版对齐移植（M8 已完成，见 `internal/claim/`）。
 - 链路：`GET {BILLING_BASE}/billing/preview?app_version=&platform=` → 解析
   `data.plans[]`（plan_id/name/priority + model_usage token grants）→
   `POST {BILLING_BASE}/billing/claim` body `{"plan_id"}`，需验证码头
@@ -255,19 +297,21 @@ meta(key TEXT PK, value TEXT)
 - [x] model.Account + 状态机 + 模型可用性 + JSON 契约单测 — `internal/model/`
 - [x] store：SQLite 单连接 + 密钥引导（随机生成、`zcode` 轮换）+ 轮询游标 + 代理 + 导入导出 + 单测 — `internal/store/`
 - [ ] **互通验收**：用 Python 版生成的真实 `data/accounts.db` 打开 → 账号/设置完整可读，Go 写回后 Python 版也能读
-  （代码就绪；需在有 Go 工具链的设备执行 `go test ./...` 实测）
+  （代码就绪，`go build/vet/test ./...` 全绿；尚缺一份真实 Python 版 db 做双向实测，
+  §7 规划的脱敏 `testdata/` 夹具亦未提交）
 ### M1 网关核心
 - [x] build_request（头 + zcode_system 注入 + 剔除表 + 客户端头过滤）— `internal/upstream/`
 - [x] 请求整形 + 错误分类链 + 模型白名单 + UsageCollector（含单测）— `internal/gateway/{body,classify,usage}.go`
-- [x] captcha 管理器（配置缓存 10min / 人工回填 45s / Solver 接口；浏览器池留 M4）— `internal/captcha/`
+- [x] captcha 管理器（配置缓存 10min / 人工回填 45s / Solver 接口）— `internal/captcha/`（浏览器池 M5 落地）
 - [x] 鉴权：网关 fail-closed + 后台限速（10 次/5min）— `internal/auth/`；终端日志 — `internal/web/`
 - [x] /v1/messages 选号循环（engine.go）+ JSON/SSE 字节级透传（handler.go）
-- [x] /v1/models（先按 Python 版形态，M4 再扩展双兼容超集）
+- [x] /v1/models（M1 先按 Python 版形态，M4 已扩展为双兼容超集）
 - [x] httptest e2e：鉴权、透传、白名单、401/402/429 码族/3010/500 透传、1005、JWT 注入、验证码 503（13 组用例）
-- [ ] **验收**：真实账号非流式 + 流式各打通一次（需验证码：待 M4 浏览器池或 M2 人工回填端点）
+- [ ] **验收**：真实账号非流式 + 流式各打通一次（依赖 M5 浏览器池或 M2 人工回填端点，两者均已就绪）
 ### M2 Admin API + 鉴权 + SPA
-- [ ] auth（Bearer + 限速）、admin_api 全部端点、embed dist + catch-all
-- [ ] **验收**：浏览器完整走一遍后台 UI（登录/账号/代理/设置/验证码页）；限速单测
+- [x] auth（Bearer + 限速）、admin_api 全部端点、embed dist + catch-all
+- [x] **验收**：浏览器完整走一遍后台 UI（登录/仪表板/账号池/代理/验证中心/设置六页均正常渲染，
+  经 UI 新增账号成功）；限速单测（auth_test.go 5 组，含失败上限与成功清零）
 ### M3 额度监控 + async
 - [x] fetch_quota（解析 + 多订阅合并 + 15s 缓存 + inflight 去重 + 清理）+ 后台 monitor
 - [x] /async/v1/messages（ticket 全语义）
@@ -276,39 +320,68 @@ meta(key TEXT PK, value TEXT)
 - [x] 请求转换：system 归并、content blocks、图片、tools/tool_calls/tool_result、stop_sequences
 - [x] 响应转换：非流式 JSON + 流式 SSE 重编码 + stop_reason/usage 映射
 - [x] /v1/models 扩展为双兼容超集
-- [x] **验收**：§5.7 每条映射至少一个单测（convert 10 + respond/stream 9 + e2e 5）；
+- [x] **验收**：§5.7 每条映射至少一个单测（convert 11 + respond/stream 9 + e2e 5）；
   httptest 全链路覆盖非流式、流式、一次工具调用三种场景（openai 官方客户端真机
   跑通待真实账号环境，与 M0/M1 验收合并执行）
-### M5 验证码（高风险，单独攻坚）
-- [x] rod 池（复用 cloakbrowser 二进制）+ manager（缓存/人工回填/冷却）— `internal/captcha/{pool,browser_solver,solve}.go`
-- [ ] **验收**：真实账号连续 20 次 JWT 请求全部自动通过（无 F001）；
-  失败注入测试（超时/崩溃替换/迟到 token 不误投）**已由单测覆盖**（pool_test.go 12 组）
+### M5 验证码池（代码完成，待真机验收）
+- [x] rod 池（复用 cloakbrowser 二进制）+ manager（缓存/人工回填/冷却）— `internal/captcha/{pool,browser_solver,solve,browserdl}.go`
+- [x] 失败注入单测：超时判死替换、崩溃替换、迟到 token 不误投、队列超时、Stop 幂等（pool_test.go 14 组）
+- [ ] **验收**：真实账号连续 20 次 JWT 请求全部自动通过（无 F001）
 ### M6 OAuth + 代理 + CLI + 交付（代码完成，待真机验收）
 - [x] OAuth 登录链（internal/oauth + adminapi login 端点 + CLI login）、账号代理出口
   （internal/proxy：http/https CONNECT + 手写 socks4/4a/5/5h，Transport 缓存；引擎与 quota 已接线）、
   CLI 子命令（serve/login/add-account/accounts/remove-account/quota/status/set-admin-key/export/import）、
-  Release CI（原 Dockerfile/compose 方案 2026-09-11 放弃，见范围一节）
+  Release CI（推 `v*` tag 交叉编译五平台并上传 Releases）
+- [x] Linux 一键部署（`deploy/manage.sh` 单一交互式管理脚本，**已实测**）：
+  二进制安装/更新（版本比对+回滚）/卸载/状态 + Docker 安装/更新/卸载 + 服务控制；
+  systemd 单元模板内嵌于脚本，单文件可部署。另附 `Dockerfile` + `docker-compose.yml`
+  参考实现，**未经验证、不保证可用**
 - [ ] **验收**：Release CI 产物可运行；`-race` 下全测试通过；两版本交替使用同一 db 无异常
 ### M7 `/v1/responses` 端点（代码完成，待真机验收）
 - [x] 请求/响应/流式转换 + 状态化划界（`previous_response_id` v1 先 400）—
-  `internal/openai/{responses,responses_stream}.go`（8 组单测 + 2 组 e2e）
+  `internal/openai/{responses,responses_stream}.go`（7 组单测，含 2 组 e2e）
 - [ ] **验收**：Codex CLI 指向网关完成一次完整会话（无状态模式）
 ### M8 套餐自动领取（代码完成，待真机验收）
 - [x] claim 核心链（preview 解析 / claim 业务码 / 3007 换码重试）+ 激活事件上报 —
   `internal/claim/`（8 组单测对照 Python tests/test_claim.py）
 - [x] Admin API `/claim/preview` + `/claim` + 入池自动领取触发点（批量添加 / OAuth / CLI login）
   + 前端按钮（工具栏全量 + JWT 账号行内单账号）
-- [ ] **验收**：单测覆盖业务码映射与重试语义（已完成）；真机领取一次成功（待真实账号环境）
+- [x] **验收**：单测覆盖业务码映射与 3007 换码重试语义（claim_test.go 8 组）
+- [ ] **验收**：真机领取一次成功（billing/preview + claim + 激活上报全链路）
+
+### M9 已知缺陷修复（代码审查发现，待排期）
+以下为 2026-09-15 代码审查确认的行为问题，**不阻塞真机验收**，但应在正式发布前处理：
+
+- [ ] `asyncpool` 错误分类与 engine 分歧：429 一律标 `Cooling`（不区分 `quotaExhaustedCodes`
+  额度码族），且不处理 3010 并发准入、`1005`、402；同账号在两条路径下状态标记不一致 —
+  `internal/asyncpool/pool.go:420-430`
+- [ ] `BrowserSolver.Solve` 持锁跨 `pool.Solve`（`browser_solver.go:75-86`），使
+  `ZCODE_CAPTCHA_BROWSER_WORKERS>1` 形同虚设（实效并发上限恒为 1），且 45s 求解期间其他调用者全阻塞
+- [ ] async ticket 逾时到期不投递任何终止事件（`pool.go:147`），客户端只看到连接断开
+- [ ] `openai.ConvertRequest` 把 `include_usage` 写入送上游的 Anthropic 请求体
+  （`convert.go:62`），上游无此顶层参数
+- [ ] `responses_stream` 的 `output_item.added` 与 `arguments.delta` 的 `item_id` 不一致
+  （`responses_stream.go:128` vs `:168`）
+- [ ] socks5 本地解析取 `resolved[0].IP.To4()`，首个结果为 IPv6 时仍以 ATYP=0x01 送出
+  （`proxy/client.go:188`）
+- [ ] `browserdl.extractTarGz` 无 symlink 分支（`browserdl.go:295-315`），darwin 的
+  Chromium.app bundle 可能解出不可用安装
+- [ ] `quota` 代理回退无日志（`quota.go:204-214`，对比 `claim.go:74` 有 `web.Warn`）
+- [ ] 后台限速以 `RemoteAddr` 为键、不信任 `X-Forwarded-For`（`auth.go:129-135`），
+  部署在反向代理后所有客户端共用同一失败桶
+- [ ] `go.mod` 将 `go-rod/rod` 标为 `// indirect` 但实际直接 import（`solve.go:27`）；
+  `go mod tidy` 会改写
+- [ ] `gofmt` 未覆盖：20/62 个 Go 档存在格式差异（import 排序、struct 字段对齐、注释 `//（` 缺空格）
 
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
-  保持同名用例语义，便于两边对照。
+  保持同名用例语义，便于两边对照。当前 23 个测试文件、171 个 `Test` 函数，`go test ./...` 全绿。
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
-  最终用 openai 官方客户端（python）指向网关做真客户端回归。
+  最终用 openai 官方客户端（python）指向网关做真客户端回归（待真实账号环境）。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。
-- 全部测试在 `-race` 下通过。
-- 数据互通夹具：把一份脱敏 `accounts.db` 提交到 `testdata/` 作为固定夹具。
+- 全部测试在 `-race` 下通过（**待办**：本机无 gcc，需在有 C 工具链的环境补跑）。
+- 数据互通夹具：把一份脱敏 `accounts.db` 提交到 `testdata/` 作为固定夹具（**尚未提交**）。
 
 ## 8. 风险与对策
 
@@ -324,7 +397,18 @@ meta(key TEXT PK, value TEXT)
 ## 9. 交付形态
 
 - `go build ./cmd/zcode2api` → 单二进制（前端已 embed），仅 Chromium 运行库为外部依赖。
-- Release CI：推 `v*` tag → GitHub Actions 交叉编译 linux/darwin/windows × amd64/arm64
-  （CGO_ENABLED=0，`-trimpath -ldflags="-s -w"`）→ 上传 GitHub Releases。
-  （2026-09-11 定案放弃 Docker 镜像方案：裸二进制 + systemd 更简单，Chromium 由部署机自备。）
-- Python 版保留在仓库中直至 Go 版 M6 验收通过，届时再决定去留（不在本计划范围内）。
+- Release CI：推 `v*` tag → GitHub Actions 交叉编译五平台产物
+  （linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64；
+  CGO_ENABLED=0，`-trimpath -ldflags="-s -w"`）→ 上传 GitHub Releases。
+- **Linux 一键部署（`deploy/manage.sh`，单一入口）**：
+  - 交互式选单：安装/更新/卸载二进制、查看状态、服务控制（启停/重启/日志）、Docker 三个操作。
+  - 非交互子命令：`install` / `update` / `uninstall` / `status` / `docker-install` /
+    `docker-update` / `docker-uninstall`，配合 `-y` 可用于脚本与 CI。
+  - 二进制路径（**已实测**）：自动装系统依赖（含验证码浏览器的共享库，按发行版命名差异解析）→
+    取二进制（Releases 下载或 `--local` 就地编译）→ 生成 `.env` → 渲染 systemd unit →
+    `systemctl enable --now` → 打印首次启动密钥。更新时备份旧二进制，下载失败自动回滚。
+  - systemd 单元模板同时内嵌于脚本，单文件下载即可运行。
+  - `Dockerfile` + `docker-compose.yml`：**参考实现，未经验证、不保证可用**（开发环境无容器运行时，
+    从未执行 `docker build`）。仅作起点，需自行验证与调整；两卷需持久化
+    （`/app/data` 账号库、`/app/browser` 浏览器缓存）。
+- Python 版归档于本仓库 `python-legacy` 分支，仅作行为契约参照，不再更新。

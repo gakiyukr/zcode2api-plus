@@ -78,11 +78,9 @@ var (
 
 // ── 验证码 ──────────────────────────────────────────────────────────────────
 var (
-	CaptchaCacheTTL       = int64(envInt("CAPTCHA_CACHE_TTL", 45_000))         // ms，Node/人工令牌
 	CaptchaConfigCacheTTL = int64(envInt("CAPTCHA_CONFIG_CACHE_TTL", 600_000)) // ms，上游配置
 	CaptchaManualCacheTTL = int64(envInt("CAPTCHA_MANUAL_CACHE_TTL", 45_000))  // ms，人工回填
 
-	CaptchaSolveRetries = envInt("ZCODE_CAPTCHA_RETRIES", 4)
 	CaptchaSolveTimeout = envInt("ZCODE_CAPTCHA_TIMEOUT", 40) // 每次求解超时（秒）
 
 	// 真实 Chromium（rod 驱动 cloakbrowser 下载的浏览器二进制）。
