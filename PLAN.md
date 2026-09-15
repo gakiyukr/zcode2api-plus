@@ -390,6 +390,36 @@ meta(key TEXT PK, value TEXT)
   采用 `X-Forwarded-For` 的最后一跳；**不可无条件信任该头**（会丧失防伪造能力）。
   当前判断：先以 `--host 127.0.0.1` 方案满足需求，此项暂不实现。
 
+### M10 待修：Account 指针共享导致的数据竞争（2026-09-15 发现，**高优先级**）
+
+`Store.Select` 在持锁状态下读取 `*model.Account` 的 `Status`/`Enabled`/`CoolingUntil`
+等字段（经 `IsSelectable`），锁随即释放并**把同一指针交给调用方**；此后引擎、quota、
+adminapi 在**锁外**直接修改这些字段（`engine.go` 11 处、`quota.go` 18 处、
+`adminapi/accounts.go` 2 处），仅靠 `UpdateAccount` 落库（该方法虽有锁，但不保护
+调用方的字段写入）。
+
+**已用 `-race` 实证**（`internal/store/store_test.go:TestSelectAndMutateConcurrently`）：
+
+```
+WARNING: DATA RACE
+Write at ... by goroutine 12:  store_test.go:441        (引擎写 acc.Status)
+Previous read at ... by goroutine 11:
+  model.(*Account).IsSelectable()  account.go:159
+  store.(*Store).Select()          store.go:679
+```
+
+**潜在后果**：`Status` 是字符串（指针+长度）、`CoolingUntil` 是指针，并发读写可能读到
+撕裂值——轻则账号可用性判断错误（如刚冷却完的账号被误判为可用），重则解引用野指针
+导致进程崩溃。
+
+**修复方向（择一，需评估后再动）**：
+- 方案 A：`Store` 提供受控修改 API（如 `SetStatus(id, status, errMsg)`），调用方不再
+  直接改字段；语义与 `UpdateAccount` 一致，但需改 31 处调用点。
+- 方案 B：`Select` 返回深拷贝，调用方改副本后显式写回；改动小，但遗漏写回即静默丢状态。
+
+**当前判断**：方案 A 更稳妥（编译器能强制走受控路径），但属架构级改动，需专门排期。
+该竞争在低并发下不易触发，短期内不阻塞使用。
+
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），

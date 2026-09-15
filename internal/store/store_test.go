@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -398,4 +399,55 @@ func TestProxyProfiles(t *testing.T) {
 	if _, err := s.AssignProxyProfile(acc.ID, "proxy-nope"); err == nil {
 		t.Fatal("指派不存在的线路应报错")
 	}
+}
+
+// Select 返回的 *model.Account 与 Store 内部切片共享同一对象。
+// 引擎在锁外修改它的状态字段（Status/UseCount/LastError 等），
+// 而 Select 在锁内读取这些字段——两者并发即为数据竞争。
+// 本测试用高并发暴露该问题（需 -race 才能判定）。
+func TestSelectAndMutateConcurrently(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "acc", "h.p.s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc.Quota = map[string]map[string]any{
+		"GLM-5.3": {"remaining": float64(10), "model": "GLM-5.3"},
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// 读侧：模拟并发请求选号（持锁读 Status/Quota）
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = s.Select(model.ProviderZai, nil, "GLM-5.3")
+			}
+		}
+	}()
+
+	// 写侧：模拟引擎在锁外标记账号状态
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			msg := "冷却中"
+			acc.Status = model.StatusCooling
+			acc.LastError = &msg
+			acc.UseCount++
+			acc.FailCount++
+			_ = s.UpdateAccount(acc)
+			acc.Status = model.StatusActive
+			_ = s.UpdateAccount(acc)
+		}
+		close(stop)
+	}()
+
+	wg.Wait()
 }
