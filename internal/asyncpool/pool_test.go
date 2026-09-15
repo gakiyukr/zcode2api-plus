@@ -399,6 +399,46 @@ func TestMessagesAcceptsWhitelistedModel(t *testing.T) {
 	}
 }
 
+// TestSkipsAPIKeyAccountsInMixedPool 混合池里轮到 apiKey 账号时应跳过，
+// 而不是终止整张票。
+//
+// async 仅支持 JWT 账号，但池中可以混有 apiKey 账号；Select 是 round-robin，
+// 一次只回一个。曾经的写法是「非 jwt 就 emitError 并 return」，且 tried 标记
+// 在检查之后，于是轮询再次轮到同一 apiKey 账号时依旧失败——池里明明有可用
+// JWT 账号，请求却间歇性、与账号状态无关地失败。
+func TestSkipsAPIKeyAccountsInMixedPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+
+	// 交错添加，确保 Select 的轮询顺序里 apiKey 账号排在 JWT 之前
+	if _, err := st.AddAccount(model.ProviderZai, "key-1", "sk-plain-key"); err != nil {
+		t.Fatal(err)
+	}
+	addJWTAccount(t, st, "jwt-1")
+
+	// 每次请求都要一个成功规格（scriptedUpstream 用完后回退 502）
+	okSpec := upstreamSpec{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
+		`data: {"type":"message_delta","usage":{"output_tokens":1}}`,
+	}}
+	up := &scriptedUpstream{specs: []upstreamSpec{okSpec, okSpec, okSpec, okSpec}}
+	config.UpstreamZai = up.start(t).URL
+
+	// 多跑几次：无论轮询从哪个账号开始，都必须落到 JWT 账号上
+	for i := range 4 {
+		id := fmt.Sprintf("ticket-mixed-%d", i)
+		tk := insertTicket(p, id, map[string]any{"model": "GLM-5.3", "messages": []any{}})
+		p.processTicket(context.Background(), id)
+
+		events := drainEvents(tk)
+		last := events[len(events)-1]
+		if last.Type != "done" {
+			t.Fatalf("第 %d 次：应跳过 apiKey 账号并成功交付，实际 %+v", i, events)
+		}
+	}
+	if up.callCount() == 0 {
+		t.Fatal("上游应收到请求")
+	}
+}
+
 // TestSuccessRecordsUsageAndRevivesStatus async 成功交付后必须与 engine.success
 // 记出相同的账号状态。
 //

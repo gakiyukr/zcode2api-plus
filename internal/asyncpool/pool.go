@@ -273,8 +273,17 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 
 	for {
 		modelName, _ := body["model"].(string)
+
+		// async 仅支持 JWT 账号，但池中可以混有 apiKey 账号：Select 是
+		// round-robin，轮到 apiKey 账号时必须跳过并继续找下一个，而不是
+		// 直接终止整张票——否则池里明明有可用 JWT 账号，请求却间歇性失败。
+		// 先记 tried 再判断：漏记会让下一次轮询又选中同一账号。
 		acc := p.Store.Select(model.ProviderZai, tried, modelName)
-		if acc == nil || acc.Mode != "jwt" {
+		for acc != nil && acc.Mode != "jwt" {
+			tried[acc.ID] = true
+			acc = p.Store.Select(model.ProviderZai, tried, modelName)
+		}
+		if acc == nil {
 			p.emitError(ctx, ticketID, "无可用 OAuth 账号", "no_account")
 			return
 		}
