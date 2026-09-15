@@ -298,6 +298,63 @@ func Test402MarksModelExhausted(t *testing.T) {
 	}
 }
 
+// TestMarkModelExhaustedDoesNotClobberStrongerStatus 额度信号不得覆盖
+// invalid/cooling/disabled——它们由凭据校验或上游限流直接判定。
+//
+// Store.Select 不做占位保留，同一账号可被并发请求同时选中：A 被上游 401
+// 标 invalid 后，B 的 402 额度信号曾无条件把状态刷回 active，失效账号立刻
+// 回到轮询池，每次选中都白耗一次上游调用。cooling 同理会提前解除。
+func TestMarkModelExhaustedDoesNotClobberStrongerStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status string
+	}{
+		{"invalid 不被覆盖", model.StatusInvalid},
+		{"cooling 不被覆盖", model.StatusCooling},
+		{"disabled 不被覆盖", model.StatusDisabled},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t)
+			acc, err := f.st.AddAccount(model.ProviderZai, "acc", "sk-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			until := float64(time.Now().Add(time.Minute).UnixNano()) / 1e9
+			prevMsg := "先前状态"
+			f.st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+				a.Status = c.status
+				if c.status == model.StatusCooling {
+					a.CoolingUntil = &until
+				}
+				a.LastError = &prevMsg
+			})
+
+			MarkModelExhausted(f.st, acc.Provider, acc.ID, "GLM-5.3", "額度已用完")
+
+			got := f.st.Find(model.ProviderZai, acc.ID)
+			if got.Status != c.status {
+				t.Fatalf("状态不应被额度信号改写: %s -> %s", c.status, got.Status)
+			}
+			if c.status == model.StatusCooling {
+				if got.CoolingUntil == nil {
+					t.Fatal("cooling 的截止时间不应被清空")
+				}
+			}
+			// 模型级标记仍要生效，否则该模型不会被摘出轮询
+			found := false
+			for _, m := range got.ExhaustedModels {
+				if m == "glm-5.3" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("模型应仍被标记耗尽: %v", got.ExhaustedModels)
+			}
+		})
+	}
+}
+
 func Test429QuotaFamilyExhaustsAndRateLimitCools(t *testing.T) {
 	t.Run("1310 用量上限族→模型耗尽", func(t *testing.T) {
 		f := newFixture(t)

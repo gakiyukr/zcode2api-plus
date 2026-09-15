@@ -474,11 +474,25 @@ func MarkAccount(st *store.Store, provider, id, status, errMsg string, now time.
 }
 
 // MarkModelExhausted 只停用已耗尽的请求模型；所有已知模型皆耗尽时才停用整号。
+//
+// 只负责「额度」这一类信号，因此不覆盖更强的状态：invalid（凭据已失效）、
+// cooling（刚被上游限流）、disabled（人工停用）都保持原状。额度信号没有
+// 资格断言账号已恢复——否则并发请求里 A 刚标出的 invalid 会被 B 的额度
+// 信号刷成 active，失效账号重新进入轮询，每次选中都是一次白费的上游调用。
 func MarkModelExhausted(st *store.Store, provider, id string, modelName any, errMsg string) {
 	st.Update(provider, id, func(acc *model.Account) {
 		if !acc.MarkModelExhausted(modelName) {
+			// 模型名无法归一化：无法做模型级停用，退回整号停用
+			if isStrongStatus(acc.Status) {
+				return
+			}
 			acc.Status = model.StatusExhausted
 			acc.LastError = &errMsg
+			return
+		}
+		if isStrongStatus(acc.Status) {
+			// 模型级标记已写入 ExhaustedModels，这里不动状态与 last_error：
+			// 把「刚被 429 限流」改写成「额度用完」会掩盖真实原因。
 			return
 		}
 		anyState := false
@@ -502,6 +516,16 @@ func MarkModelExhausted(st *store.Store, provider, id string, modelName any, err
 		acc.CoolingUntil = nil
 		acc.LastError = &errMsg
 	})
+}
+
+// isStrongStatus 判断账号是否处于「比额度耗尽更强」的状态：
+// 这些状态由凭据校验或上游限流直接判定，额度信号不得覆盖。
+func isStrongStatus(status string) bool {
+	switch status {
+	case model.StatusInvalid, model.StatusCooling, model.StatusDisabled:
+		return true
+	}
+	return false
 }
 
 func (e *Engine) mark(acc *model.Account, status, errMsg string) {
