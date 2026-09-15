@@ -42,7 +42,8 @@ const cliUsage = `ZCode2api (Go)
 `
 
 // runCLI 命令分发；返回进程退出码。cmd 为空串表示无参数。
-func runCLI(cmd string, rest []string, serveFn func()) int {
+// serveFn 返回 error 以便 main 统一收尾（避免 os.Exit 跳过 defer）。
+func runCLI(cmd string, rest []string, serveFn func() error) int {
 	switch cmd {
 	case "", "help", "-h", "--help":
 		fmt.Print(cliUsage)
@@ -53,7 +54,10 @@ func runCLI(cmd string, rest []string, serveFn func()) int {
 				config.Port = port
 			}
 		}
-		serveFn()
+		if err := serveFn(); err != nil {
+			web.Err("cli", err.Error())
+			return 1
+		}
 		return 0
 	case "login":
 		cmdLogin(rest)
