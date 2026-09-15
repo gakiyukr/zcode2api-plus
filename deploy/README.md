@@ -318,14 +318,49 @@ location / {
 
 ### 資料備份
 
+**只需備份 `data/` 與 `.env`**——二進制可從 Releases 或源碼重建，瀏覽器快取會自動下載。
+
 ```bash
-# 停止服務後複製整個數據目錄（含 SQLite 的 WAL 文件）
+# 停止服務後複製（含 SQLite 的 WAL 文件，三者必須一起）
 systemctl stop zcode2api
-cp -a /opt/zcode2api/data /backup/zcode2api-data-$(date +%F)
+tar -cJf /backup/zcode2api-$(date +%F).tar.xz -C /opt/zcode2api data .env .installed-version
 systemctl start zcode2api
 ```
 
-或用後台的匯出功能（`/admin/api/export`，含明文憑證，請妥善保管）。
+實測：資料目錄 4.2MB（其中 WAL 4MB），壓縮後約 **35KB**。
+
+| 備份項 | 必要性 |
+|--------|--------|
+| `data/accounts.db` + `-wal` + `-shm` | **必須**（帳號憑證、額度狀態、用量統計） |
+| `data/device_mid.txt` | **必須**（裝置指紋，缺失會被上游視為新裝置） |
+| `.env` | 建議（含 `ZCODE_PORT`、`ZCODE_CAPTCHA_BROWSER_BIN` 等部署參數） |
+| `.installed-version` | 可選（供 `manage.sh update` 比對版本） |
+| 二進制 | **不需**（`manage.sh install` 或 Releases 重新取得） |
+| `browser/` | **不需**（首次使用時自動下載，約 200MB） |
+
+### 從備份還原
+
+```bash
+# 1. 部署新實例（會自動取得二進制與系統依賴）
+sudo ./deploy/manage.sh install --port 3002 --no-prefetch-browser
+
+# 2. 停止服務，還原資料
+sudo systemctl stop zcode2api
+sudo tar -xJf /backup/zcode2api-2026-09-15.tar.xz -C /opt/zcode2api
+sudo chown -R zcode2api:zcode2api /opt/zcode2api/data
+sudo systemctl start zcode2api
+
+# 3. 驗證
+curl -sS http://127.0.0.1:3002/meta          # {"version":"..."}
+sudo journalctl -u zcode2api -n 20           # 確認無錯誤
+```
+
+> **還原後必須修正屬主**：備份保留了原始 UID/GID，若目標機器沒有同 UID 的賬號，
+> 服務（以 `User=zcode2api` 運行）將無法讀寫資料庫。
+>
+> **WAL 必須一起還原**：只還原 `accounts.db` 會丟失 WAL 中尚未合併的交易。
+
+也可用後台的匯出功能（`/admin/api/export`，含明文憑證，請妥善保管）。
 
 > 資料庫與 Python 版（`python-legacy` 分支）完全互通，可互相接續使用同一份 `data/accounts.db`。
 
