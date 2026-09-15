@@ -63,6 +63,7 @@ sudo ./deploy/manage.sh docker-uninstall   # Docker 卸載
 ```bash
 --dir DIR            # 安裝目錄（預設 /opt/zcode2api）
 --port PORT          # 監聽端口（預設 3000）
+--host ADDR          # 監聽地址（預設 0.0.0.0；反向代理後建議 127.0.0.1）
 --user USER          # 以非特權賬號運行（不存在則自動建立）
 --local              # 從本機源碼構建（需 Go 工具鏈）
 --version TAG        # 指定 Release 標籤，預設取最新
@@ -269,11 +270,43 @@ systemd 系統服務不繼承登入 shell 的環境變數，因此正常情況�
 systemctl show-environment | grep -i proxy
 ```
 
-### 反向代理後台限速
+### 反向代理部署（重要）
 
-後台登入失敗限速以 `RemoteAddr` 為鍵，**不信任 `X-Forwarded-For`**。
-若把服務放在 Nginx/Caddy 之後，所有客戶端會共用同一個失敗計數桶（5 分鐘內 10 次失敗即整站 429）。
-建議後台僅綁定內網，或直接暴露端口而不經反向代理。
+後台登入失敗限速以 `RemoteAddr` 為鍵，**刻意不信任 `X-Forwarded-For`**
+（無條件信任該頭會讓攻擊者偽造來源繞過限速）。
+
+這帶來一個後果：**若把服務放在反向代理之後，所有請求的 `RemoteAddr` 都是反代 IP**，
+於是 10 次失敗（無論來自多少個不同客戶端）就會鎖死整個後台——單一 IP 攻擊者
+即可用 10 個請求讓所有人無法登入。
+
+**解法：讓服務只監聽回環，由反向代理在本機轉發。**
+
+```bash
+# 安裝時指定
+sudo ./deploy/manage.sh install --host 127.0.0.1
+
+# 或改既有安裝的 .env 後重啟
+sudo sed -i 's/^ZCODE_HOST=.*/ZCODE_HOST=127.0.0.1/' /opt/zcode2api/.env
+sudo systemctl restart zcode2api
+```
+
+這樣外部無法直連該端口（實測外部介面連線被拒），只能經反向代理，
+而反代與服務同機，`RemoteAddr` 恆為 `127.0.0.1`——攻擊面收斂到「只能從本機發起」。
+Nginx 範例：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    # SSE 透傳（/v1/messages 串流必需）
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+}
+```
+
+> 注意：`--host 127.0.0.1` 時，**網關端點（`/v1/messages` 等）也只監聽本機**。
+> 若 API 客戶端在外部，需一併經反向代理轉發，或改用 `--host 0.0.0.0` 並
+> 僅把後台路徑限制在內網（例如 Nginx 對 `/admin` 加 IP 白名單）。
 
 ### 資料備份
 

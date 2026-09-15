@@ -375,11 +375,18 @@ meta(key TEXT PK, value TEXT)
 - [x] `go.mod` 将 `go-rod/rod` 标为 indirect → `go mod tidy` 修正，并补齐 go.sum 缺失条目
 - [x] `gofmt` 未覆盖 → 全部 62 个 Go 档已格式化
 
-**待评估（未修改）**：
-- [ ] 后台限速以 `RemoteAddr` 为键、不信任 `X-Forwarded-For`（`auth.go:129-135`）。
-  这是**刻意的安全取舍**（信任 `X-Forwarded-For` 会让攻击者伪造头绕过限速），
-  已在 README 与 `deploy/README.md` 说明「建议后台仅绑定内网」；
-  若确需反代支持，应改为显式配置可信代理列表，而非无条件信任该头。
+**已提供缓解方案（2026-09-15）**：
+- `manage.sh` 新增 `--host ADDR`（交互式安装亦会询问），`ZCODE_HOST=127.0.0.1` 时
+  仅监听回环，适合放在反向代理之后——实测外部接口不可达，反代与同机服务通信时
+  `RemoteAddr` 恒为 `127.0.0.1`，攻击面收敛到「只能从本机发起」。
+- 同时修正 systemd 单元：原先 `Environment=ZCODE_HOST=0.0.0.0` 写在 `EnvironmentFile`
+  之后，会**覆盖** `.env` 中的设置，导致用户改 `.env` 不生效；现已移除该硬编码行，
+  `ZCODE_HOST` 统一由 `.env` 控制。
+
+- [ ] 若需真正支持反代场景下的**按真实客户端 IP 限速**，应引入显式可信代理配置
+  （如 `ZCODE_TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8`），仅对来自可信代理的请求
+  采用 `X-Forwarded-For` 的最后一跳；**不可无条件信任该头**（会丧失防伪造能力）。
+  当前判断：先以 `--host 127.0.0.1` 方案满足需求，此项暂不实现。
 
 ## 7. 测试策略
 

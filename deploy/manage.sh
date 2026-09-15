@@ -21,6 +21,7 @@ REPO_URL="https://github.com/$REPO.git"
 DIR="/opt/zcode2api"
 DOCKER_DIR="/opt/zcode2api-docker"
 PORT="3000"
+HOST="0.0.0.0"
 RUN_USER=""
 RUN_GROUP=""
 ENABLE_BROWSER="true"
@@ -88,6 +89,19 @@ validate_port() {
 	esac
 	if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
 		die "端口超出范围（1-65535）: $PORT"
+	fi
+}
+
+# validate_host 校验 $HOST：接受 IP 字面量或空（表示全部接口）。
+# 反向代理部署应设为 127.0.0.1，只监听回环。
+validate_host() {
+	[ -z "$HOST" ] && return 0
+	case "$HOST" in
+		0.0.0.0|::|127.0.0.1|::1) return 0 ;;
+	esac
+	# 其余情况要求是合法 IP 字面量（不做 DNS 解析，避免启动期依赖网络）
+	if ! printf '%s' "$HOST" | grep -qE '^[0-9a-fA-F:.]+$'; then
+		die "ZCODE_HOST 必须是 IP 字面量（如 127.0.0.1、0.0.0.0、::）: $HOST"
 	fi
 }
 
@@ -235,7 +249,6 @@ Group=__ZCODE_GROUP__
 WorkingDirectory=__ZCODE_DIR__
 ExecStart=__ZCODE_DIR__/zcode2api serve
 EnvironmentFile=-__ZCODE_DIR__/.env
-Environment=ZCODE_HOST=0.0.0.0
 Environment=ZCODE_PORT=__ZCODE_PORT__
 Environment=ZCODE_DATA_DIR=__ZCODE_DIR__/data
 Environment=ZCODE_CAPTCHA_BROWSER=__ZCODE_BROWSER__
@@ -291,8 +304,9 @@ write_env_file() {
 	fi
 	cat >"$DIR/.env" <<EOF
 # zcode2api 环境配置（由 manage.sh 生成，可自行编辑后 systemctl restart zcode2api）
+# ZCODE_HOST=127.0.0.1 时仅监听本机回环，适合放在反向代理之后
+ZCODE_HOST=$HOST
 ZCODE_PORT=$PORT
-ZCODE_HOST=0.0.0.0
 ZCODE_DATA_DIR=$DIR/data
 ZCODE_CAPTCHA_BROWSER=$ENABLE_BROWSER
 CLOAKBROWSER_CACHE_DIR=$DIR/browser
@@ -348,6 +362,7 @@ bin_install() {
 	detect_pkg_mgr
 	resolve_run_user
 	validate_port
+	validate_host
 	info "安装目录: $DIR    运行账号: $RUN_USER    架构: linux/$ARCH"
 	install_base_deps
 	install_browser_deps
@@ -536,7 +551,7 @@ bin_status() {
 		printf '  开机自启   %s\n' "$(systemctl is-enabled zcode2api.service 2>/dev/null || echo '-')"
 	fi
 	if [ -f "$DIR/.env" ]; then
-		printf '  配置       %s\n' "$(grep -E '^ZCODE_PORT=' "$DIR/.env" 2>/dev/null || echo '-')"
+		printf '  监听       %s\n' "$(grep -E '^ZCODE_(HOST|PORT)=' "$DIR/.env" 2>/dev/null | tr '\n' ' ' || echo '-')"
 	fi
 	if [ -d "$DIR/data" ]; then
 		printf '  数据       %s\n' "$(du -sh "$DIR/data" 2>/dev/null | cut -f1 || echo '-')"
@@ -730,6 +745,11 @@ menu_install() {
 	[ -n "$p" ] && PORT="$p"
 	validate_port
 
+	printf '监听地址 [%s]（反向代理后填 127.0.0.1）: ' "$HOST"
+	local h; read -r h || true
+	[ -n "$h" ] && HOST="$h"
+	validate_host
+
 	printf '运行账号 [root]: '
 	local u; read -r u || true
 	[ -n "$u" ] && RUN_USER="$u"
@@ -821,6 +841,7 @@ ${C_BOLD}zcode2api 管理脚本（Linux）${C_RST}
 选项:
   --dir DIR           安装目录（默认 $DIR）
   --port PORT         监听端口（默认 $PORT）
+  --host ADDR         监听地址（默认 $HOST；反向代理后建议 127.0.0.1）
   --user USER         以该账号运行（默认 root；不存在则自动创建）
   --local             从本机源码构建（需 Go 工具链）
   --version TAG       指定 Release 标签（如 v1.2.3），默认取最新
@@ -849,6 +870,7 @@ parse_args() {
 			--dir) DIR="${2:?--dir 需要路径}"; shift 2 ;;
 			--docker-dir) DOCKER_DIR="${2:?--docker-dir 需要路径}"; shift 2 ;;
 			--port) PORT="${2:?--port 需要端口}"; shift 2 ;;
+			--host) HOST="${2:?--host 需要地址}"; shift 2 ;;
 			--user) RUN_USER="${2:?--user 需要账号名}"; shift 2 ;;
 			--version) VERSION="${2:?--version 需要标签}"; shift 2 ;;
 			--local) SOURCE="local"; shift ;;

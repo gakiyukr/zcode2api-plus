@@ -85,8 +85,9 @@ sudo ./deploy/manage.sh docker-install         # Docker（未驗證）
 > Chromium（如 Debian 13）會被風控拒絕——自動下載的補丁二進制即為此問題的內建解法。
 
 > ⚠️ 放在反向代理後時注意：後台登入失敗限速以 `RemoteAddr` 為鍵，不信任
-> `X-Forwarded-For`，所有客戶端會共用同一失敗桶（5 分鐘 10 次即整站 429）。
-> 建議後台僅綁定內網。
+> `X-Forwarded-For`（防偽造），因此反代後所有客戶端會共用同一失敗桶
+> （5 分鐘 10 次即整站 429）。**解法**：以 `--host 127.0.0.1` 安裝，讓服務只監聽
+> 回環、僅由本機反代轉發，詳見 [`deploy/README.md`](deploy/README.md)。
 
 ## 配置（環境變量）
 

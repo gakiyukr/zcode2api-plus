@@ -12,7 +12,6 @@ Group=__ZCODE_GROUP__
 WorkingDirectory=__ZCODE_DIR__
 ExecStart=__ZCODE_DIR__/zcode2api serve
 EnvironmentFile=-__ZCODE_DIR__/.env
-Environment=ZCODE_HOST=0.0.0.0
 Environment=ZCODE_PORT=__ZCODE_PORT__
 Environment=ZCODE_DATA_DIR=__ZCODE_DIR__/data
 # 验证码浏览器：启用后在数据目录内下载补丁 Chromium（约 200MB，首次启动时）
