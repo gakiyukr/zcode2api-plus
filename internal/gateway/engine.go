@@ -8,6 +8,7 @@ import (
 	"context"
 	cryptoRand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -204,6 +205,15 @@ func (e *Engine) tryAccount(
 
 		resp, err := e.clientFor(acc).Do(httpReq)
 		if err != nil {
+			// 客户端主动断开（Ctrl-C、调用方超时、反代截断）会让 ctx 取消，
+			// Do 随即返回 context.Canceled。这不是账号的问题：若照「连接失败」
+			// 处理，后续每轮 Select→Do 都会立刻失败，最多把 5 个账号各标一次
+			// 冷却并落库，小账号池几次中断就全池不可用。此时直接终止，
+			// 不写任何账号状态。
+			if isCanceled(ctx, err) {
+				web.Warn(reqID, "客户端已断开，终止重试")
+				return canceledResult()
+			}
 			e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}
@@ -262,7 +272,11 @@ func (e *Engine) handleUpstreamError(
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
-		// 读不出错误体：按连接失败处理
+		// 读不出错误体：客户端断开同样会让读失败，此时不能归咎于账号
+		if isCanceled(ctx, err) {
+			web.Warn(reqID, "客户端已断开，终止重试")
+			return canceledResult()
+		}
 		e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
 		return attemptResult{switchAccount: true}
 	}
@@ -304,7 +318,7 @@ func (e *Engine) handleUpstreamError(
 			web.Warn(reqID, fmt.Sprintf("模型并发准入受限，%g s 后重试（账号仍可用）", delay.Seconds()))
 			select {
 			case <-ctx.Done():
-				return attemptResult{final: errResult(http.StatusServiceUnavailable, "canceled", "请求已取消")}
+				return canceledResult()
 			case <-time.After(delay):
 			}
 			return attemptResult{retryCaptcha: true}
@@ -579,6 +593,26 @@ func errResult(status int, errType, msg string) runResult {
 		Status: status,
 		Body:   map[string]any{"error": map[string]any{"message": msg, "type": errType}},
 	}
+}
+
+// canceledResult 客户端主动断开时的统一响应。
+//
+// 此时响应通常已写不出去（连接已断），返回它只是为了终止重试循环、
+// 让调用方走正常收尾路径；关键是**不写任何账号状态**——中断与账号健康无关。
+func canceledResult() attemptResult {
+	return attemptResult{final: errResult(http.StatusServiceUnavailable, "canceled", "请求已取消")}
+}
+
+// isCanceled 判断上游调用失败是否源于 ctx 取消/超时（而非账号或网络问题）。
+//
+// http.Client.Do 会把底层错误包进 *url.Error，context.Canceled 在 errors.Is
+// 下仍可穿透，因此同时检查 ctx 自身状态作为兜底（例如 cancel 与 Do 竞态时
+// 返回的是连接层错误）。
+func isCanceled(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // passthroughBodyWithType 解析上游错误体透传；解析失败时构造兜底错误结构。

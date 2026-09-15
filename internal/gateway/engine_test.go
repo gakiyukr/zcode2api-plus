@@ -497,6 +497,64 @@ func TestConcurrentRequestsAccountState(t *testing.T) {
 	}
 }
 
+// TestClientCancelDoesNotCoolAccounts 客户端中断不得污染账号状态。
+//
+// 中断会让 ctx 取消，Do 随即返回 context.Canceled；若把它当成「连接失败」，
+// 重试循环会把每个被选中的账号各标一次冷却（默认 300s）并落库——小账号池
+// 几次 Ctrl-C 就全池不可用，所有请求 503。中断与账号健康无关，必须不写状态。
+func TestClientCancelDoesNotCoolAccounts(t *testing.T) {
+	f := newFixture(t)
+
+	// 上游阻塞到 ctx 取消为止，确保取消发生在请求进行中
+	blocked := make(chan struct{})
+	f.respond = func(int, *http.Request) (int, http.Header, string) {
+		<-blocked
+		return 200, http.Header{"Content-Type": []string{"application/json"}}, okUpstreamJSON
+	}
+	defer close(blocked)
+
+	const accounts = 3
+	for i := range accounts {
+		if _, err := f.st.AddAccount(model.ProviderZai, fmt.Sprintf("acc-%d", i), fmt.Sprintf("sk-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan runResult, 1)
+	go func() {
+		done <- f.eng.RunMessages(ctx, msgBody(), map[string]string{}, func(Delivery) error { return nil })
+	}()
+
+	// 等上游真的被调用后再取消，模拟客户端中途断开
+	deadline := time.After(5 * time.Second)
+	for f.callCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("上游未被调用")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后引擎未返回")
+	}
+
+	// 核心断言：没有任何账号被标记为冷却或其他异常状态
+	for _, a := range f.st.ListAccounts(model.ProviderZai) {
+		if a.Status != model.StatusActive {
+			t.Fatalf("账号 %s 状态被中断污染: %s (%v)", a.Name, a.Status, a.LastError)
+		}
+		if a.CoolingUntil != nil {
+			t.Fatalf("账号 %s 不应有冷却截止时间", a.Name)
+		}
+	}
+}
+
 func TestModelsEndpoint(t *testing.T) {
 	f := newFixture(t)
 	// Python 版 /v1/models 带 Depends(verify_gateway_key)，同样需要鉴权
