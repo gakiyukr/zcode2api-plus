@@ -120,15 +120,20 @@ func serve() error {
 
 // newServer 构造 HTTP 服务端。
 //
-// 只设 ReadHeaderTimeout：它防的是 Slowloris（慢速发请求头占住连接），
-// 对响应阶段无影响。WriteTimeout / IdleTimeout 都不能设——SSE 长连接与
-// async 票务会持续数分钟，设了会在流中途掐断（部署文档的
-// proxy_read_timeout 3600s 也说明长连接是预期形态）。
+// ReadHeaderTimeout 防 Slowloris（慢速发请求头占住连接）。
+// IdleTimeout 回收 keep-alive 空连接——它只作用于「响应已写完、等待下一个
+// 请求」的空闲期，与流式响应无关；不设则 net/http 会把读期限清空
+// （server.go: idleTimeout()==0 且 ReadTimeout==0 → SetReadDeadline(zero)），
+// 空闲连接永不回收，goroutine 与 fd 无界累积。
+//
+// WriteTimeout 保持零值：SSE 与 async 票务的响应阶段会持续数分钟，
+// 设了会在流中途掐断（部署文档的 proxy_read_timeout 3600s 即为此配合）。
 func newServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 }
 
