@@ -209,7 +209,7 @@ func probeGet(client *http.Client, endpoint string) (*http.Response, error) {
 }
 
 // fetchIPInfo 查询单个 IP 服务并整理结果；ASN 缺失时向 hackertarget 补查
-//（补查失败仍保留 IP 结果，对齐 Python 版）。
+// （补查失败仍保留 IP 结果，对齐 Python 版）。
 func fetchIPInfo(client *http.Client, source, endpoint string) (map[string]any, error) {
 	resp, err := probeGet(client, endpoint)
 	if err != nil {
@@ -241,7 +241,7 @@ func fetchIPInfo(client *http.Client, source, endpoint string) (map[string]any, 
 }
 
 // parseIPLookup 将不同 IP 查询服务的字段整理成稳定的后台 API 格式
-//（对齐 Python _parse_ip_lookup）。
+// （对齐 Python _parse_ip_lookup）。
 func parseIPLookup(payload map[string]any) (map[string]any, error) {
 	connection, _ := payload["connection"].(map[string]any)
 	ip := strings.TrimSpace(strOf(firstTruthy(payload["ip"])))
@@ -258,10 +258,10 @@ func parseIPLookup(payload map[string]any) (map[string]any, error) {
 		payload["organization"], payload["isp"], connection["org"], connection["isp"],
 	)))
 	return map[string]any{
-		"ip":           ip,
-		"asn":          asn,
-		"operator":     operator,
-		"country":      strings.TrimSpace(strOf(firstTruthy(payload["country"]))),
+		"ip":       ip,
+		"asn":      asn,
+		"operator": operator,
+		"country":  strings.TrimSpace(strOf(firstTruthy(payload["country"]))),
 		"country_code": strings.ToUpper(strings.TrimSpace(strOf(firstTruthy(
 			payload["country_code"], payload["cc"])))),
 	}, nil

@@ -218,14 +218,14 @@ func ConvertResponsesResponse(payload map[string]any) map[string]any {
 	}
 	output, _ := messageToResponsesOutput(payload)
 	return map[string]any{
-		"id":          "resp_" + id,
-		"object":      "response",
-		"created_at":  float64(time.Now().Unix()),
-		"model":       payload["model"],
-		"status":      "completed",
-		"output":      output,
+		"id":                  "resp_" + id,
+		"object":              "response",
+		"created_at":          float64(time.Now().Unix()),
+		"model":               payload["model"],
+		"status":              "completed",
+		"output":              output,
 		"parallel_tool_calls": true,
-		"usage":       responsesUsage(payload["usage"]),
+		"usage":               responsesUsage(payload["usage"]),
 	}
 }
 
@@ -260,9 +260,9 @@ func messageToResponsesOutput(message map[string]any) ([]any, bool) {
 		}
 	}
 	messageItem := map[string]any{
-		"type": "message",
-		"id":   "msg_" + stringOf(message["id"]),
-		"role": "assistant",
+		"type":   "message",
+		"id":     "msg_" + stringOf(message["id"]),
+		"role":   "assistant",
 		"status": "completed",
 		"content": []any{map[string]any{
 			"type":        "output_text",

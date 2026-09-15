@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -204,3 +205,126 @@ func TestBrowserSolverCloseStopsPool(t *testing.T) {
 		t.Fatalf("关闭后应清空池引用: %v %q", s.pool, s.poolKey)
 	}
 }
+
+// Solve 不得持锁跨越池求解：多个调用者必须能并发执行（池 size 决定上限）。
+// 曾因持锁导致实效并发恒为 1，且单次 45s 求解期间其他调用者全部阻塞。
+func TestBrowserSolverConcurrentSolvesDoNotSerialize(t *testing.T) {
+	s := NewBrowserSolver()
+	var concurrent, peak int
+	var mu sync.Mutex
+	release := make(chan struct{})
+
+	s.SetPoolFactory(func(Config) *Pool {
+		return newStartedFakePool(t, func(ctx context.Context) (Worker, error) {
+			return &blockingWorker{onSolve: func() {
+				mu.Lock()
+				concurrent++
+				if concurrent > peak {
+					peak = concurrent
+				}
+				mu.Unlock()
+				<-release
+				mu.Lock()
+				concurrent--
+				mu.Unlock()
+			}}, nil
+		}, 3)
+	})
+
+	const n = 3
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for range n {
+		go func() {
+			defer wg.Done()
+			_, _ = s.Solve(context.Background(), solveCfg("cn"))
+		}()
+	}
+
+	// 等待全部进入求解状态（不持锁才能达到 n 个并发）
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		cur := concurrent
+		mu.Unlock()
+		if cur >= n || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	got := concurrent
+	mu.Unlock()
+	close(release)
+	wg.Wait()
+
+	if got != n {
+		t.Fatalf("Solve 应允许并发（期望 %d 个同时在求解，实际 %d）", n, got)
+	}
+}
+
+// 配置键变更时，在途求解不得被中止；旧池由最后一个归还者回收。
+func TestBrowserSolverConfigChangeDoesNotAbortInFlight(t *testing.T) {
+	s := NewBrowserSolver()
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	release := make(chan struct{})
+	var onceStart, onceFinish sync.Once
+
+	s.SetPoolFactory(func(Config) *Pool {
+		return newStartedFakePool(t, func(ctx context.Context) (Worker, error) {
+			return &blockingWorker{onSolve: func() {
+				// 同一 worker 会被池重复使用，只关心第一次
+				onceStart.Do(func() { close(started) })
+				<-release
+				onceFinish.Do(func() { close(finished) })
+			}}, nil
+		}, 1)
+	})
+
+	go func() {
+		_, _ = s.Solve(context.Background(), solveCfg("cn"))
+	}()
+	<-started
+
+	// 配置键变更：旧池有在途求解，应标记 retired 而非立即 Stop
+	_, _ = s.Solve(context.Background(), solveCfg("sgp"))
+
+	// 在途求解必须仍能正常完成（未被 Stop 中止）
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("在途求解被配置变更中止（应延迟关闭旧池）")
+	}
+
+	// 最后一个归还者应回收 retired 池
+	var retired *Pool
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.mu.Lock()
+		retired = s.retired
+		s.mu.Unlock()
+		if retired == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if retired != nil {
+		t.Fatal("在途求解归还后应回收 retired 池")
+	}
+}
+
+// blockingWorker 在 onSolve 中执行测试指定的阻塞逻辑，完成后返回固定令牌。
+type blockingWorker struct {
+	onSolve func()
+}
+
+func (w *blockingWorker) Solve(ctx context.Context) (string, error) {
+	if w.onSolve != nil {
+		w.onSolve()
+	}
+	return "token", nil
+}
+
+func (w *blockingWorker) Close() error { return nil }

@@ -53,8 +53,8 @@ var configURL = "https://zcode.z.ai/api/v1/client/configs"
 
 // Manager 令牌缓存 + 配置缓存 + 求解器编排。
 type Manager struct {
-	solver          Solver
-	configProvider  ConfigProvider
+	solver         Solver
+	configProvider ConfigProvider
 
 	mu            sync.Mutex
 	cached        *Token
@@ -175,9 +175,12 @@ func (m *Manager) GetVerifyParam(ctx context.Context) (*Token, error) {
 		return nil, nil
 	}
 
-	// 浏览器求解路径（M4）
-	if config.CaptchaBrowserEnabled && m.solver != nil {
-		param, err := m.solver.Solve(ctx, cfg)
+	// 浏览器求解路径
+	m.mu.Lock()
+	solver := m.solver
+	m.mu.Unlock()
+	if config.CaptchaBrowserEnabled && solver != nil {
+		param, err := solver.Solve(ctx, cfg)
 		if err != nil {
 			return nil, err
 		}
@@ -219,12 +222,15 @@ func (m *Manager) Invalidate() {
 	m.cachedTTL = 0
 }
 
-// Close 释放求解器资源（M4 浏览器池）。
+// Close 释放求解器资源（浏览器池）。
+// 求解器的 Close 可能阻塞（池关闭需等待 worker 收尾），故在锁外调用，
+// 避免阻塞并发的 GetVerifyParam。
 func (m *Manager) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.solver != nil {
-		return m.solver.Close()
+	s := m.solver
+	m.mu.Unlock()
+	if s != nil {
+		return s.Close()
 	}
 	return nil
 }

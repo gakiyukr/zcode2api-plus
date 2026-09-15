@@ -11,8 +11,8 @@ import (
 	"zcode2api" // 嵌入的前端构建产物（仓库根包，受 go:embed 目录约束）
 
 	"zcode2api/internal/adminapi"
-	"zcode2api/internal/auth"
 	"zcode2api/internal/asyncpool"
+	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
@@ -117,7 +117,7 @@ func printBanner(st *store.Store) {
 }
 
 // displayHost 横幅展示用主机：通配地址在浏览器中不可直接访问，显示 127.0.0.1
-//（对齐 Python _display_host）。
+// （对齐 Python _display_host）。
 func displayHost() string {
 	switch config.Host {
 	case "", "0.0.0.0", "::":

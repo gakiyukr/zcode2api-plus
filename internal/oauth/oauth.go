@@ -18,9 +18,9 @@ import (
 )
 
 const (
-	authorizeURL = "https://chat.z.ai/api/oauth/authorize"
-	tokenURL     = "https://zcode.z.ai/api/v1/oauth/token"
-	clientID     = "client_P8X5CMWmlaRO9gyO-KSqtg"
+	authorizeURL          = "https://chat.z.ai/api/oauth/authorize"
+	tokenURL              = "https://zcode.z.ai/api/v1/oauth/token"
+	clientID              = "client_P8X5CMWmlaRO9gyO-KSqtg"
 	registeredRedirectURI = "https://zcode.z.ai/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback"
 )
 

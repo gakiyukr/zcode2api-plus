@@ -106,7 +106,7 @@ var (
 // ── 用量监控 ────────────────────────────────────────────────────────────────
 var (
 	QuotaRefreshInterval = envInt("ZCODE_QUOTA_REFRESH_INTERVAL", 60) // 秒，0=关闭
-	CoolingSeconds       = envInt("ZCODE_COOLING_SECONDS", 300)  // 限流冷却（秒）
+	CoolingSeconds       = envInt("ZCODE_COOLING_SECONDS", 300)       // 限流冷却（秒）
 )
 
 // ── 上游端点 ────────────────────────────────────────────────────────────────
@@ -117,7 +117,7 @@ var (
 	// ZCode 计费 / 额度查询端点（不可配置，与官方客户端一致）。
 	ZcodeBillingBase = "https://zcode.z.ai/api/v1/zcode-plan"
 
-	ZcodeClientVersion  = env("ZCODE_CLIENT_VERSION", "3.7.7")
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.7.7")
 	// 与 Python 版保持一致的客户端平台标识；旧的 win32 参数已失效。
 	ZcodeClientPlatform = env("ZCODE_CLIENT_PLATFORM", "win32-x64")
 

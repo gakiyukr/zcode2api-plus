@@ -67,7 +67,7 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 		if !acc.IsSelectable(now) && acc.Status == model.StatusCooling {
 			out = append(out, map[string]any{
 				"account_id": acc.ID, "account_name": acc.Name, "plans": []any{},
-				"error": "賬號冷卻中（風控/限流），已跳過上游查詢",
+				"error":     "賬號冷卻中（風控/限流），已跳過上游查詢",
 				"activated": false, "activation_error": nil,
 			})
 			continue

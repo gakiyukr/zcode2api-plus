@@ -20,6 +20,7 @@ import (
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
+	"zcode2api/internal/web"
 )
 
 // QuotaCacheTTL 成功结果的复用窗口（对齐 _QUOTA_CACHE_TTL_SECONDS）。
@@ -200,15 +201,17 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 }
 
 // clientFor 返回账号出站客户端；配置了代理时走代理传输（20s 超时，短请求）。
-// 代理无效时回退直连并落 last_error 日志。
+// 代理无效时回退直连并记日志（对齐 claim 包的同名行为）。
 func (s *Service) clientFor(acc *model.Account) HTTPClient {
 	if s.Client != nil {
 		return s.Client
 	}
 	if acc != nil && acc.ProxyURL != nil && *acc.ProxyURL != "" {
-		if client, err := proxy.ClientFor(*acc.ProxyURL, 20*time.Second); err == nil {
+		client, err := proxy.ClientFor(*acc.ProxyURL, 20*time.Second)
+		if err == nil {
 			return client
 		}
+		web.Warn("quota", fmt.Sprintf("账号 %s 代理无效，回退直连: %v", acc.Name, err))
 	}
 	return &http.Client{Timeout: 20 * time.Second}
 }

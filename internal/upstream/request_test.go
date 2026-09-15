@@ -69,14 +69,14 @@ func TestBuildRequestNoCredentials(t *testing.T) {
 
 func TestClientHeadersFiltered(t *testing.T) {
 	incoming := map[string]string{
-		"Cookie":                          "session=1",
-		"Authorization":                   "Bearer client-key",
-		"X-ZCode-Agent":                   "spoof",
-		"x-zcode-app-version":             "9.9.9",
-		"x-aliyun-captcha-verify-param":   "client-token",
-		"X-Aliyun-Captcha-Verify-Region":  "client-region",
-		"Accept":                          "application/json",
-		"X-Custom-Trace":                  "keep-me",
+		"Cookie":                         "session=1",
+		"Authorization":                  "Bearer client-key",
+		"X-ZCode-Agent":                  "spoof",
+		"x-zcode-app-version":            "9.9.9",
+		"x-aliyun-captcha-verify-param":  "client-token",
+		"X-Aliyun-Captcha-Verify-Region": "client-region",
+		"Accept":                         "application/json",
+		"X-Custom-Trace":                 "keep-me",
 	}
 	req, err := BuildRequest(jwtAccount(), "server-token", "sgp", incoming)
 	if err != nil {

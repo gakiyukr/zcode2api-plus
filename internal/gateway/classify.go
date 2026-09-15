@@ -55,6 +55,13 @@ var quotaExhaustedCodes = map[string]bool{
 	"1316": true, "1317": true, "1318": true, "1319": true, "1320": true, "1321": true,
 }
 
+// IsQuotaExhaustedCode 判断上游业务码是否属于额度/用量上限族。
+// 429 响应须用本函数区分「该模型耗尽」（换号）与「瞬时限流」（冷却换号）；
+// asyncpool 与 engine 共用同一判定，避免两条路径对同一账号标出不同状态。
+func IsQuotaExhaustedCode(text string) bool {
+	return quotaExhaustedCodes[UpstreamBusinessCode(text)]
+}
+
 // captchaHeaders 上游用于携带验证码挑战的响应头。
 var captchaHeaders = []string{
 	"x-aliyun-captcha-verify-param",

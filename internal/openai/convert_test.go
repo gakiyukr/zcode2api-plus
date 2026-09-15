@@ -257,7 +257,9 @@ func TestNGreaterThanOneRejected(t *testing.T) {
 	}
 }
 
-func TestStreamOptionsIncludeUsageExtracted(t *testing.T) {
+func TestStreamOptionsIncludeUsageNotForwarded(t *testing.T) {
+	// include_usage 是 OpenAI 侧参数，Messages API 无对应字段：
+	// 不得出现在送上游的请求体（handler 从原始 body 读取）。
 	out := convertInput(t, map[string]any{
 		"model": "glm-5.3-flash", "messages": []any{}, "stream": true,
 		"stream_options": map[string]any{"include_usage": true},
@@ -265,8 +267,8 @@ func TestStreamOptionsIncludeUsageExtracted(t *testing.T) {
 	if out["stream"] != true {
 		t.Fatalf("stream 应透传: %v", out["stream"])
 	}
-	if out["include_usage"] != true {
-		t.Fatalf("include_usage 应提取到顶层: %v", out["include_usage"])
+	if _, leaked := out["include_usage"]; leaked {
+		t.Fatalf("include_usage 不应外泄到上游请求体: %v", out["include_usage"])
 	}
 }
 

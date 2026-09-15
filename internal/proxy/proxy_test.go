@@ -220,3 +220,74 @@ func TestSocks5RemoteResolveATYPDomain(t *testing.T) {
 		t.Fatalf("socks5h 应以域名 ATYP=0x03 发送，得到 %d", seenATYP)
 	}
 }
+
+// 本地解析得到 IPv6（或 IPv6 在首位）时，必须以 ATYP=0x04 发送，
+// 不得送出 addr 长度为 0 的畸形 CONNECT（IPv4 优先，找不到才用 IPv6）。
+func TestSocks5LocalResolveFallsBackToIPv6(t *testing.T) {
+	var seenATYP byte
+	var seenAddr []byte
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		head := make([]byte, 2)
+		if _, e := readFull(conn, head); e != nil {
+			return
+		}
+		methods := make([]byte, head[1])
+		if _, e := readFull(conn, methods); e != nil {
+			return
+		}
+		_, _ = conn.Write([]byte{0x05, 0x00})
+		req := make([]byte, 4)
+		if _, e := readFull(conn, req); e != nil {
+			return
+		}
+		seenATYP = req[3]
+		switch req[3] {
+		case 0x01:
+			seenAddr = make([]byte, 4)
+		case 0x04:
+			seenAddr = make([]byte, 16)
+		case 0x03:
+			n := make([]byte, 1)
+			_, _ = readFull(conn, n)
+			seenAddr = make([]byte, int(n[0]))
+		}
+		if _, e := readFull(conn, seenAddr); e != nil {
+			return
+		}
+		port := make([]byte, 2)
+		if _, e := readFull(conn, port); e != nil {
+			return
+		}
+		_, _ = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	}()
+
+	u, _ := url.Parse("socks5://" + ln.Addr().String())
+	conn, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// 用只解析出 IPv6 的主机名触发回退路径
+	if err := socks5Handshake(ctx, conn, u, "[::1]:80", false); err != nil {
+		t.Fatalf("IPv6 目标握手失败: %v", err)
+	}
+	if seenATYP != 0x04 {
+		t.Fatalf("IPv6 目标应以 ATYP=0x04 发送，得到 %d", seenATYP)
+	}
+	if len(seenAddr) != 16 {
+		t.Fatalf("ATYP=0x04 应带 16 字节地址，得到 %d", len(seenAddr))
+	}
+}

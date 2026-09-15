@@ -64,20 +64,20 @@ type Account struct {
 	Plans           []map[string]any          `json:"plans"` // 账号下全部订阅方案
 	Usage           map[string]any            `json:"usage"` // 近期用量原始数据
 
-	UseCount              int      `json:"use_count"`
-	FailCount             int      `json:"fail_count"`
-	TotalInputTokens      int      `json:"total_input_tokens"`
-	TotalOutputTokens     int      `json:"total_output_tokens"`
+	UseCount                 int      `json:"use_count"`
+	FailCount                int      `json:"fail_count"`
+	TotalInputTokens         int      `json:"total_input_tokens"`
+	TotalOutputTokens        int      `json:"total_output_tokens"`
 	TotalCacheCreationTokens int      `json:"total_cache_creation_tokens"`
-	TotalCacheReadTokens  int      `json:"total_cache_read_tokens"`
-	LastUsedAt            *float64 `json:"last_used_at"`
-	LastCheckedAt         *float64 `json:"last_checked_at"`
-	CoolingUntil          *float64 `json:"cooling_until"`
-	LastError             *string  `json:"last_error"`
-	ProxyURL              *string  `json:"proxy_url"`
-	ProxyID               *string  `json:"proxy_id"`
-	CreatedAt             float64  `json:"created_at"`
-	ArchivedAt            *float64 `json:"archived_at"` // 非空表示已归档：只保留记录，不参与调度/领取/刷新
+	TotalCacheReadTokens     int      `json:"total_cache_read_tokens"`
+	LastUsedAt               *float64 `json:"last_used_at"`
+	LastCheckedAt            *float64 `json:"last_checked_at"`
+	CoolingUntil             *float64 `json:"cooling_until"`
+	LastError                *string  `json:"last_error"`
+	ProxyURL                 *string  `json:"proxy_url"`
+	ProxyID                  *string  `json:"proxy_id"`
+	CreatedAt                float64  `json:"created_at"`
+	ArchivedAt               *float64 `json:"archived_at"` // 非空表示已归档：只保留记录，不参与调度/领取/刷新
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。

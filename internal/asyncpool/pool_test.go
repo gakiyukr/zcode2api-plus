@@ -27,10 +27,10 @@ import (
 // fakeSolver 依次返回预置令牌；tokens 耗尽时回退默认令牌（不关注
 // 验证码内容的用例可直接使用），err 非空时始终报错。
 type fakeSolver struct {
-	mu       sync.Mutex
-	tokens   []string
-	err      error
-	calls    int
+	mu     sync.Mutex
+	tokens []string
+	err    error
+	calls  int
 }
 
 func (s *fakeSolver) Solve(ctx context.Context, cfg captcha.Config) (string, error) {
@@ -442,6 +442,38 @@ func TestClientDisconnectReleasesTicket(t *testing.T) {
 	}
 }
 
+// 票务逾时必须显式投递终止事件，否则客户端只看到连接关闭，
+// 无法区分「已完成」与「被超时截断」。
+func TestTicketTimeoutEmitsErrorEvent(t *testing.T) {
+	p, _, _, _ := newTestPool(t)
+	old := config.AsyncTicketTimeout
+	config.AsyncTicketTimeout = 30 // 下限；用 createdAt 回拨触发立即逾时
+	t.Cleanup(func() { config.AsyncTicketTimeout = old })
+
+	tk := insertTicket(p, "ticket-timeout", map[string]any{"messages": []any{}})
+	tk.createdAt = time.Now().Add(-time.Duration(config.AsyncTicketTimeout+1) * time.Second)
+
+	var out []string
+	p.streamTicket(context.Background(), func(s string) error {
+		out = append(out, s)
+		return nil
+	}, "ticket-timeout")
+
+	if len(out) == 0 {
+		t.Fatal("逾时应至少投递 ticket 事件与终止事件")
+	}
+	last := out[len(out)-1]
+	if !strings.Contains(last, "event: error") || !strings.Contains(last, "ticket_timeout") {
+		t.Fatalf("逾时应投递 ticket_timeout 错误事件: %q", last)
+	}
+	p.mu.Lock()
+	remaining := len(p.tickets)
+	p.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("逾时后应释放票务: %d", remaining)
+	}
+}
+
 func TestReleaseTicketIgnoresUnknownIDAndFinishedTask(t *testing.T) {
 	// 未知 id 與已結束任務都應安全跳過。
 	p, _, _, _ := newTestPool(t)
@@ -469,7 +501,7 @@ func TestSweepRemovesExpiredOrphansAndKeepsFresh(t *testing.T) {
 		status: "pending",
 		queue:  make(chan ticketEvent, 1),
 		createdAt: time.Now().Add(-time.Duration(config.AsyncTicketTimeout)*time.Second -
-			120 * time.Second),
+			120*time.Second),
 	}
 	p.mu.Lock()
 	p.tickets["ticket-stale"] = stale
@@ -498,7 +530,7 @@ func TestNewTicketSweepsOrphans(t *testing.T) {
 		status: "pending",
 		queue:  make(chan ticketEvent, 1),
 		createdAt: time.Now().Add(-time.Duration(config.AsyncTicketTimeout)*time.Second -
-			120 * time.Second),
+			120*time.Second),
 	}
 	p.mu.Lock()
 	p.tickets["ticket-stale"] = stale
@@ -669,4 +701,74 @@ func TestSSEJSONEscapesNonASCII(t *testing.T) {
 	if !strings.Contains(got, "<a>&</a>") {
 		t.Fatalf("HTML 字符不应转义: %s", got)
 	}
+}
+
+// async 路径必须与 engine 用同一套分类：429 的额度上限码族标「该模型耗尽」，
+// 而非一律标 cooling（曾因两条路径各自实现而分歧）。
+func TestQuotaExhaustedCodeMarksModelNotCooling(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "quota-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusTooManyRequests, body: `{"code":1310,"msg":"weekly limit"}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-quota", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-quota")
+
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status == model.StatusCooling {
+		t.Fatalf("额度上限码族不应标 cooling（应与 engine 一致）: %s", acc.Status)
+	}
+	if !containsStr(acc.ExhaustedModels, "glm-5.3") {
+		t.Fatalf("应标记该模型耗尽（正規化為小寫）: %v", acc.ExhaustedModels)
+	}
+}
+
+// 401 应标 invalid（账号失效），不得落入冷却分支。
+func TestUnauthorizedMarksInvalid(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "bad-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusUnauthorized, body: ""},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-401", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-401")
+
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status != model.StatusInvalid {
+		t.Fatalf("401 应标 invalid: %s", acc.Status)
+	}
+}
+
+// 3010 并发准入限制：账号仍可用，不得标 cooling 或 invalid。
+func TestConcurrencyLimitKeepsAccountState(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "busy-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusTooManyRequests, body: `{"code":3010,"msg":"model admission concurrency limit"}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-3010", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-3010")
+
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status != model.StatusActive {
+		t.Fatalf("3010 不应改变账号状态（当前 %s）", acc.Status)
+	}
+}
+
+func containsStr(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }

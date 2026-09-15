@@ -178,3 +178,72 @@ func TestEnsureRejectsBadSignature(t *testing.T) {
 		t.Fatal("失败时不应安装目录")
 	}
 }
+
+// macOS 的 Chromium.app bundle 以符号链接组织 Framework：
+// 解包必须保留 symlink，否则解出的安装不可用。
+func TestExtractTarGzPreservesSymlink(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	entries := []struct {
+		hdr  *tar.Header
+		body string
+	}{
+		{&tar.Header{Name: "Chromium.app/Contents/MacOS/", Typeflag: tar.TypeDir, Mode: 0o755}, ""},
+		{&tar.Header{Name: "Chromium.app/Contents/MacOS/Chromium", Mode: 0o755, Size: 4}, "bin\n"},
+		{&tar.Header{Name: "Chromium.app/Contents/MacOS/Current", Typeflag: tar.TypeSymlink, Linkname: "Chromium", Mode: 0o777}, ""},
+	}
+	for _, e := range entries {
+		if err := tw.WriteHeader(e.hdr); err != nil {
+			t.Fatal(err)
+		}
+		if e.body != "" {
+			if _, err := tw.Write([]byte(e.body)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := t.TempDir()
+	if err := extractTarGz(buf.Bytes(), dest); err != nil {
+		t.Fatalf("解包失败: %v", err)
+	}
+	link := filepath.Join(dest, "Chromium.app", "Contents", "MacOS", "Current")
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("符号链接应存在: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("应保留为符号链接而非普通文件: %v", info.Mode())
+	}
+	if target, _ := os.Readlink(link); target != "Chromium" {
+		t.Fatalf("链接目标不符: %q", target)
+	}
+}
+
+// 逃逸解包目录的符号链接必须被拒绝（压缩包投毒防护）。
+func TestExtractTarGzRejectsEscapingSymlink(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	hdr := &tar.Header{Name: "evil", Typeflag: tar.TypeSymlink, Linkname: "../../etc/passwd", Mode: 0o777}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := extractTarGz(buf.Bytes(), t.TempDir()); err == nil {
+		t.Fatal("逃逸目录的符号链接应被拒绝")
+	}
+}

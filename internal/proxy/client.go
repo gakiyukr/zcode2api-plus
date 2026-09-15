@@ -185,7 +185,22 @@ func socks5Handshake(ctx context.Context, conn net.Conn, u *url.URL, addr string
 		if rerr != nil || len(resolved) == 0 {
 			return fmt.Errorf("本地解析失败: %v", rerr)
 		}
-		atyp, hostBytes = 0x01, resolved[0].IP.To4()
+		// 优先 IPv4；解析结果可能只有 IPv6（或 IPv6 排在首位），
+		// 此时必须用 ATYP=0x04，否则会送出 addr 长度为 0 的畸形 CONNECT。
+		atyp, hostBytes = 0, nil
+		for _, r := range resolved {
+			if v4 := r.IP.To4(); v4 != nil {
+				atyp, hostBytes = 0x01, v4
+				break
+			}
+		}
+		if atyp == 0 {
+			if v6 := resolved[0].IP.To16(); v6 != nil {
+				atyp, hostBytes = 0x04, v6
+			} else {
+				return fmt.Errorf("本地解析结果不可用: %s", host)
+			}
+		}
 	} else {
 		// ATYP=0x03 后需带 1 字节域名长度（RFC 1928）
 		atyp = 0x03

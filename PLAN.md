@@ -349,29 +349,37 @@ meta(key TEXT PK, value TEXT)
 - [x] **验收**：单测覆盖业务码映射与 3007 换码重试语义（claim_test.go 8 组）
 - [ ] **验收**：真机领取一次成功（billing/preview + claim + 激活上报全链路）
 
-### M9 已知缺陷修复（代码审查发现，待排期）
-以下为 2026-09-15 代码审查确认的行为问题，**不阻塞真机验收**，但应在正式发布前处理：
+### M9 已知缺陷修复（2026-09-15 完成，仅剩 1 项待评估）
+以下为代码审查确认的行为问题，**已全部修复**（每项附回归测试）：
 
-- [ ] `asyncpool` 错误分类与 engine 分歧：429 一律标 `Cooling`（不区分 `quotaExhaustedCodes`
-  额度码族），且不处理 3010 并发准入、`1005`、402；同账号在两条路径下状态标记不一致 —
-  `internal/asyncpool/pool.go:420-430`
-- [ ] `BrowserSolver.Solve` 持锁跨 `pool.Solve`（`browser_solver.go:75-86`），使
-  `ZCODE_CAPTCHA_BROWSER_WORKERS>1` 形同虚设（实效并发上限恒为 1），且 45s 求解期间其他调用者全阻塞
-- [ ] async ticket 逾时到期不投递任何终止事件（`pool.go:147`），客户端只看到连接断开
-- [ ] `openai.ConvertRequest` 把 `include_usage` 写入送上游的 Anthropic 请求体
-  （`convert.go:62`），上游无此顶层参数
-- [ ] `responses_stream` 的 `output_item.added` 与 `arguments.delta` 的 `item_id` 不一致
-  （`responses_stream.go:128` vs `:168`）
-- [ ] socks5 本地解析取 `resolved[0].IP.To4()`，首个结果为 IPv6 时仍以 ATYP=0x01 送出
-  （`proxy/client.go:188`）
-- [ ] `browserdl.extractTarGz` 无 symlink 分支（`browserdl.go:295-315`），darwin 的
-  Chromium.app bundle 可能解出不可用安装
-- [ ] `quota` 代理回退无日志（`quota.go:204-214`，对比 `claim.go:74` 有 `web.Warn`）
-- [ ] 后台限速以 `RemoteAddr` 为键、不信任 `X-Forwarded-For`（`auth.go:129-135`），
-  部署在反向代理后所有客户端共用同一失败桶
-- [ ] `go.mod` 将 `go-rod/rod` 标为 `// indirect` 但实际直接 import（`solve.go:27`）；
-  `go mod tidy` 会改写
-- [ ] `gofmt` 未覆盖：20/62 个 Go 档存在格式差异（import 排序、struct 字段对齐、注释 `//（` 缺空格）
+- [x] `asyncpool` 错误分类与 engine 分歧 → 抽出 `gateway.MarkAccount` / `MarkModelExhausted` /
+  `IsQuotaExhaustedCode` 共用，asyncpool 现按同一顺序分类 401/402/3010/429 码族/503；
+  新增 `TestQuotaExhaustedCodeMarksModelNotCooling`、`TestUnauthorizedMarksInvalid`、
+  `TestConcurrencyLimitKeepsAccountState`
+- [x] `BrowserSolver.Solve` 持锁跨 `pool.Solve` → 锁只保护池的选取与重建，求解在锁外执行；
+  配置变更时以 `retired` 标记延迟关闭旧池，避免中止在途求解；
+  新增 `TestBrowserSolverConcurrentSolvesDoNotSerialize`（验证 n 路并发）、
+  `TestBrowserSolverConfigChangeDoesNotAbortInFlight`
+- [x] async ticket 逾时不投递终止事件 → 补发 `ticket_timeout` 错误事件；
+  新增 `TestTicketTimeoutEmitsErrorEvent`
+- [x] `include_usage` 外泄到上游 → 不再写入上游请求体，handler 改从原始 OpenAI 请求读取；
+  测试改为 `TestStreamOptionsIncludeUsageNotForwarded`
+- [x] `responses_stream` 的 `item_id` 不一致 → 统一取 function_call item 的 id；
+  `TestResponsesStreamEvents` 增加 id 一致性断言
+- [x] socks5 IPv6 回退 → 本地解析优先 IPv4，仅有 IPv6 时以 ATYP=0x04 发送；
+  新增 `TestSocks5LocalResolveFallsBackToIPv6`
+- [x] `browserdl.extractTarGz` 无 symlink 分支 → 支持 `TypeSymlink`（限制链接目标在解包目录内）
+  与 `TypeLink`，未知类型记日志而非静默丢弃；新增 `TestExtractTarGzPreservesSymlink`、
+  `TestExtractTarGzRejectsEscapingSymlink`
+- [x] `quota` 代理回退无日志 → 补 `web.Warn`
+- [x] `go.mod` 将 `go-rod/rod` 标为 indirect → `go mod tidy` 修正，并补齐 go.sum 缺失条目
+- [x] `gofmt` 未覆盖 → 全部 62 个 Go 档已格式化
+
+**待评估（未修改）**：
+- [ ] 后台限速以 `RemoteAddr` 为键、不信任 `X-Forwarded-For`（`auth.go:129-135`）。
+  这是**刻意的安全取舍**（信任 `X-Forwarded-For` 会让攻击者伪造头绕过限速），
+  已在 README 与 `deploy/README.md` 说明「建议后台仅绑定内网」；
+  若确需反代支持，应改为显式配置可信代理列表，而非无条件信任该头。
 
 ## 7. 测试策略
 

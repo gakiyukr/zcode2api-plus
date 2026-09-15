@@ -9,6 +9,7 @@
 //     迟到的求解结果只会被丢弃，绝不投递给后续请求（杜绝响应错位）。
 //   - 失败分类：worker 明确报错视为求解失败（worker 仍健康，复用页面）；
 //     ErrWorkerDead（浏览器退出/崩溃）触发替换。
+//
 // 重试与缓存属于 Manager（调用方）职责，池不代劳。
 package captcha
 
@@ -142,7 +143,7 @@ type Pool struct {
 }
 
 // NewPool 创建池；size < 1 或 factory 为 nil 属编程错误，直接 panic
-//（对齐 Python 的 ValueError）。超时参数默认取 config 的验证码池配置。
+// （对齐 Python 的 ValueError）。超时参数默认取 config 的验证码池配置。
 func NewPool(factory WorkerFactory, size int) *Pool {
 	if factory == nil {
 		panic("captcha: factory 不能为空")
@@ -151,8 +152,8 @@ func NewPool(factory WorkerFactory, size int) *Pool {
 		panic("captcha: size 必须 >= 1")
 	}
 	return &Pool{
-		factory: factory,
-		size:    size,
+		factory:         factory,
+		size:            size,
 		startupTimeout:  time.Duration(config.CaptchaBrowserStartupTimeout) * time.Second,
 		requestTimeout:  time.Duration(config.CaptchaBrowserRequestTimeout) * time.Second,
 		queueTimeout:    time.Duration(config.CaptchaBrowserQueueTimeout) * time.Second,
@@ -181,7 +182,7 @@ func (p *Pool) StatsSnapshot() Stats {
 }
 
 // Start 启动全部槽位，并在启动总超时内等待全部就绪；重复调用为无害空操作
-//（对齐 Python：started 或 loops 存在时直接返回）。
+// （对齐 Python：started 或 loops 存在时直接返回）。
 func (p *Pool) Start() error {
 	p.mu.Lock()
 	if p.started || p.cur != nil {
@@ -518,7 +519,7 @@ func (p *Pool) sleepRestart(g *generation) bool {
 }
 
 // closeWorker 异步关闭 worker；Close 阻塞超过看门狗时限即放弃等待
-//（残留浏览器进程由 leakless/进程退出兜底）。
+// （残留浏览器进程由 leakless/进程退出兜底）。
 func (p *Pool) closeWorker(w Worker) {
 	go func() {
 		done := make(chan struct{})
@@ -538,8 +539,8 @@ func (p *Pool) closeWorker(w Worker) {
 
 // ── 统计（写路径持锁，读路径走 StatsSnapshot）────────────────────────────────
 
-func (p *Pool) countRequest()       { p.mu.Lock(); p.stats.Requests++; p.mu.Unlock() }
-func (p *Pool) countTimeout()       { p.mu.Lock(); p.stats.Timeouts++; p.mu.Unlock() }
-func (p *Pool) countSolveFailure()  { p.mu.Lock(); p.stats.SolverFailures++; p.mu.Unlock() }
-func (p *Pool) countRestart()       { p.mu.Lock(); p.stats.WorkerRestarts++; p.mu.Unlock() }
-func (p *Pool) countDiscarded()     { p.mu.Lock(); p.stats.DiscardedResults++; p.mu.Unlock() }
+func (p *Pool) countRequest()      { p.mu.Lock(); p.stats.Requests++; p.mu.Unlock() }
+func (p *Pool) countTimeout()      { p.mu.Lock(); p.stats.Timeouts++; p.mu.Unlock() }
+func (p *Pool) countSolveFailure() { p.mu.Lock(); p.stats.SolverFailures++; p.mu.Unlock() }
+func (p *Pool) countRestart()      { p.mu.Lock(); p.stats.WorkerRestarts++; p.mu.Unlock() }
+func (p *Pool) countDiscarded()    { p.mu.Lock(); p.stats.DiscardedResults++; p.mu.Unlock() }

@@ -39,9 +39,9 @@ type fixture struct {
 	cm       *captcha.Manager
 	eng      *Engine
 
-	mu       sync.Mutex
-	calls    []upstreamCall
-	respond  responder
+	mu      sync.Mutex
+	calls   []upstreamCall
+	respond responder
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -140,9 +140,9 @@ func (f *fixture) post(t *testing.T, body map[string]any, key string) (int, stri
 
 func msgBody() map[string]any {
 	return map[string]any{
-		"model":     "GLM-5.3",
+		"model":      "GLM-5.3",
 		"max_tokens": 8,
-		"messages":  []any{map[string]any{"role": "user", "content": "hi"}},
+		"messages":   []any{map[string]any{"role": "user", "content": "hi"}},
 	}
 }
 
@@ -458,9 +458,9 @@ func TestModelsEndpoint(t *testing.T) {
 	var payload struct {
 		Object string `json:"object"`
 		Data   []struct {
-			ID           string `json:"id"`
-			Type         string `json:"type"`
-			DisplayName  string `json:"display_name"`
+			ID          string `json:"id"`
+			Type        string `json:"type"`
+			DisplayName string `json:"display_name"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {

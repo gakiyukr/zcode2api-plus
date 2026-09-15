@@ -60,7 +60,11 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	gateway.NormalizeBody(anthropicReq, false)
 
 	stream, _ := body["stream"].(bool)
-	includeUsage, _ := anthropicReq["include_usage"].(bool)
+	// include_usage 取自 OpenAI 原始请求（Messages API 无此字段，不转发上游）
+	includeUsage := false
+	if opts, ok := body["stream_options"].(map[string]any); ok {
+		includeUsage, _ = opts["include_usage"].(bool)
+	}
 
 	result := h.Engine.RunMessages(r.Context(), anthropicReq, gateway.IncomingHeaders(r),
 		func(d gateway.Delivery) error {

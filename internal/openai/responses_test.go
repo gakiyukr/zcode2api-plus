@@ -11,9 +11,9 @@ import (
 
 func TestResponsesConvertStringInput(t *testing.T) {
 	got, err := ConvertResponsesRequest(map[string]any{
-		"model":            "glm-5.3-flash",
-		"instructions":     "你是助手",
-		"input":            "你好",
+		"model":             "glm-5.3-flash",
+		"instructions":      "你是助手",
+		"input":             "你好",
 		"max_output_tokens": float64(512),
 	})
 	if err != nil {
@@ -196,6 +196,31 @@ func TestResponsesStreamEvents(t *testing.T) {
 	usage, _ := resp["usage"].(map[string]any)
 	if usage["input_tokens"] != float64(4) || usage["output_tokens"] != float64(2) {
 		t.Fatalf("completed usage 不符: %v", usage)
+	}
+
+	// output_item.added 与 function_call_arguments.delta 必须用同一个 item_id，
+	// 否则客户端无法把参数增量关联到对应工具调用。
+	var addedID, deltaID string
+	for _, ev := range events {
+		data := strings.TrimPrefix(strings.SplitN(ev, "\n", 2)[1], "data: ")
+		var obj map[string]any
+		if json.Unmarshal([]byte(data), &obj) != nil {
+			continue
+		}
+		switch {
+		case strings.Contains(ev, "response.output_item.added"):
+			if item, ok := obj["item"].(map[string]any); ok {
+				addedID = stringOf(item["id"])
+			}
+		case strings.Contains(ev, "response.function_call_arguments.delta"):
+			deltaID = stringOf(obj["item_id"])
+		}
+	}
+	if addedID == "" || deltaID == "" {
+		t.Fatalf("未捕获到 item id: added=%q delta=%q", addedID, deltaID)
+	}
+	if addedID != deltaID {
+		t.Fatalf("item_id 必须一致: added=%q delta=%q", addedID, deltaID)
 	}
 }
 

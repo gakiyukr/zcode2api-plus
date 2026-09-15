@@ -323,7 +323,7 @@ func (e *Engine) handleUpstreamError(
 			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
 			e.fireRefresh(acc)
 		} else {
-			e.mark(acc, model.StatusCooling, "上游限流 429")
+			e.mark(acc, model.StatusCooling, "上游限流 HTTP 429")
 			web.Warn(reqID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
 		}
 		return attemptResult{switchAccount: true}
@@ -438,21 +438,27 @@ func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCo
 }
 
 // ── 账号状态标记（对齐 Python 版 _mark / _mark_model_exhausted）──────────────
+//
+// MarkAccount / MarkModelExhausted 同时导出，供 asyncpool 复用同一套状态机；
+// 两条请求路径对同一账号必须标出相同状态（曾因 asyncpool 自行实现而分歧）。
 
-func (e *Engine) mark(acc *model.Account, status, errMsg string) {
+// MarkAccount 设置账号状态；status 为 cooling 时按配置写入冷却截止时间。
+func MarkAccount(st *store.Store, acc *model.Account, status, errMsg string, now time.Time) {
 	acc.Status = status
 	acc.LastError = &errMsg
 	if status == model.StatusCooling {
-		until := float64(e.now().Add(time.Duration(config.CoolingSeconds) * time.Second).UnixNano()) / 1e9
+		until := float64(now.Add(time.Duration(config.CoolingSeconds)*time.Second).UnixNano()) / 1e9
 		acc.CoolingUntil = &until
 	}
-	_ = e.Store.UpdateAccount(acc)
+	_ = st.UpdateAccount(acc)
 }
 
-// markModelExhausted 只停用已耗尽的请求模型；所有已知模型皆耗尽时才停用整号。
-func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg string) {
+// MarkModelExhausted 只停用已耗尽的请求模型；所有已知模型皆耗尽时才停用整号。
+func MarkModelExhausted(st *store.Store, acc *model.Account, modelName any, errMsg string) {
 	if !acc.MarkModelExhausted(modelName) {
-		e.mark(acc, model.StatusExhausted, errMsg)
+		acc.Status = model.StatusExhausted
+		acc.LastError = &errMsg
+		_ = st.UpdateAccount(acc)
 		return
 	}
 	anyState := false
@@ -475,11 +481,19 @@ func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg st
 	}
 	acc.CoolingUntil = nil
 	acc.LastError = &errMsg
-	_ = e.Store.UpdateAccount(acc)
+	_ = st.UpdateAccount(acc)
+}
+
+func (e *Engine) mark(acc *model.Account, status, errMsg string) {
+	MarkAccount(e.Store, acc, status, errMsg, e.now())
+}
+
+func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg string) {
+	MarkModelExhausted(e.Store, acc, modelName, errMsg)
 }
 
 // success 记录成功调用的账号状态；并异步触发一次额度刷新
-//（对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
+// （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
 func (e *Engine) success(acc *model.Account) {
 	acc.UseCount++
 	ts := float64(e.now().UnixNano()) / 1e9

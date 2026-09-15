@@ -312,6 +312,36 @@ func extractTarGz(archive []byte, dest string) error {
 			if err := writeExecFile(target, tr, mode); err != nil {
 				return err
 			}
+		case tar.TypeSymlink:
+			// macOS 的 Chromium.app bundle 以符号链接组织 Framework；
+			// 丢弃它们会解出不可用的安装。链接目标须留在解包目录内。
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			link := filepath.Clean(hdr.Linkname)
+			if filepath.IsAbs(link) || strings.HasPrefix(link, "..") {
+				return fmt.Errorf("压缩包含非法符号链接: %s -> %s", hdr.Name, hdr.Linkname)
+			}
+			_ = os.Remove(target) // 覆盖既有条目（重复解包时）
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				return fmt.Errorf("创建符号链接失败 %s: %w", hdr.Name, err)
+			}
+		case tar.TypeLink:
+			// 硬链接：解包内相对路径，直接复制内容而非建链（跨设备安全）
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			src := filepath.Join(dest, filepath.Clean(hdr.Linkname))
+			data, err := os.ReadFile(src)
+			if err != nil {
+				return fmt.Errorf("硬链接源不可读 %s: %w", hdr.Name, err)
+			}
+			if err := os.WriteFile(target, data, 0o644); err != nil {
+				return err
+			}
+		default:
+			// 其余类型（FIFO、设备节点等）不应出现在发行包中，记录而非静默丢弃
+			web.Warn("captcha", fmt.Sprintf("压缩包含忽略的条目类型 %d: %s", hdr.Typeflag, hdr.Name))
 		}
 	}
 }

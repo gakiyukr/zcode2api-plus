@@ -7,11 +7,13 @@ go 1.25.0
 //   M4: github.com/go-rod/rod     （验证码求解，驱动 cloakbrowser 下载的 Chromium）
 //   可选: github.com/joho/godotenv （.env 加载；也可自写约 30 行替代）
 
-require modernc.org/sqlite v1.58.0
+require (
+	github.com/go-rod/rod v0.116.2
+	modernc.org/sqlite v1.58.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/go-rod/rod v0.116.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect

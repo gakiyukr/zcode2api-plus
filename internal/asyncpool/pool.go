@@ -175,6 +175,12 @@ func (p *Pool) streamTicket(ctx context.Context, write func(string) error, ticke
 			}
 		}
 	}
+	// 逾时：必须显式投递终止事件，否则客户端只看到连接关闭而无法区分
+	// 「已完成」与「被超时截断」（defer releaseTicket 会中止后台任务）。
+	_ = send("error", sseJSON(map[string]any{"error": map[string]any{
+		"message": fmt.Sprintf("请求超时（%d 秒未完成）", config.AsyncTicketTimeout),
+		"type":    "ticket_timeout",
+	}}))
 }
 
 // ── 票务生命周期 ────────────────────────────────────────────────────────────
@@ -313,7 +319,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				announcedReady = true
 			}
 
-			midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, req, payload)
+			midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, modelName, req, payload)
 			if midStream {
 				// 已向客户端发出内容块，不能换号重发（会收到重复事件），终止本票
 				web.Warn(ticketID, fmt.Sprintf("流转发中断: %s", streamErr.Error()))
@@ -389,6 +395,7 @@ func (p *Pool) attemptUpstream(
 	ctx context.Context,
 	ticketID string,
 	acc *model.Account,
+	modelName string,
 	req upstream.Request,
 	payload []byte,
 ) (bool, error) {
@@ -413,24 +420,61 @@ func (p *Pool) attemptUpstream(
 		}
 		bodyText := string(text)
 
+		// 分类顺序与 engine.handleUpstreamError 一致（PLAN §5.2），
+		// 同一账号在两条路径下必须标出相同状态。
 		if gateway.IsCaptchaError(bodyText, resp.StatusCode, resp.Header) {
 			// 验证码被拒：令牌作废，由调用方在内层循环内换令牌重试
 			p.Captcha.Invalidate()
 			return false, errCaptchaRejected
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		// 401/403 → 账号失效，换号
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			gateway.MarkAccount(p.Store, acc, model.StatusInvalid,
+				fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode), time.Now())
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
+			return false, errNetwork{bodyText}
+		}
+
+		// 402 → 该模型额度用完
+		if resp.StatusCode == http.StatusPaymentRequired {
+			gateway.MarkModelExhausted(p.Store, acc, modelName,
+				fmt.Sprintf("%s 額度已用完", orCurrent(modelName)))
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+			return false, errNetwork{bodyText}
+		}
+
+		// 429 且 code=3010：模型并发准入限制，账号仍可用，不标状态
+		if gateway.IsModelConcurrencyLimit(resp.StatusCode, bodyText) {
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 模型并发准入受限，保留账号状态", acc.Name))
+			return false, errNetwork{bodyText}
+		}
+
+		// 429：额度上限码族 → 该模型耗尽；其余瞬时限流 → 冷却
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if gateway.IsQuotaExhaustedCode(bodyText) {
+				gateway.MarkModelExhausted(p.Store, acc, modelName,
+					fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
+			} else {
+				gateway.MarkAccount(p.Store, acc, model.StatusCooling, "上游限流 HTTP 429", time.Now())
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
+			}
+			return false, errNetwork{bodyText}
+		}
+
+		// 503 → 冷却换号
+		if resp.StatusCode == http.StatusServiceUnavailable {
 			acc.FailCount++
-			until := float64(time.Now().Add(time.Duration(config.CoolingSeconds) * time.Second).UnixNano()) / 1e9
-			acc.Status = model.StatusCooling
-			acc.CoolingUntil = &until
-			msg := fmt.Sprintf("上游服務暫時不可用 HTTP %d", resp.StatusCode)
-			acc.LastError = &msg
-			_ = p.Store.UpdateAccount(acc)
+			gateway.MarkAccount(p.Store, acc, model.StatusCooling,
+				"上游服務不可用 HTTP 503", time.Now())
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
 			return false, errNetwork{bodyText}
 		}
 
 		// 其余错误：原样回传上游错误体，终止本票
+		acc.FailCount++
+		_ = p.Store.UpdateAccount(acc)
 		p.emit(ctx, ticketID, ticketEvent{
 			Type: "error",
 			Data: map[string]any{"error": map[string]any{"message": bodyText, "type": "upstream_error"}},
@@ -444,6 +488,14 @@ func (p *Pool) attemptUpstream(
 
 // errCaptchaRejected 上游拒绝验证码：调用方在内层循环内换令牌重试（不换号）。
 var errCaptchaRejected = errors.New("上游拒绝验证码")
+
+// orCurrent 模型名为空时的占位文案（与 gateway 同语义）。
+func orCurrent(modelName string) string {
+	if modelName == "" {
+		return "當前模型"
+	}
+	return modelName
+}
 
 // errDelivered 非 200 错误体已作为 error 事件投递给客户端，任务直接结束。
 var errDelivered = errors.New("已投递错误事件")

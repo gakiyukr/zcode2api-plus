@@ -52,7 +52,7 @@ func TestConvertResponseText(t *testing.T) {
 func TestConvertResponseToolUse(t *testing.T) {
 	payload := map[string]any{
 		"id": "msg_02", "model": "GLM-5.3", "stop_reason": "tool_use",
-		"role": "assistant",
+		"role":  "assistant",
 		"usage": map[string]any{"input_tokens": 8, "output_tokens": 4},
 		"content": []any{
 			map[string]any{"type": "tool_use", "id": "call_9", "name": "get_weather",
@@ -94,10 +94,10 @@ func TestStopReasonMappings(t *testing.T) {
 func TestUsageMappingSumsCacheIntoPrompt(t *testing.T) {
 	// prompt_tokens = input + cache_read + cache_creation；缓存细节进 details
 	usage := mapUsage(map[string]any{
-		"input_tokens":                  float64(10),
-		"output_tokens":                 float64(5),
-		"cache_read_input_tokens":       float64(3),
-		"cache_creation_input_tokens":   float64(2),
+		"input_tokens":                float64(10),
+		"output_tokens":               float64(5),
+		"cache_read_input_tokens":     float64(3),
+		"cache_creation_input_tokens": float64(2),
 	})
 	if usage["prompt_tokens"] != float64(15) {
 		t.Fatalf("prompt_tokens 应含缓存两系: %v", usage["prompt_tokens"])

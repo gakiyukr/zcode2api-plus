@@ -159,13 +159,17 @@ func (e *responsesEncoder) onContentBlockDelta(payload map[string]any) error {
 		if partial == "" {
 			return nil
 		}
+		itemID := ""
 		if len(e.functionCalls) > 0 {
 			if item, ok := e.functionCalls[len(e.functionCalls)-1].(map[string]any); ok {
 				item["arguments"] = stringOf(item["arguments"]) + partial
+				// item_id 必须与 output_item.added 一致（同一 function_call item），
+				// 否则客户端无法把增量关联到对应工具调用。
+				itemID = stringOf(item["id"])
 			}
 		}
 		return e.emit("response.function_call_arguments.delta", map[string]any{
-			"item_id": "fc_" + stringOf(payload["index"]),
+			"item_id": itemID,
 			"delta":   partial,
 		})
 	default:
@@ -180,9 +184,9 @@ func (e *responsesEncoder) onMessageStop() error {
 	e.finished = true
 	// 组装完整 output：message item 在前、function_call items 在后
 	messageItem := map[string]any{
-		"type": "message",
-		"id":   "msg_" + e.respID,
-		"role": "assistant",
+		"type":   "message",
+		"id":     "msg_" + e.respID,
+		"role":   "assistant",
 		"status": "completed",
 		"content": []any{map[string]any{
 			"type":        "output_text",

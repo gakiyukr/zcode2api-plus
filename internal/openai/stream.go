@@ -57,13 +57,13 @@ func reencodeSSE(body io.Reader, includeUsage bool, write func(string) error) er
 type sseEncoder struct {
 	write func(string) error
 
-	id             string
-	model          string
-	toolIndexes    map[int]float64 // Anthropic block index → OpenAI tool_calls index
-	toolCount      float64
-	inputUsage     map[string]any // message_start 的 usage（input 系）
-	outputUsage    map[string]any // message_delta 的 usage（output）
-	includeUsage   bool
+	id           string
+	model        string
+	toolIndexes  map[int]float64 // Anthropic block index → OpenAI tool_calls index
+	toolCount    float64
+	inputUsage   map[string]any // message_start 的 usage（input 系）
+	outputUsage  map[string]any // message_delta 的 usage（output）
+	includeUsage bool
 }
 
 // dispatch 分发一个已解析的上游事件。

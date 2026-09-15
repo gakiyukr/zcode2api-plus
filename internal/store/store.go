@@ -763,9 +763,9 @@ type exportAccount struct {
 
 // ExportPayload 导出格式（version 1，与 Python 版一致）。
 type ExportPayload struct {
-	Version    int                          `json:"version"`
-	ExportedAt float64                      `json:"exported_at"`
-	Providers  map[string][]exportAccount   `json:"providers"`
+	Version    int                        `json:"version"`
+	ExportedAt float64                    `json:"exported_at"`
+	Providers  map[string][]exportAccount `json:"providers"`
 }
 
 // Export 导出全部账号（含明文凭证，仅用于备份/迁移）。
