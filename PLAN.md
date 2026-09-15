@@ -434,25 +434,31 @@ Previous read at ... by goroutine 11:
 （把 `Select` 改回 `return acc`）下 `TestSelectAndMutateConcurrently` 立刻报
 `DATA RACE`，确认该测试真能抓住此缺陷而非偶然通过。
 
-### M11 缺陷审查发现（2026-09-15，待排期）
+### M11 缺陷审查发现（2026-09-15）
 
 一次针对 Store 指针重构的三路审查（store 并发契约 / 网关主路径 / async 池与后台 API），
-除已修复的项外，确认以下**既存缺陷**（均早于本次重构，非其引入）。按后果排序：
+确认以下**既存缺陷**（均早于该重构，非其引入）。按后果排序，前两项已修复。
 
-**高**
+**高（均已修复）**
 
-1. **客户端中断被误判为上游连接失败** — `internal/gateway/engine.go:205-210`
-   `Do` 返回的 `err` 不分来源一律标 `cooling`。`handler.go:56` 把 `r.Context()` 交给引擎，
+1. ~~**客户端中断被误判为上游连接失败**~~ — 已修复（446359a）
+   `Do` 返回的 `err` 曾不分来源一律标 `cooling`。`handler.go:56` 把 `r.Context()` 交给引擎，
    客户端断线时 ctx 立即取消，后续每轮 `Select`→`Do` 都立即失败，会把最多
    `MaxAccountAttempts=5` 个账号各标一次冷却（默认 300s）并落库。账号池小的部署
-   几次中断即全池冷却，全部请求收到 503。修法：`err` 为 `context.Canceled`/`DeadlineExceeded`
-   时不标状态、直接终止（async 池 `pool.go:346-348` 已有正确做法）。
+   几次中断即全池冷却，全部请求收到 503。
+   现以 `isCanceled` 区分取消与真实传输失败：ctx 已结束或错误包裹
+   `context.Canceled`/`DeadlineExceeded` 时终止重试且不写任何账号状态；
+   `handleUpstreamError` 中 `io.ReadAll` 因取消而失败的同一误判也一并修正。
+   回归测试 `TestClientCancelDoesNotCoolAccounts`（移除修复即失败）。
 
-2. **async 池完全绕过账号 `proxy_url`** — `internal/asyncpool/pool.go:559-570`
-   `p.client()` 写死直连（连环境变量代理也不生效），`acc` 只用于取 ID/Name。
-   README §账号级出站代理与 PLAN §5.9 均承诺「网关请求、额度查询与套餐领取均走对应代理」。
+2. ~~**async 池完全绕过账号 `proxy_url`**~~ — 已修复（0d370e5）
+   `Pool.client()` 曾写死直连（连环境变量代理也不生效），`acc` 只用于取 ID/Name。
+   README §账号级出站代理与 PLAN §5.9 均承诺「网关请求、额度查询与套餐领取均走对应代理」，
    配置代理的账号在 `/async/v1/messages` 会以真实出口 IP 直连上游——泄露部署 IP 并触发风控。
-   修法：比照 `engine.clientFor`，按 `acc.ProxyURL` 建 client 并缓存。
+   现为 `clientFor(acc)`，与 `engine.clientFor` 同语义（代理无效时回退直连并记日志），
+   保留 make_async_client 的 180s 响应头上限。`TransportForTimeout` 按「URL + 超时」
+   缓存 transport，避免网关 120s 与 async 180s 共用同一连接池而互相覆盖。
+   回归测试 `TestAccountProxyIsUsed`（移除修复即失败）。
 
 **中**
 
@@ -520,7 +526,7 @@ Previous read at ... by goroutine 11:
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
-  保持同名用例语义，便于两边对照。当前 23 个测试文件、183 个 `Test` 函数，`go test ./...` 全绿。
+  保持同名用例语义，便于两边对照。当前 23 个测试文件、185 个 `Test` 函数，`go test ./...` 全绿。
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
   最终用 openai 官方客户端（python）指向网关做真客户端回归（待真实账号环境）。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。
