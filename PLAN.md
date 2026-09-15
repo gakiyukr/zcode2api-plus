@@ -570,6 +570,62 @@ Previous read at ... by goroutine 11:
   而后台 API 对同一字段已有拒绝逻辑。
 - `login` 忽略 `Store.Update` 的落库错误仍报「已保存」。
 
+### M12 补审：`internal/captcha`（1,865 行，最大且最复杂）
+
+浏览器池 / 求解 / 自动下载三层的审查，对照 `go-rod/rod@v0.116.2` 与
+`ysmood/leakless@v0.9.0` 原始码逐条验证推论。
+
+**高（已修复，c1acdf7）**
+
+- **`Connect` 失败后对 nil client 调 `Close`，panic 终止整个进程** —
+  rod 的 `Browser.Connect` 只在 `cdp.StartWithURL` 成功后给 `client` 赋值，
+  失败时 `client` 仍为 nil；`Browser.Close` 直接走 `b.client.Call(...)`，
+  nil interface 方法调用即 panic。该路径运行在池的槽位 goroutine 上，套件内
+  无任何 `recover`——一次浏览器启动异常即服务全挂。已实测复现（连接死地址后
+  `Close` 报 `nil pointer dereference`）。修法：只做进程侧清理。
+  回归测试 `TestNewRodWorkerConnectFailureDoesNotPanic`（用「回应版本探测但拒绝
+  WebSocket 握手」的假浏览器落到该分支；还原旧清理逻辑即 panic）。
+- **rod 调用未绑定 ctx，槽位协程可永久卡死** — `rod.New()` 的 ctx 是
+  `context.Background()`，而 `cdp.Client.Call` 靠 `ctx.Done()` 取消，故
+  `classify` 的存活探针、`b.Page`、`browser.Close`、`launcher.Cleanup`
+  （`<-l.exit`）在浏览器假死时全部无界阻塞。池的逾时机制建立在「`Solve` 一定
+  返回」的前提上：卡住即槽位永不归队、永不替换，workers 默认 1 时整池永久失效。
+  修法：browser 绑定可取消 ctx（`Close` 时先取消），launcher 清理改为
+  「先杀进程 + 最多等 5s」。
+
+**中（已修复）**
+
+- **持锁执行 `pool.Start()`/`Stop()`** — `Start` 最长 90s、`Stop` 10s，期间所有
+  并发 `GetVerifyParam` 卡在同一把锁上，各自 ctx 取消完全无效。已拆为「锁内决策、
+  锁外启动」，并让并发者等待启动信号（可被 ctx 取消）；`Close` 先等启动结束再拆，
+  否则该池会在 `Close` 返回后才赋值、既漏关又泄漏浏览器进程。
+  回归测试 `TestBrowserSolverStartDoesNotHoldLock`。
+- **首次下载不受 startupTimeout 约束** — 用 `context.Background()` 且
+  `downloadMutex` 是普通 `sync.Mutex`。下载上限 10 分钟 vs 启动超时 90s，
+  调用方放弃后槽位仍被扣住、`cm.Close()` 也取消不掉。现 ctx 贯穿全链，
+  锁改为可取消的 channel。回归测试 `TestEnsureVersionDownloadLockIsCancellable`。
+- **解包硬链接 `Linkname` 未做逃逸校验** — 同函数的 `Name` 与 `TypeSymlink`
+  分支都有校验，唯 `TypeLink` 只 `filepath.Clean`，`../../..` 可读到宿主任意文件
+  并写进安装目录。签名链阻断当前利用，属纵深缺口。回归测试
+  `TestExtractTarGzRejectsEscapingHardlink`（断言拒绝理由是路径校验，而非
+  「源文件恰好读不到」——后者在源存在时会放行）。
+
+**低（已修复）**
+
+- 解包前用 `string(archive)` 复制整包，峰值内存约 2× 压缩包（200MB 包 → 400MB）；
+  改用 `bytes.NewReader` 零复制。
+- `BrowserSolver` 的配置校验只拒「三项全空」，与错误文案「缺少任一」不符；
+  缺一项仍会拉起浏览器并加载 224KB SDK 才失败。
+- `ZCODE_CAPTCHA_TIMEOUT` 是唯一未做下界钳制的 captcha 旋钮（0/负值使 deadline
+  立即过期且不触发冷却，极大值在 `time.Duration` 乘法处溢出成负值）。
+
+**已检查确认无缺陷**：池的并发/关闭语义（generation 隔离、teardown 三段式、
+`closeOnce` 幂等、双重 `Stop`、逾时判死替换、`condemned`/`abandoned` 防误投）、
+求解失败路径（`pageDirty` 四条路径全覆盖、失败冷却只在启动失败时设定）、
+下载校验链（Ed25519 验签不降级 + SHA256 比对在解包前 + 原子安装）、
+路径穿越（tar 的 `Name` 与 symlink、zip 的 `Name`）、
+`GetVerifyParam` 的 `(nil, nil)` 语义与三个调用方的契约、rod/leakless 进程兜底。
+
 ### 审查中确认**无缺陷**的范围
 
 - 死锁：22 个 `Update` 调用点的闭包体逐一核对，无嵌套加锁（`model` 包方法皆不引用 `Store`）。
@@ -581,7 +637,7 @@ Previous read at ... by goroutine 11:
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
-  保持同名用例语义，便于两边对照。当前 24 个测试文件、197 个 `Test` 函数，`go test ./...` 全绿。
+  保持同名用例语义，便于两边对照。当前 25 个测试文件、203 个 `Test` 函数，`go test ./...` 全绿。
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
   最终用 openai 官方客户端（python）指向网关做真客户端回归（待真实账号环境）。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。
