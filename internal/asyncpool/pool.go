@@ -430,7 +430,7 @@ func (p *Pool) attemptUpstream(
 
 		// 401/403 → 账号失效，换号
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			gateway.MarkAccount(p.Store, acc, model.StatusInvalid,
+			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusInvalid,
 				fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode), time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
 			return false, errNetwork{bodyText}
@@ -438,7 +438,7 @@ func (p *Pool) attemptUpstream(
 
 		// 402 → 该模型额度用完
 		if resp.StatusCode == http.StatusPaymentRequired {
-			gateway.MarkModelExhausted(p.Store, acc, modelName,
+			gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
 				fmt.Sprintf("%s 額度已用完", orCurrent(modelName)))
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, orCurrent(modelName)))
 			return false, errNetwork{bodyText}
@@ -453,11 +453,11 @@ func (p *Pool) attemptUpstream(
 		// 429：额度上限码族 → 该模型耗尽；其余瞬时限流 → 冷却
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if gateway.IsQuotaExhaustedCode(bodyText) {
-				gateway.MarkModelExhausted(p.Store, acc, modelName,
+				gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
 					fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
 			} else {
-				gateway.MarkAccount(p.Store, acc, model.StatusCooling, "上游限流 HTTP 429", time.Now())
+				gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling, "上游限流 HTTP 429", time.Now())
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
 			}
 			return false, errNetwork{bodyText}
@@ -465,16 +465,15 @@ func (p *Pool) attemptUpstream(
 
 		// 503 → 冷却换号
 		if resp.StatusCode == http.StatusServiceUnavailable {
-			acc.FailCount++
-			gateway.MarkAccount(p.Store, acc, model.StatusCooling,
+			p.bumpFail(acc)
+			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling,
 				"上游服務不可用 HTTP 503", time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
 			return false, errNetwork{bodyText}
 		}
 
 		// 其余错误：原样回传上游错误体，终止本票
-		acc.FailCount++
-		_ = p.Store.UpdateAccount(acc)
+		p.bumpFail(acc)
 		p.emit(ctx, ticketID, ticketEvent{
 			Type: "error",
 			Data: map[string]any{"error": map[string]any{"message": bodyText, "type": "upstream_error"}},
@@ -541,12 +540,18 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 
 	// 统计落库失败不应触发换号重发
 	usage.Finish()
-	acc.AccumulateTokens(usage.AsDict())
-	if err := p.Store.UpdateAccount(acc); err != nil {
-		web.Warn("async", "用量统计落库失败: "+err.Error())
-	}
+	p.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.AccumulateTokens(usage.AsDict())
+	})
 	p.emit(ctx, ticketID, ticketEvent{Type: "done"})
 	return false, nil
+}
+
+// bumpFail 累加账号失败计数（锁内修改，供 503 与未知错误分支复用）。
+func (p *Pool) bumpFail(acc *model.Account) {
+	p.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.FailCount++
+	})
 }
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────

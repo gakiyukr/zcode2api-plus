@@ -150,6 +150,93 @@ func (a *Account) Secret() string {
 	return derefString(a.APIKey)
 }
 
+// Clone 深拷贝账号（含 map/slice 与指针字段）。
+//
+// 用途：Store 在持锁状态下把账号副本交给并发路径读取，
+// 避免调用方在锁外直接触碰 Store 内部对象（曾因此产生数据竞争）。
+// 值语义字段直接复制；容器与指针逐层重建，不与原对象共享底层数组。
+func (a *Account) Clone() *Account {
+	if a == nil {
+		return nil
+	}
+	c := *a
+	c.Email = clonePtr(a.Email)
+	c.JWTToken = clonePtr(a.JWTToken)
+	c.APIKey = clonePtr(a.APIKey)
+	c.LastUsedAt = clonePtr(a.LastUsedAt)
+	c.LastCheckedAt = clonePtr(a.LastCheckedAt)
+	c.CoolingUntil = clonePtr(a.CoolingUntil)
+	c.LastError = clonePtr(a.LastError)
+	c.ProxyURL = clonePtr(a.ProxyURL)
+	c.ProxyID = clonePtr(a.ProxyID)
+	c.ArchivedAt = clonePtr(a.ArchivedAt)
+	c.ExhaustedModels = append([]string(nil), a.ExhaustedModels...)
+	c.DisabledModels = append([]string(nil), a.DisabledModels...)
+	c.Quota = cloneQuota(a.Quota)
+	c.Plan = cloneAnyMap(a.Plan)
+	c.Plans = cloneAnyMapSlice(a.Plans)
+	c.Usage = cloneAnyMap(a.Usage)
+	return &c
+}
+
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func cloneQuota(in map[string]map[string]any) map[string]map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]map[string]any, len(in))
+	for k, v := range in {
+		out[k] = cloneAnyMap(v)
+	}
+	return out
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = cloneAnyValue(v)
+	}
+	return out
+}
+
+func cloneAnyMapSlice(in []map[string]any) []map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make([]map[string]any, len(in))
+	for i, m := range in {
+		out[i] = cloneAnyMap(m)
+	}
+	return out
+}
+
+// cloneAnyValue 递归复制 JSON 解码得到的容器值（map/slice）；
+// 标量（string/float64/bool/nil）直接返回。
+func cloneAnyValue(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		return cloneAnyMap(t)
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = cloneAnyValue(e)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 // IsSelectable 是否可被轮询选中（对齐 Account.is_selectable）。
 // 已归档账号一律不可选（归档即停止调用）。
 func (a *Account) IsSelectable(now time.Time) bool {

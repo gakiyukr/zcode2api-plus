@@ -350,8 +350,9 @@ func TestBilling405WithSnapshotIsIdempotent(t *testing.T) {
 
 	// 人为制造 last_error，验证 405 幂等路径将其清除
 	msg := "上游服務暫時不可用 HTTP 503"
-	acc.LastError = &msg
-	_ = st.UpdateAccount(acc)
+	st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.LastError = &msg
+	})
 
 	now = base.Add(QuotaCacheTTL + time.Second)
 	billing.setStatus(http.StatusMethodNotAllowed, "")

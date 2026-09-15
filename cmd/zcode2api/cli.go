@@ -161,9 +161,10 @@ func cmdLogin(args []string) {
 			return
 		}
 		if result.Email != nil && strings.TrimSpace(*result.Email) != "" {
-			acc.Email = result.Email
-			acc.Name = *result.Email
-			_ = st.UpdateAccount(acc)
+			st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+				a.Email = result.Email
+				a.Name = *result.Email
+			})
 		}
 		fmt.Println(web.Green + fmt.Sprintf("\n✔ 已保存 Coding Plan JWT 账号: %s (%s)", acc.Name, acc.ID) + web.Reset)
 		// 入池即激活上报 + 自动领取全部可领活动套餐（失败仅提示，不中断；

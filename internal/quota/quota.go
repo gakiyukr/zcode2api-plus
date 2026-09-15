@@ -176,8 +176,14 @@ func mergeQuotaEntry(current map[string]any, incoming map[string]any) map[string
 // fetchQuotaOnce 拉取官方客户端使用的套餐与模型余额，写回账号状态并持久化。
 // 返回结构与 Python 版一致：成功 {"balance": payload}；失败 {"error": ...}。
 func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
-	checkedAt := float64(s.now().UnixNano()) / 1e9
-	acc.LastCheckedAt = &checkedAt
+	// 调用方传入的对象可能是 Select/ListAccounts 的返回值，与 Store 内部对象
+	// 共享或在锁外被并发读写；这里改用它自己的一份深拷贝做只读计算，
+	// 状态写入一律经 Store.Update 在锁内完成。
+	snap := s.Store.Find(acc.Provider, acc.ID)
+	if snap == nil {
+		return map[string]any{"error": "账号已不存在"}
+	}
+	acc = snap
 
 	query := url.Values{}
 	query.Set("app_version", config.ZcodeClientVersion)
@@ -195,9 +201,17 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 		}
 	}
 	msg := "额度查询网络错误: " + err.Error()
-	acc.LastError = &msg
-	_ = s.Store.UpdateAccount(acc)
+	s.setLastError(acc, msg)
 	return map[string]any{"error": msg}
+}
+
+// setLastError 在锁内设置账号错误信息（顺带刷新 LastCheckedAt）。
+func (s *Service) setLastError(acc *model.Account, msg string) {
+	checkedAt := float64(s.now().UnixNano()) / 1e9
+	s.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.LastCheckedAt = &checkedAt
+		a.LastError = &msg
+	})
 }
 
 // clientFor 返回账号出站客户端；配置了代理时走代理传输（20s 超时，短请求）。
@@ -222,36 +236,35 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		msg := fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode)
-		acc.Status = model.StatusInvalid
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+			a.Status = model.StatusInvalid
+			a.LastError = &msg
+		})
 		return map[string]any{"error": msg}
 	}
 	if resp.StatusCode != http.StatusOK {
 		// 上游对重复查询返回 405：已有快照时视为幂等成功（清错误、不重建状态）
 		if resp.StatusCode == http.StatusMethodNotAllowed && len(acc.Quota) > 0 {
-			acc.LastError = nil
-			_ = s.Store.UpdateAccount(acc)
+			s.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+				a.LastError = nil
+			})
 			return map[string]any{"cached": true, "reason": "上游额度接口拒绝了重复查询（HTTP 405）"}
 		}
 		msg := fmt.Sprintf("额度查询失败 HTTP %d", resp.StatusCode)
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.setLastError(acc, msg)
 		return map[string]any{"error": msg}
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		msg := "额度查询网络错误: " + err.Error()
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.setLastError(acc, msg)
 		return map[string]any{"error": msg}
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		msg := "额度查询返回了无效 JSON"
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.setLastError(acc, msg)
 		return map[string]any{"error": msg}
 	}
 	if code := payload["code"]; code != nil && !isZeroNumber(code) {
@@ -260,8 +273,7 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 			msg = fmt.Sprintf("额度查询失败 code=%s", fmt.Sprint(code))
 		}
 		msg = strings.TrimSpace(msg)
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.setLastError(acc, msg)
 		return map[string]any{"balance": payload, "error": msg}
 	}
 
@@ -278,12 +290,9 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 			plans = append(plans, p)
 		}
 	}
+	// 下面全部是「响应 → 新快照」的纯计算，在 acc（深拷贝）上进行；
+	// 真正落库统一放到末尾的 Store.Update 中，避免用陈旧快照覆盖并发状态变更。
 	acc.Plans = plans
-	if len(plans) > 0 {
-		acc.Plan = plans[0]
-	} else {
-		acc.Plan = map[string]any{}
-	}
 
 	// balance 仅提供当期数值；周期与所属方案需由 entitlement 对应回来
 	entitlements := map[any]map[string]any{}
@@ -340,15 +349,13 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 	}
 
 	if len(quotaMap) == 0 {
-		acc.Quota = map[string]map[string]any{}
 		msg := "账号未返回可用套餐额度"
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+			a.Quota = map[string]map[string]any{}
+			a.LastError = &msg
+		})
 		return map[string]any{"balance": payload, "error": msg}
 	}
-
-	acc.Quota = quotaMap
-	acc.SyncExhaustedModels()
 
 	// 任一列 remaining 缺失时跳过该列；全部已列 remaining <= 0 才判耗尽
 	var remainings []float64
@@ -368,26 +375,39 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 		}
 	}
 
-	if allEmpty {
-		acc.Status = model.StatusExhausted
-		msg := "額度已用完"
-		acc.LastError = &msg
-	} else {
-		switch acc.Status {
+	now := float64(s.now().UnixNano()) / 1e9
+	s.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.Plans = plans
+		if len(plans) > 0 {
+			a.Plan = plans[0]
+		} else {
+			a.Plan = map[string]any{}
+		}
+		a.Quota = quotaMap
+		a.SyncExhaustedModels()
+
+		if allEmpty {
+			a.Status = model.StatusExhausted
+			msg := "額度已用完"
+			a.LastError = &msg
+			return
+		}
+		// 状态机读的是锁内当前值：并发请求可能刚把账号标成 invalid/cooling，
+		// 用陈旧快照判断会把它们错误地刷回 active。
+		switch a.Status {
 		case model.StatusExhausted, model.StatusInvalid:
-			acc.Status = model.StatusActive
-			acc.CoolingUntil = nil
+			a.Status = model.StatusActive
+			a.CoolingUntil = nil
 		case model.StatusCooling:
-			if acc.CoolingUntil != nil && *acc.CoolingUntil <= float64(s.now().UnixNano())/1e9 {
-				acc.Status = model.StatusActive
-				acc.CoolingUntil = nil
+			if a.CoolingUntil != nil && *a.CoolingUntil <= now {
+				a.Status = model.StatusActive
+				a.CoolingUntil = nil
 			}
 		}
-		if acc.Status != model.StatusCooling {
-			acc.LastError = nil
+		if a.Status != model.StatusCooling {
+			a.LastError = nil
 		}
-	}
-	_ = s.Store.UpdateAccount(acc)
+	})
 	return map[string]any{"balance": payload}
 }
 

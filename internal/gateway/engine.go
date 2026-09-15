@@ -431,8 +431,9 @@ func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCo
 	}
 	usage.Finish()
 	got := usage.AsDict()
-	acc.AccumulateTokens(got)
-	_ = e.Store.UpdateAccount(acc)
+	e.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.AccumulateTokens(got)
+	})
 	web.ReqOk(reqID, got.Output)
 	return attemptResult{final: runResult{Delivered: true}}
 }
@@ -441,73 +442,80 @@ func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCo
 //
 // MarkAccount / MarkModelExhausted 同时导出，供 asyncpool 复用同一套状态机；
 // 两条请求路径对同一账号必须标出相同状态（曾因 asyncpool 自行实现而分歧）。
+//
+// 二者按账号 ID 定位并在 Store 锁内修改真实对象：调用方持有的是 Select
+// 返回的深拷贝，直接改它既不会落库、也会与并发读取竞争。
 
 // MarkAccount 设置账号状态；status 为 cooling 时按配置写入冷却截止时间。
-func MarkAccount(st *store.Store, acc *model.Account, status, errMsg string, now time.Time) {
-	acc.Status = status
-	acc.LastError = &errMsg
-	if status == model.StatusCooling {
-		until := float64(now.Add(time.Duration(config.CoolingSeconds)*time.Second).UnixNano()) / 1e9
-		acc.CoolingUntil = &until
-	}
-	_ = st.UpdateAccount(acc)
+// 账号不存在时静默返回（可能已被后台删除）。
+func MarkAccount(st *store.Store, provider, id, status, errMsg string, now time.Time) {
+	st.Update(provider, id, func(acc *model.Account) {
+		acc.Status = status
+		acc.LastError = &errMsg
+		if status == model.StatusCooling {
+			until := float64(now.Add(time.Duration(config.CoolingSeconds)*time.Second).UnixNano()) / 1e9
+			acc.CoolingUntil = &until
+		}
+	})
 }
 
 // MarkModelExhausted 只停用已耗尽的请求模型；所有已知模型皆耗尽时才停用整号。
-func MarkModelExhausted(st *store.Store, acc *model.Account, modelName any, errMsg string) {
-	if !acc.MarkModelExhausted(modelName) {
-		acc.Status = model.StatusExhausted
+func MarkModelExhausted(st *store.Store, provider, id string, modelName any, errMsg string) {
+	st.Update(provider, id, func(acc *model.Account) {
+		if !acc.MarkModelExhausted(modelName) {
+			acc.Status = model.StatusExhausted
+			acc.LastError = &errMsg
+			return
+		}
+		anyState := false
+		allExhausted := true
+		for name, quota := range acc.Quota {
+			entryModel, _ := quota["model"].(string)
+			if entryModel == "" {
+				entryModel = name
+			}
+			anyState = true
+			if acc.ModelAvailability(entryModel) != "exhausted" {
+				allExhausted = false
+				break
+			}
+		}
+		if anyState && allExhausted {
+			acc.Status = model.StatusExhausted
+		} else {
+			acc.Status = model.StatusActive
+		}
+		acc.CoolingUntil = nil
 		acc.LastError = &errMsg
-		_ = st.UpdateAccount(acc)
-		return
-	}
-	anyState := false
-	allExhausted := true
-	for name, quota := range acc.Quota {
-		entryModel, _ := quota["model"].(string)
-		if entryModel == "" {
-			entryModel = name
-		}
-		anyState = true
-		if acc.ModelAvailability(entryModel) != "exhausted" {
-			allExhausted = false
-			break
-		}
-	}
-	if anyState && allExhausted {
-		acc.Status = model.StatusExhausted
-	} else {
-		acc.Status = model.StatusActive
-	}
-	acc.CoolingUntil = nil
-	acc.LastError = &errMsg
-	_ = st.UpdateAccount(acc)
+	})
 }
 
 func (e *Engine) mark(acc *model.Account, status, errMsg string) {
-	MarkAccount(e.Store, acc, status, errMsg, e.now())
+	MarkAccount(e.Store, acc.Provider, acc.ID, status, errMsg, e.now())
 }
 
 func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg string) {
-	MarkModelExhausted(e.Store, acc, modelName, errMsg)
+	MarkModelExhausted(e.Store, acc.Provider, acc.ID, modelName, errMsg)
 }
 
 // success 记录成功调用的账号状态；并异步触发一次额度刷新
 // （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
 func (e *Engine) success(acc *model.Account) {
-	acc.UseCount++
 	ts := float64(e.now().UnixNano()) / 1e9
-	acc.LastUsedAt = &ts
-	if acc.Status == model.StatusCooling || acc.Status == model.StatusExhausted {
-		acc.Status = model.StatusActive
-	}
-	_ = e.Store.UpdateAccount(acc)
+	e.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.UseCount++
+		a.LastUsedAt = &ts
+		if a.Status == model.StatusCooling || a.Status == model.StatusExhausted {
+			a.Status = model.StatusActive
+		}
+	})
 	e.fireRefresh(acc)
 }
 
 func (e *Engine) bumpFail(acc *model.Account) {
-	acc.FailCount++
-	_ = e.Store.UpdateAccount(acc)
+	e.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.FailCount++
+	})
 }
 
 // fireRefresh 触发额度刷新（M3 接入 quota 包；仅 JWT 账号，对齐 _safe_refresh）。

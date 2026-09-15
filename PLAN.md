@@ -390,7 +390,7 @@ meta(key TEXT PK, value TEXT)
   采用 `X-Forwarded-For` 的最后一跳；**不可无条件信任该头**（会丧失防伪造能力）。
   当前判断：先以 `--host 127.0.0.1` 方案满足需求，此项暂不实现。
 
-### M10 待修：Account 指针共享导致的数据竞争（2026-09-15 发现，**高优先级**）
+### M10 Account 指针共享导致的数据竞争（2026-09-15 发现，同日修复）
 
 `Store.Select` 在持锁状态下读取 `*model.Account` 的 `Status`/`Enabled`/`CoolingUntil`
 等字段（经 `IsSelectable`），锁随即释放并**把同一指针交给调用方**；此后引擎、quota、
@@ -412,18 +412,32 @@ Previous read at ... by goroutine 11:
 撕裂值——轻则账号可用性判断错误（如刚冷却完的账号被误判为可用），重则解引用野指针
 导致进程崩溃。
 
-**修复方向（择一，需评估后再动）**：
-- 方案 A：`Store` 提供受控修改 API（如 `SetStatus(id, status, errMsg)`），调用方不再
-  直接改字段；语义与 `UpdateAccount` 一致，但需改 31 处调用点。
-- 方案 B：`Select` 返回深拷贝，调用方改副本后显式写回；改动小，但遗漏写回即静默丢状态。
+**修复（2026-09-15 完成）**：两条规则同时落地，方案 A 与 B 并用——读走深拷贝、写走锁内闭包：
 
-**当前判断**：方案 A 更稳妥（编译器能强制走受控路径），但属架构级改动，需专门排期。
-该竞争在低并发下不易触发，短期内不阻塞使用。
+1. **读**：`ListAccounts`/`Find`/`FindAny`/`AddAccount`/`Select` 一律返回深拷贝
+   （新增 `Account.Clone()`，逐层重建 map/slice/指针）。调用方在锁外读副本不再与
+   Store 的写入竞争。
+2. **写**：新增 `Store.Update(provider, id, fn)`，在锁内取出真实对象执行 `fn` 并落库；
+   `MarkAccount`/`MarkModelExhausted` 改收 `(provider, id)`；quota 的状态机移入
+   `Update` 闭包内读取**锁内当前值**。原 `UpdateAccount` 已删除，使「锁外改字段 →
+   写回」在类型层面无法表达。
+
+**顺带修掉两个真实缺陷**：
+- `handleEditAccount` 原先把整个快照写回，会覆盖并发产生的状态变更（刚被标
+  `invalid`/`cooling` 的账号被刷回旧状态）；改为只套用请求中实际出现的字段。
+- `adminapi/login.go` 与 `cmd/zcode2api/cli.go` 在 `AddAccount` 返回的副本上改
+  `Email`/`Name`/`APIKey` 后期待落库——副本不落库，OAuth 登录的邮箱与兑换到的
+  API Key 会静默丢失；改走 `Update`。
+
+**验证**：`go test -race ./...` 13 包全绿（WSL Debian + gcc，Windows 侧无 cgo 工具链）；
+端到端并发压测 60 请求 / 8 账号，`use_count` 与 token 统计精确无丢失；缺陷注入对照
+（把 `Select` 改回 `return acc`）下 `TestSelectAndMutateConcurrently` 立刻报
+`DATA RACE`，确认该测试真能抓住此缺陷而非偶然通过。
 
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
-  保持同名用例语义，便于两边对照。当前 23 个测试文件、171 个 `Test` 函数，`go test ./...` 全绿。
+  保持同名用例语义，便于两边对照。当前 23 个测试文件、182 个 `Test` 函数，`go test ./...` 全绿。
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
   最终用 openai 官方客户端（python）指向网关做真客户端回归（待真实账号环境）。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。

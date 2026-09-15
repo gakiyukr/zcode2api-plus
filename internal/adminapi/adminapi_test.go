@@ -518,10 +518,9 @@ func TestMonitorAndUsage(t *testing.T) {
 
 	// 预置用量与状态供快照/排行断言
 	acc := st.FindAny(str(t, ids[0]))
-	acc.UseCount, acc.FailCount, acc.TotalInputTokens, acc.TotalOutputTokens = 8, 2, 100, 40
-	if err := st.UpdateAccount(acc); err != nil {
-		t.Fatal(err)
-	}
+	st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.UseCount, a.FailCount, a.TotalInputTokens, a.TotalOutputTokens = 8, 2, 100, 40
+	})
 
 	code, body := do(t, mux, st, http.MethodGet, "/admin/api/monitor", nil)
 	if code != http.StatusOK {

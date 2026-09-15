@@ -114,16 +114,18 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult) (*model.Account
 		return nil, errUpstream(fmt.Sprintf("凭证入池失败: %v", err))
 	}
 	if email != "" {
-		account.Email = &email
-		if account.Name == "oauth-login" {
-			account.Name = email
-		}
-		_ = h.Store.UpdateAccount(account)
+		h.Store.Update(account.Provider, account.ID, func(a *model.Account) {
+			a.Email = &email
+			if a.Name == "oauth-login" {
+				a.Name = email
+			}
+		})
 	}
 	if result.AccessToken != "" {
 		if apiKey, err := oauth.ExchangeAPIKey(result.AccessToken); err == nil && apiKey != "" {
-			account.APIKey = &apiKey
-			_ = h.Store.UpdateAccount(account)
+			h.Store.Update(account.Provider, account.ID, func(a *model.Account) {
+				a.APIKey = &apiKey
+			})
 		} else if err != nil {
 			web.Warn("adminapi", fmt.Sprintf("兑换 API Key 失败: %v", err))
 		}

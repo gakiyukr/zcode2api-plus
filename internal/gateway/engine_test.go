@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -438,6 +439,61 @@ func TestJWTWithoutSolverReturnsCaptchaRequired(t *testing.T) {
 	}
 	if f.callCount() != 0 {
 		t.Fatal("上游不应被调用")
+	}
+}
+
+// TestConcurrentRequestsAccountState 并发压测：多个请求同时打同一账号池，
+// 验证账号状态更新（use_count / token 统计）不丢失。
+//
+// 每个成功请求恰好累计一次，并发下丢更新会直接反映为数值偏小——这是
+// 「状态写入必须经 Store.Update 在锁内完成」的行为契约。
+func TestConcurrentRequestsAccountState(t *testing.T) {
+	f := newFixture(t)
+	f.respond = jsonResp(200, okUpstreamJSON)
+
+	const accounts = 4
+	const requests = 40
+	for i := range accounts {
+		acc, err := f.st.AddAccount(model.ProviderZai, fmt.Sprintf("acc-%d", i), fmt.Sprintf("sk-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// quota 需在锁内写入，Select 才会认为该模型可用
+		f.st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+			a.Quota = map[string]map[string]any{
+				"GLM-5.3": {"remaining": float64(1000), "model": "GLM-5.3"},
+			}
+		})
+	}
+
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// 第三个参数是网关密钥（所有请求相同）；账号由引擎轮询选中
+			status, _ := f.post(t, msgBody(), "sk-test")
+			if status != 200 {
+				t.Errorf("请求 %d 应 200: %d", i, status)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// 每个成功请求恰好累计一次：use_count 与 token 统计都必须精确，
+	// 并发下丢更新会直接反映为数值偏小。
+	totalUse, totalIn, totalOut := 0, 0, 0
+	for _, a := range f.st.ListAccounts(model.ProviderZai) {
+		totalUse += a.UseCount
+		totalIn += a.TotalInputTokens
+		totalOut += a.TotalOutputTokens
+	}
+	if totalUse != requests {
+		t.Fatalf("use_count 合计应为 %d（并发丢更新？）: %d", requests, totalUse)
+	}
+	if totalIn != requests*11 || totalOut != requests*22 {
+		t.Fatalf("token 统计不符: in=%d out=%d（期望 %d/%d）",
+			totalIn, totalOut, requests*11, requests*22)
 	}
 }
 
