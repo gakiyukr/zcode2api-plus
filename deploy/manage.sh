@@ -204,8 +204,11 @@ installed_version() {
 }
 
 latest_tag() {
+	# || true：API 限流或网络故障时 curl 返回非 0，set -e + pipefail 会让脚本在此
+	# 直接退出，连调用方的错误提示都来不及打印——表现为「查询最新 Release」后
+	# 无声终止。查询失败应返回空串，由调用方决定如何提示。
 	curl -fsSL --connect-timeout 15 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-		| sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+		| sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true
 }
 
 # build_local 从源码构建到 $DIR/zcode2api。
@@ -686,6 +689,270 @@ bin_scan() {
 	echo
 }
 
+# count_accounts 读取某个数据目录下的账号总数，用于迁移前后校验。
+# 直接查 SQLite 而不是调用二进制的 accounts 子命令：后者需要启动整套配置
+# （密钥、验证码浏览器等），而校验只关心行数。
+count_accounts() {
+	local data_dir="$1" db="$1/accounts.db"
+	[ -f "$db" ] || { printf '0'; return 0; }
+	command -v sqlite3 >/dev/null 2>&1 || return 0
+	sqlite3 "$db" 'SELECT COUNT(*) FROM accounts;' 2>/dev/null || printf '0'
+}
+
+# sqlite_backup 用 SQLite 自己的备份机制导出一致快照。
+# 不能只 cp accounts.db：库以 WAL 模式运行，最近的写入还在 accounts.db-wal 里，
+# 只拷主文件会静默丢掉最新数据。
+snapshot_db() {
+	local src_dir="$1" dst_file="$2" src_db="$1/accounts.db"
+	[ -f "$src_db" ] || return 1
+	if command -v sqlite3 >/dev/null 2>&1; then
+		sqlite3 "$src_db" ".backup '$dst_file'" 2>/dev/null && return 0
+	fi
+	# 无 sqlite3 时退化为整目录拷贝（含 -wal/-shm），由调用方确保服务已停。
+	cp -f "$src_db" "$dst_file" || return 1
+	[ -f "$src_db-wal" ] && cp -f "$src_db-wal" "$dst_file-wal" 2>/dev/null
+	[ -f "$src_db-shm" ] && cp -f "$src_db-shm" "$dst_file-shm" 2>/dev/null
+	return 0
+}
+
+# migrate_pick_target 决定迁移目标目录。
+# 目标始终是标准目录 $DIR：迁移的意义就是把散落部署收拢到标准位置。
+# 若源本身就是 $DIR，则原地升级（无处分可搬）。
+# 若 $DIR 已被别的部署占用，加后缀——两个不同实例不该被合并到同一目录。
+migrate_pick_target() {
+	local src="$1"
+	if [ "$src" = "$DIR" ]; then
+		printf '%s' "$DIR"
+		return 0
+	fi
+	if [ ! -e "$DIR/zcode2api" ]; then
+		printf '%s' "$DIR"
+		return 0
+	fi
+	printf '%s' "${DIR}-migrated"
+}
+
+# menu_migrate 交互式迁移：扫描候选 → 让用户选一个 → 走 bin_migrate。
+# 菜单里不能要求用户先手打路径，否则等于把扫描结果白报了。
+menu_migrate() {
+	require_root
+
+	local -a cands=()
+	local bin
+	# 候选来自 scan 的同一判据：basename 恰为 zcode2api 且可执行
+	while IFS= read -r bin; do
+		[ -n "$bin" ] || continue
+		[ -x "$bin" ] || continue
+		[ "$(basename "$bin")" = "zcode2api" ] || continue
+		[ "$(dirname "$bin")" = "$DIR" ] && continue
+		cands+=("$(dirname "$bin")")
+	done < <(find "$SCAN_ROOT" -maxdepth 4 -type f -name 'zcode2api' 2>/dev/null | sort)
+
+	echo
+	printf '%s迁移既有部署%s\n' "$C_BOLD" "$C_RST"
+	hr
+
+	if [ "${#cands[@]}" -eq 0 ]; then
+		warn "未在 $SCAN_ROOT 下找到可迁移的部署（已排除标准目录 $DIR）"
+		info "若部署在别处，用命令行指定: sudo $SELF_BASENAME migrate --dir <目录>"
+		echo
+		return 0
+	fi
+
+	local i
+	for i in "${!cands[@]}"; do
+		bin="${cands[$i]}/zcode2api"
+		printf '  %s%d)%s %s\n' "$C_CYAN" "$((i + 1))" "$C_RST" "${cands[$i]}"
+		printf '       版本 %s   %s\n' \
+			"$(probe_binary_version "$bin" || echo '?')" \
+			"$(probe_binary_service "$bin" || echo '未运行')"
+	done
+	printf '  %s0)%s 取消\n' "$C_CYAN" "$C_RST"
+	echo
+
+	local pick
+	printf '请选择要迁移的部署: '
+	read -r pick || return 0
+	case "$pick" in
+		0|"") info "已取消"; return 0 ;;
+	esac
+	if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#cands[@]}" ]; then
+		warn "无效选择: $pick"
+		return 0
+	fi
+
+	ADOPT_DIR="${cands[$((pick - 1))]}"
+	bin_migrate
+}
+
+# bin_migrate 把既有部署迁到标准目录并升级到最新 Release。
+# 与 adopt 的区别：adopt 只补管理元数据、不动二进制；migrate 会真正部署新版本，
+# 因此每一步都可回滚，且旧目录默认保留。
+bin_migrate() {
+	require_root
+	detect_arch
+
+	local src="${ADOPT_DIR:-}"
+	[ -n "$src" ] || die "需要 --dir 指定源部署目录，例如: sudo $SELF_BASENAME migrate --dir /opt/zcode2api-custom"
+	src="$(cd "$src" 2>/dev/null && pwd)" || die "目录不存在: ${ADOPT_DIR}"
+	[ -f "$src/zcode2api" ] || die "$src 下没有 zcode2api 可执行文件"
+
+	local target
+	target="$(migrate_pick_target "$src")"
+	local target_is_src="false"
+	[ "$target" = "$src" ] && target_is_src="true"
+
+	echo
+	printf '%s迁移既有部署%s\n' "$C_BOLD" "$C_RST"
+	hr
+	printf '  源目录     %s\n' "$src"
+	printf '  目标目录   %s\n' "$target"
+	printf '  源版本     %s\n' "$(probe_binary_version "$src/zcode2api" || echo '(未知)')"
+	printf '  运行状态   %s\n' "$(probe_binary_service "$src/zcode2api" || echo '未运行')"
+	echo
+
+	# 目标版本：优先 --version，否则查最新 Release（可能因 API 限流失败）
+	local tag="$VERSION"
+	if [ -z "$tag" ]; then
+		info "查询最新 Release"
+		tag="$(latest_tag)"
+		if [ -z "$tag" ]; then
+			die "无法获取最新版本（网络问题或 GitHub API 限流）。请用 --version TAG 指定标签"
+		fi
+	fi
+	printf '  目标版本   %s\n' "$tag"
+	echo
+
+	confirm "确认迁移？" || { info "已取消"; return 0; }
+
+	# 1) 停止旧服务。必须在拷贝数据前停：WAL 模式下运行中的写入会让快照不一致。
+	local svc
+	svc="$(probe_binary_service "$src/zcode2api" || true)"
+	local stopped_unit=""
+	if [ -n "$svc" ]; then
+		info "停止服务 $svc"
+		systemctl stop "$svc" 2>/dev/null || true
+		stopped_unit="$svc"
+	fi
+	# 也可能有无 systemd 的裸进程
+	local pid
+	pid="$(probe_running_pid "$src/zcode2api" || true)"
+	if [ -n "$pid" ]; then
+		warn "发现直接运行的进程 PID $pid，正在停止"
+		kill "$pid" 2>/dev/null || true
+		sleep 2
+		kill -9 "$pid" 2>/dev/null || true
+	fi
+
+	# 2) 记录源数据基线，供迁移后校验
+	local src_accounts=""
+	if [ -f "$src/data/accounts.db" ]; then
+		src_accounts="$(count_accounts "$src/data")"
+		info "源数据账号数: ${src_accounts:-未知}"
+	fi
+
+	# 3) 准备目标目录
+	if [ "$target_is_src" = "false" ]; then
+		mkdir -p "$target/data" || die "无法创建 $target"
+	fi
+
+	# 4) 部署新二进制。先备份，失败可回滚。
+	local bak="$target/zcode2api.pre-migrate"
+	cp -f "$target/zcode2api" "$bak" 2>/dev/null || true
+	local dl_dir="$target"
+	if [ "$target_is_src" = "false" ]; then
+		info "下载 $tag 到 $target"
+	else
+		info "下载 $tag（原地升级）"
+	fi
+	local url="https://github.com/$REPO/releases/download/$tag/zcode2api-linux-$ARCH"
+	if ! curl -fL --retry 3 --connect-timeout 15 --progress-bar -o "$target/zcode2api.new" "$url"; then
+		warn "下载失败: $url"
+		[ -f "$bak" ] && mv -f "$bak" "$target/zcode2api"
+		warn "迁移中止（二进制已回滚）"
+		[ -n "$stopped_unit" ] && systemctl start "$stopped_unit" 2>/dev/null
+		die "下载 $tag 失败"
+	fi
+	chmod 0755 "$target/zcode2api.new" || die "设置可执行权限失败"
+
+	# 5) 迁移数据。目标已存在同名库时先留副本，避免覆盖掉目标自己的数据。
+	if [ "$target_is_src" = "false" ] && [ -d "$src/data" ]; then
+		if [ -f "$target/data/accounts.db" ]; then
+			warn "$target/data 已有 accounts.db，保留为 accounts.db.pre-migrate"
+			mv -f "$target/data/accounts.db" "$target/data/accounts.db.pre-migrate" 2>/dev/null || true
+		fi
+		info "复制数据 $src/data → $target/data"
+		if ! cp -a "$src/data/." "$target/data/" 2>/dev/null; then
+			warn "数据复制失败"
+			rm -f "$target/zcode2api.new"
+			[ -f "$bak" ] && mv -f "$bak" "$target/zcode2api"
+			[ -n "$stopped_unit" ] && systemctl start "$stopped_unit" 2>/dev/null
+			die "迁移中止（二进制已回滚，数据未改动）"
+		fi
+	fi
+
+	# 6) 校验账号数。数量不符说明快照不完整，宁可停下让人检查。
+	if [ -n "$src_accounts" ]; then
+		local dst_accounts
+		dst_accounts="$(count_accounts "$target/data")"
+		if [ "$dst_accounts" != "$src_accounts" ]; then
+			warn "账号数不一致: 源 $src_accounts → 目标 $dst_accounts"
+			warn "数据可能未完整迁移，已保留新二进制于 $target/zcode2api.new 供检查"
+			[ -n "$stopped_unit" ] && systemctl start "$stopped_unit" 2>/dev/null
+			die "迁移校验失败，未切换"
+		fi
+		ok "账号数校验通过: $dst_accounts"
+	fi
+
+	# 7) 切换二进制
+	mv -f "$target/zcode2api.new" "$target/zcode2api" || die "替换二进制失败"
+	ok "已部署 $tag"
+
+	# 8) 迁移 .env（保留源配置：端口、密钥等都在里面）
+	if [ "$target_is_src" = "false" ] && [ -f "$src/.env" ]; then
+		if [ -f "$target/.env" ]; then
+			cp -f "$target/.env" "$target/.env.pre-migrate" 2>/dev/null || true
+		fi
+		cp -f "$src/.env" "$target/.env" && chmod 0600 "$target/.env"
+		info "已迁移 .env"
+	fi
+
+	printf '%s' "$tag" >"$target/.installed-version"
+
+	# 9) 写单元并启动。DIR 临时指向 target 以复用单元模板。
+	local old_dir="$DIR"
+	DIR="$target"
+	write_unit || { DIR="$old_dir"; die "写入 systemd 单元失败"; }
+	DIR="$old_dir"
+
+	if [ -n "$stopped_unit" ] && [ "$stopped_unit" != "zcode2api.service" ]; then
+		systemctl disable "$stopped_unit" 2>/dev/null || true
+		info "已停用旧单元 $stopped_unit"
+	fi
+	systemctl daemon-reload 2>/dev/null || true
+	systemctl restart zcode2api.service 2>/dev/null \
+		|| systemctl start zcode2api.service 2>/dev/null \
+		|| warn "服务启动失败，请手动执行: systemctl start zcode2api"
+	ok "服务已启动"
+
+	# 10) 清理旧目录。仅在数据已确认迁移且目标不是源目录时进行。
+	if [ "$target_is_src" = "false" ]; then
+		echo
+		if confirm "删除旧目录 $src？（数据已迁移到 $target）"; then
+			rm -rf "$src" && ok "已删除 $src"
+		else
+			info "保留 $src"
+			warn "旧目录仍在，两个目录都含 data/；确认新部署正常后可手动删除"
+		fi
+	fi
+
+	echo
+	ok "迁移完成（$tag）"
+	printf '  目录   %s\n' "$target"
+	printf '  管理   sudo %s status --dir %s\n' "$SELF_BASENAME" "$target"
+	echo
+}
+
 # bin_adopt 把一个手工部署的目录纳入管理。
 # 只补管理所需的元数据与单元，不动二进制本身——避免覆盖用户自行编译的产物。
 bin_adopt() {
@@ -936,11 +1203,11 @@ menu() {
 		printf '  %s2)%s 更新二进制          %s6)%s Docker 更新\n' "$C_CYAN" "$C_RST" "$C_CYAN" "$C_RST"
 		printf '  %s3)%s 卸载二进制          %s7)%s Docker 卸载\n' "$C_CYAN" "$C_RST" "$C_CYAN" "$C_RST"
 		printf '  %s4)%s 查看状态            %s8)%s 服务控制（启停/重启/日志）\n' "$C_CYAN" "$C_RST" "$C_CYAN" "$C_RST"
-		printf '  %s9)%s 扫描已有安装\n' "$C_CYAN" "$C_RST"
+		printf '  %s9)%s 扫描已有安装        %s10)%s 迁移到标准目录\n' "$C_CYAN" "$C_RST" "$C_CYAN" "$C_RST"
 		printf '  %s0)%s 退出\n' "$C_CYAN" "$C_RST"
 		echo
 		local choice
-		printf '请选择 [0-9]: '
+		printf '请选择 [0-10]: '
 		read -r choice || { echo; break; }
 		case "$choice" in
 			1) menu_install ;;
@@ -952,6 +1219,7 @@ menu() {
 			7) menu_docker_uninstall ;;
 			8) menu_service ;;
 			9) bin_scan ;;
+			10) menu_migrate ;;
 			0|"") break ;;
 			*) warn "无效选择: $choice" ;;
 		esac
@@ -1070,6 +1338,7 @@ ${C_BOLD}zcode2api 管理脚本（Linux）${C_RST}
   status             查看安装状态
   scan               扫描 /opt 下已有的本程序安装（含手工编译的）
   adopt              把手工部署的目录纳入管理（--dir 指定）
+  migrate            接管 + 部署最新 + 迁移数据（--dir 指定源目录）
   docker-install     Docker 安装（参考实现，未验证）
   docker-update      Docker 更新
   docker-uninstall   Docker 卸载
@@ -1096,6 +1365,7 @@ ${C_BOLD}zcode2api 管理脚本（Linux）${C_RST}
   sudo $0 update -y
   sudo $0 scan
   sudo $0 adopt --dir /opt/zcode2api-custom
+  sudo $0 migrate --dir /opt/zcode2api-custom
   sudo $0 uninstall --purge
   sudo $0 docker-install
 EOF
@@ -1130,11 +1400,14 @@ parse_args() {
 main() {
 	parse_args "$@"
 
-	# --dir 对 adopt 表示「待接管的既有目录」，对其它命令表示「本脚本的安装目录」。
-	# 两者语义不同且 adopt 会改写 DIR，故在此分流，避免 adopt 误判自己为默认目录。
-	if [ -n "$ADOPT_DIR" ] && [ "${CMD:-}" != "adopt" ]; then
-		DIR="$ADOPT_DIR"
-	fi
+	# --dir 的语义随命令而变：adopt / migrate 指的是「要操作的既有目录」，
+	# 其余命令指的是「本脚本的安装目录」。
+	# 不能对 adopt / migrate 也赋给 DIR：它们内部靠 src = DIR 判断源是否已是标准目录，
+	# 一旦 DIR 被改成源目录，就会误判为原地升级而放弃搬迁。
+	case "${CMD:-}" in
+		adopt|migrate) ;;
+		*) [ -n "$ADOPT_DIR" ] && DIR="$ADOPT_DIR" ;;
+	esac
 
 	case "${CMD:-}" in
 		"")           menu ;;
@@ -1144,6 +1417,7 @@ main() {
 		status)       require_linux; bin_status ;;
 		scan)         require_linux; bin_scan ;;
 		adopt)        require_linux; bin_adopt ;;
+		migrate)      require_linux; bin_migrate ;;
 		docker-install)   require_linux; docker_install ;;
 		docker-update)    require_linux; docker_update ;;
 		docker-uninstall) require_linux; docker_uninstall ;;

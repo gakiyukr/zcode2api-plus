@@ -55,6 +55,7 @@ sudo ./deploy/manage.sh uninstall          # 卸載
 sudo ./deploy/manage.sh status             # 查看狀態
 sudo ./deploy/manage.sh scan               # 掃描 /opt 下已有的安裝
 sudo ./deploy/manage.sh adopt --dir /opt/zcode2api-custom   # 納管手工部署
+sudo ./deploy/manage.sh migrate --dir /opt/zcode2api-custom # 遷移到標準目錄並升級
 sudo ./deploy/manage.sh docker-install     # Docker 安裝
 sudo ./deploy/manage.sh docker-update      # Docker 更新
 sudo ./deploy/manage.sh docker-uninstall   # Docker 卸載
@@ -96,6 +97,38 @@ sudo ./deploy/manage.sh update --dir /opt/zcode2api-custom
 
 > 註：`scan` / `adopt` 只在 `/opt` 下查找（`SCAN_ROOT` 可覆寫）。若部署在別處，
 > 用 `find / -name 'zcode2api*' -type f -executable` 自行確認。
+
+### 遷移到標準目錄並升級
+
+`adopt` 只補管理元數據，不換二進制。若要把散落的舊部署收攏到標準目錄
+`/opt/zcode2api` 並升級到最新 Release，用 `migrate`：
+
+```bash
+sudo ./deploy/manage.sh migrate --dir /opt/zcode2api-custom
+```
+
+執行流程（每步都可回滾）：
+
+1. **停止舊服務**。必須在拷貝數據前停——數據庫以 WAL 模式運行，最近的寫入還在
+   `accounts.db-wal` 裡，運行中拷貝會得到不一致的快照。
+2. **記錄源賬號數**作為基線。
+3. **下載目標版本**到新目錄，舊二進制備份為 `zcode2api.pre-migrate`。
+4. **遷移數據**：用 SQLite 自身的 `.backup` 導出一致快照（而非 `cp`，見上）；
+   同時遷移 `.env`（端口、密鑰都在裡面）。
+5. **校驗賬號數**。數量不符即中止且不切換——寧可停下讓人檢查，也不帶著殘缺數據上線。
+6. **切換並啟動**，寫入 systemd 單元。
+7. **詢問是否刪除舊目錄**。數據已確認遷移後才問；選否則保留，可手動清理。
+
+原地升級：若源目錄本就是 `/opt/zcode2api`，則無處可搬，直接原地替換二進制，
+`data/` 與 `.env` 不動。
+
+目標目錄已被佔用（存在另一個部署）時，會改用 `/opt/zcode2api-migrated`，
+避免把兩個不同實例合併到同一目錄。
+
+交互式：菜單選 `10)` 會先掃描候選並列出各自版本，選一個即可，無需手打路徑。
+
+> ⚠️ `migrate` 查詢最新 Release 走 GitHub API（未認證限流為每小時 60 次/IP）。
+> 撞限流時會提示改用 `--version TAG` 指定標籤。
 
 ### 常用選項
 
