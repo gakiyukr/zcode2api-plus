@@ -436,9 +436,16 @@ bin_update() {
 		rm -f "$DIR/zcode2api.bak"
 		ok "已重新构建"
 	else
-		info "当前版本: $current；查询最新 Release"
-		target="$(latest_tag)"
-		[ -n "$target" ] || die "无法获取最新版本（网络问题或仓库无 Release）"
+		# --version 优先：GitHub API 未认证限流（每小时 60 次，共享出口 IP 极易撞上）
+		# 时 latest_tag 会返回空并导致更新中止，显式指定标签可绕开该查询。
+		target="$VERSION"
+		if [ -n "$target" ]; then
+			info "当前版本: $current；目标版本（--version 指定）: $target"
+		else
+			info "当前版本: $current；查询最新 Release"
+			target="$(latest_tag)"
+			[ -n "$target" ] || die "无法获取最新版本（网络问题或 GitHub API 限流）。请用 --version TAG 指定标签"
+		fi
 
 		if [ "$current" = "$target" ]; then
 			ok "已是最新版本 $current"
