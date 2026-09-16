@@ -33,11 +33,15 @@ VERSION=""
 PREFETCH_BROWSER="true"
 PURGE="false"
 KEEP_USER="false"
+ADOPT_DIR=""
 DOCKER_VOLUMES="false"
 ASSUME_YES="false"
 
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname -- "$SELF_DIR")"
+SELF_BASENAME="$(basename -- "${BASH_SOURCE[0]}")"
+# 扫描根目录：手工部署常见于 /opt 下的自建目录，故以 /opt 为界递归查找。
+SCAN_ROOT="${SCAN_ROOT:-/opt}"
 
 # ── 输出 ────────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -184,6 +188,17 @@ install_browser_deps() {
 }
 
 # ── 版本与下载 ──────────────────────────────────────────────────────────────
+# human_size 把字节数格式化为人类可读形式（纯 awk，避免依赖 numfmt，
+# 后者属于 coreutils 但部分精简镜像会裁掉）。
+human_size() {
+	awk -v n="${1:-0}" 'BEGIN {
+		split("B KB MB GB TB", u, " ")
+		i = 1
+		while (n >= 1024 && i < 5) { n /= 1024; i++ }
+		printf (i == 1 ? "%.0f %s" : "%.1f %s"), n, u[i]
+	}'
+}
+
 installed_version() {
 	[ -f "$DIR/.installed-version" ] && cat "$DIR/.installed-version" 2>/dev/null || true
 }
@@ -539,6 +554,213 @@ print_summary() {
 EOF
 }
 
+# probe_binary_version 从二进制中提取版本串（AppVersion 常量，形如 2.0.3-go）。
+# 手工编译或剥离符号的产物没有 .installed-version，只能从内容反推；
+# 用 grep -a 而非 strings：前者所有 Linux 发行版都有，后者常在最小化系统里缺失。
+probe_binary_version() {
+	local bin="$1"
+	[ -f "$bin" ] || return 0
+	# || true：未匹配到版本串时 grep 返回 1，pipefail 会将其视为失败并终止调用方。
+	grep -aoE '[0-9]+\.[0-9]+\.[0-9]+-go' "$bin" 2>/dev/null | sort -u | head -1 || true
+}
+
+# probe_binary_service 找出哪个 systemd 单元在运行给定的二进制。
+probe_binary_service() {
+	local bin="$1" unit exec_line
+	command -v systemctl >/dev/null 2>&1 || return 0
+	# 命令替换放进 for 的 word list 时退出码会被忽略，但 WSL 等无 systemd 环境下
+	# 仍可能因空列表产生意外行为，故显式容错。
+	for unit in $(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}' || true); do
+		exec_line="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
+		case "$exec_line" in
+			*"$bin"*) printf '%s' "$unit"; return 0 ;;
+		esac
+	done
+}
+
+# probe_running_pid 找出直接以该路径运行的进程（无 systemd 的手工部署）。
+probe_running_pid() {
+	local bin="$1"
+	command -v pgrep >/dev/null 2>&1 || return 0
+	# 同理：进程不在跑时 pgrep 返回 1，不能让它冒泡成脚本错误。
+	pgrep -f "^${bin}( |$)" 2>/dev/null | head -1 || true
+}
+
+# scan_report_one 输出单个候选项的详情。
+# 返回 0 表示这是个可接管的部署目录（含可执行文件），非 0 表示只是散落文件。
+scan_report_one() {
+	local bin="$1" dir ver size running svc pid mark
+
+	dir="$(dirname "$bin")"
+	ver="$(probe_binary_version "$bin")"
+	size="$(stat -c '%s' "$bin" 2>/dev/null || echo 0)"
+	svc="$(probe_binary_service "$bin")"
+	pid="$(probe_running_pid "$bin")"
+
+	if [ -n "$svc" ]; then
+		running="运行中（$svc）"
+	elif [ -n "$pid" ]; then
+		running="运行中（PID $pid，无 systemd 单元）"
+	else
+		running="未运行"
+	fi
+
+	mark=" "
+	[ "$dir" = "$DIR" ] && mark="*"
+
+	printf '  %s %s\n' "$mark" "$bin"
+	printf '      版本       %s\n' "${ver:-(未知，无 .installed-version)}"
+	printf '      大小       %s\n' "$(human_size "$size")"
+	printf '      状态       %s\n' "$running"
+
+	# 关联资产：决定这是不是一个完整部署，以及能否安全接管
+	local assets="" a
+	for a in .env data browser .installed-version; do
+		[ -e "$dir/$a" ] && assets="$assets $a"
+	done
+	[ -n "$assets" ] && printf '      关联       %s\n' "$assets"
+
+	if [ -x "$dir/zcode2api" ] && [ "$dir" != "$DIR" ]; then
+		printf '      %s可接管%s    sudo %s adopt --dir %s\n' "$C_DIM" "$C_RST" "$SELF_BASENAME" "$dir"
+	fi
+	echo
+	return 0
+}
+
+# bin_scan 在 /opt 下寻找本程序的既有安装。
+# 存在的理由：手工编译部署的实例没有 .installed-version，也没有 systemd 单元，
+# 管理脚本的固定 $DIR 看不见它，导致 update/status 报「未安装」。
+bin_scan() {
+	require_root
+	local found=0 bin
+
+	echo
+	printf '%s扫描既有安装%s\n' "$C_BOLD" "$C_RST"
+	hr
+	info "扫描路径: $DIR 及 $SCAN_ROOT 下的同名可执行文件"
+
+	# 先查标准位置：这是脚本自己的安装目录
+	if [ -x "$DIR/zcode2api" ]; then
+		found=1
+		scan_report_one "$DIR/zcode2api"
+	fi
+
+	# 再递归找散落的同名可执行文件。
+	# 只认 basename 恰为 zcode2api 的文件：zcode2api.bak / .old 这类是备份，
+	# 与主程序同目录，逐个详报只会把同一部署刷屏。
+	# -x 过滤可执行位，避免把 data/ 里的缓存文件也报出来。
+	local extras_file
+	extras_file="$(mktemp)"
+	while IFS= read -r bin; do
+		[ -n "$bin" ] || continue
+		[ "$bin" = "$DIR/zcode2api" ] && continue
+		[ -x "$bin" ] || continue
+		if [ "$(basename "$bin")" = "zcode2api" ]; then
+			found=1
+			scan_report_one "$bin"
+		else
+			printf '%s\n' "$bin" >>"$extras_file"
+		fi
+	done < <(find "$SCAN_ROOT" -maxdepth 4 -type f -name 'zcode2api*' 2>/dev/null | sort)
+
+	if [ -s "$extras_file" ]; then
+		printf '%s  同目录下的其他文件（备份等，未详列）:%s\n' "$C_DIM" "$C_RST"
+		sed 's/^/    /' "$extras_file"
+		echo
+	fi
+	rm -f "$extras_file"
+
+	if [ "$found" -eq 0 ]; then
+		warn "未找到本程序的任何安装"
+		echo
+		info "可执行文件可能不在 $SCAN_ROOT，或名称不同。手动确认:"
+		printf '  find / -name "zcode2api*" -type f -executable 2>/dev/null\n'
+		echo
+		return 0
+	fi
+
+	printf '%s* = 管理脚本当前使用的目录%s\n' "$C_DIM" "$C_RST"
+	echo
+	info "接管一个散落的部署（写入 .installed-version、建 systemd 单元）:"
+	printf '  sudo %s adopt --dir <目录>\n' "$SELF_BASENAME"
+	echo
+}
+
+# bin_adopt 把一个手工部署的目录纳入管理。
+# 只补管理所需的元数据与单元，不动二进制本身——避免覆盖用户自行编译的产物。
+bin_adopt() {
+	require_root
+	detect_arch
+
+	local src="${ADOPT_DIR:-}"
+	[ -n "$src" ] || die "需要 --dir 指定部署目录，例如: sudo $SELF_BASENAME adopt --dir /opt/zcode2api-custom"
+	[ -d "$src" ] || die "目录不存在: $src"
+
+	local bin="$src/zcode2api"
+	[ -f "$bin" ] || die "$src 下没有 zcode2api 可执行文件"
+	[ -x "$bin" ] || die "$bin 没有可执行权限，请先 chmod +x"
+	src="$(cd "$src" && pwd)"
+
+	if [ "$src" = "$DIR" ]; then
+		info "$src 已是管理脚本的默认目录，无需接管"
+		return 0
+	fi
+
+	local ver
+	ver="$(probe_binary_version "$bin")"
+	info "接管目录: $src"
+	[ -n "$ver" ] && info "检测到版本: $ver" || warn "未能从二进制提取版本，接管后 update 将无法比对版本"
+
+	confirm "确认接管 $src？" || { info "已取消"; return 0; }
+
+	# 单元里的路径与用户需要指向新目录：临时切换 DIR 后复用现成的写入逻辑，
+	# 而不是把单元模板再抄一份（抄一份就会有两处需要同步维护）。
+	# 既有单元若与我们写入的不同名，接管后两个单元会同时拉起同一二进制、
+	# 抢同一端口（后启动者 bind 失败）。故接管前先停用旧单元，而不是并存。
+	local svc="$(probe_binary_service "$bin")"
+	local old_unit=""
+	if [ -n "$svc" ] && [ "/etc/systemd/system/$svc" != "$UNIT_PATH" ]; then
+		old_unit="$svc"
+		warn "检测到 $svc 正在运行该二进制"
+		info "接管后将停用 $svc 并改用 $UNIT_PATH，避免两个单元争抢端口"
+	elif [ -n "$svc" ]; then
+		info "检测到 $svc 正在运行该二进制，将就地重启"
+	fi
+
+	local old_dir="$DIR"
+	DIR="$src"
+	write_unit || { DIR="$old_dir"; die "写入 systemd 单元失败"; }
+	DIR="$old_dir"
+
+	# .installed-version 让 update/status 能识别版本；缺失时 update 会当作未知版本。
+	# 手工编译的产物无法确定对应哪个 Release，故用二进制内嵌版本号而非猜一个 tag。
+	if [ -n "$ver" ]; then
+		printf 'v%s' "$ver" >"$src/.installed-version"
+		info "已写入 $src/.installed-version = v$ver"
+	else
+		warn "跳过 .installed-version（版本未知），update 将提示无法比对"
+	fi
+
+	if [ -n "$old_unit" ]; then
+		systemctl stop "$old_unit" 2>/dev/null || true
+		systemctl disable "$old_unit" 2>/dev/null || true
+		info "已停用旧单元 $old_unit"
+	fi
+
+	systemctl daemon-reload 2>/dev/null || true
+	if confirm "现在启动服务？"; then
+		systemctl restart zcode2api.service 2>/dev/null \
+			|| systemctl start zcode2api.service 2>/dev/null \
+			|| warn "服务启动失败，请手动执行: systemctl start zcode2api"
+		ok "服务已启动"
+	fi
+
+	echo
+	warn "注意：管理脚本的默认目录仍是 $old_dir"
+	info "后续 update/status 需指定目录: sudo $SELF_BASENAME update --dir $src"
+	echo
+}
+
 bin_status() {
 	echo
 	printf '%s二进制安装%s\n' "$C_BOLD" "$C_RST"
@@ -714,10 +936,11 @@ menu() {
 		printf '  %s2)%s 更新二进制          %s6)%s Docker 更新\n' "$C_CYAN" "$C_RST" "$C_CYAN" "$C_RST"
 		printf '  %s3)%s 卸载二进制          %s7)%s Docker 卸载\n' "$C_CYAN" "$C_RST" "$C_CYAN" "$C_RST"
 		printf '  %s4)%s 查看状态            %s8)%s 服务控制（启停/重启/日志）\n' "$C_CYAN" "$C_RST" "$C_CYAN" "$C_RST"
+		printf '  %s9)%s 扫描已有安装\n' "$C_CYAN" "$C_RST"
 		printf '  %s0)%s 退出\n' "$C_CYAN" "$C_RST"
 		echo
 		local choice
-		printf '请选择 [0-8]: '
+		printf '请选择 [0-9]: '
 		read -r choice || { echo; break; }
 		case "$choice" in
 			1) menu_install ;;
@@ -728,6 +951,7 @@ menu() {
 			6) docker_update ;;
 			7) menu_docker_uninstall ;;
 			8) menu_service ;;
+			9) bin_scan ;;
 			0|"") break ;;
 			*) warn "无效选择: $choice" ;;
 		esac
@@ -844,6 +1068,8 @@ ${C_BOLD}zcode2api 管理脚本（Linux）${C_RST}
   update             更新二进制（比对 Release 版本）
   uninstall          卸载二进制
   status             查看安装状态
+  scan               扫描 /opt 下已有的本程序安装（含手工编译的）
+  adopt              把手工部署的目录纳入管理（--dir 指定）
   docker-install     Docker 安装（参考实现，未验证）
   docker-update      Docker 更新
   docker-uninstall   Docker 卸载
@@ -868,6 +1094,8 @@ ${C_BOLD}zcode2api 管理脚本（Linux）${C_RST}
 示例:
   sudo $0 install --port 3010 --user zcode
   sudo $0 update -y
+  sudo $0 scan
+  sudo $0 adopt --dir /opt/zcode2api-custom
   sudo $0 uninstall --purge
   sudo $0 docker-install
 EOF
@@ -878,7 +1106,7 @@ parse_args() {
 	if [ -n "$CMD" ]; then shift; fi
 	while [ $# -gt 0 ]; do
 		case "$1" in
-			--dir) DIR="${2:?--dir 需要路径}"; shift 2 ;;
+			--dir) ADOPT_DIR="${2:?--dir 需要路径}"; shift 2 ;;
 			--docker-dir) DOCKER_DIR="${2:?--docker-dir 需要路径}"; shift 2 ;;
 			--port) PORT="${2:?--port 需要端口}"; shift 2 ;;
 			--host) HOST="${2:?--host 需要地址}"; shift 2 ;;
@@ -902,12 +1130,20 @@ parse_args() {
 main() {
 	parse_args "$@"
 
+	# --dir 对 adopt 表示「待接管的既有目录」，对其它命令表示「本脚本的安装目录」。
+	# 两者语义不同且 adopt 会改写 DIR，故在此分流，避免 adopt 误判自己为默认目录。
+	if [ -n "$ADOPT_DIR" ] && [ "${CMD:-}" != "adopt" ]; then
+		DIR="$ADOPT_DIR"
+	fi
+
 	case "${CMD:-}" in
 		"")           menu ;;
 		install)      require_linux; bin_install ;;
 		update)       require_linux; bin_update ;;
 		uninstall)    require_linux; bin_uninstall ;;
 		status)       require_linux; bin_status ;;
+		scan)         require_linux; bin_scan ;;
+		adopt)        require_linux; bin_adopt ;;
 		docker-install)   require_linux; docker_install ;;
 		docker-update)    require_linux; docker_update ;;
 		docker-uninstall) require_linux; docker_uninstall ;;

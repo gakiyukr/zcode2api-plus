@@ -53,20 +53,61 @@ sudo ./deploy/manage.sh install            # 二進制安裝
 sudo ./deploy/manage.sh update             # 更新（自動比對 Release 版本）
 sudo ./deploy/manage.sh uninstall          # 卸載
 sudo ./deploy/manage.sh status             # 查看狀態
+sudo ./deploy/manage.sh scan               # 掃描 /opt 下已有的安裝
+sudo ./deploy/manage.sh adopt --dir /opt/zcode2api-custom   # 納管手工部署
 sudo ./deploy/manage.sh docker-install     # Docker 安裝
 sudo ./deploy/manage.sh docker-update      # Docker 更新
 sudo ./deploy/manage.sh docker-uninstall   # Docker 卸載
 ```
 
+### 納管手工編譯的部署
+
+若二進制是自己編譯後手工放置的（沒有 `.installed-version`、沒有 systemd 單元），
+管理腳本的固定 `$DIR` 看不見它，`update` / `status` 會誤報「未安裝」。用 `scan`
+找出來，再用 `adopt` 納管：
+
+```bash
+sudo ./deploy/manage.sh scan
+#    /opt/zcode2api-custom/zcode2api
+#      版本       2.0.3-go
+#      大小       15.5 MB
+#      狀態       未運行
+#      關聯        .env data
+#      可接管    sudo manage.sh adopt --dir /opt/zcode2api-custom
+
+sudo ./deploy/manage.sh adopt --dir /opt/zcode2api-custom
+```
+
+`scan` 只報告、不改動任何東西；`adopt` 才會寫入 `.installed-version` 與 systemd
+單元。要點：
+
+- **不動你的二進制**。接管只補管理所需的元數據與單元，不覆蓋自行編譯的產物。
+- **版本從二進制提取**。手工編譯沒有版本記錄，`adopt` 直接從二進制內嵌的
+  `AppVersion` 讀取，寫成 `.installed-version` 供後續 `update` 比對。
+- **舊單元會被停用**。若既有服務用的不是 `zcode2api.service`（例如
+  `zcode-legacy.service`），接管會停用它並改用標準單元——否則兩個單元會同時
+  拉起同一二進制、爭搶同一端口。
+
+納管後，後續命令需顯式指定目錄：
+
+```bash
+sudo ./deploy/manage.sh update --dir /opt/zcode2api-custom
+```
+
+> 註：`scan` / `adopt` 只在 `/opt` 下查找（`SCAN_ROOT` 可覆寫）。若部署在別處，
+> 用 `find / -name 'zcode2api*' -type f -executable` 自行確認。
+
 ### 常用選項
 
 ```bash
---dir DIR            # 安裝目錄（預設 /opt/zcode2api）
+--dir DIR            # 安裝目錄（預設 /opt/zcode2api）；adopt 時為待接管目錄
 --port PORT          # 監聽端口（預設 3000）
 --host ADDR          # 監聽地址（預設 0.0.0.0；反向代理後建議 127.0.0.1）
 --user USER          # 以非特權賬號運行（不存在則自動建立）
 --local              # 從本機源碼構建（需 Go 工具鏈）
 --version TAG        # 指定 Release 標籤，預設取最新
+                     # GitHub API 未認證限流（每小時 60 次/IP）時，查詢會返回空
+                     # 導致更新中止，此時用本選項繞開查詢
 --no-browser         # 不裝驗證碼瀏覽器依賴（改用後台人工回填）
 --no-prefetch-browser  # 安裝時不預下載 Chromium（預設會下載，約 200MB）
 --no-deps            # 跳過系統依賴安裝
