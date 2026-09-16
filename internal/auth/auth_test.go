@@ -142,3 +142,145 @@ func TestFailureTableSweepsExpiredEntries(t *testing.T) {
 		t.Fatalf("过期条目应被清理，实际剩 %d 条", remaining)
 	}
 }
+
+// ── 访客邀请码与配额 ────────────────────────────────────────────────────────
+
+func guestReq(invite, remoteAddr string) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	if invite != "" {
+		r.Header.Set("x-invite-code", invite)
+	}
+	r.RemoteAddr = remoteAddr
+	return r
+}
+
+// 未配置邀请码时必须拒绝——这个入口会写入账号池并触发真实上游调用，
+// 宁可默认关闭也不能默认开放。
+func TestVerifyInviteClosedWhenUnset(t *testing.T) {
+	svc := New(openStore(t))
+	e := svc.VerifyInvite(guestReq("anything", "203.0.113.7:1234"))
+	if e == nil || e.Status != http.StatusServiceUnavailable {
+		t.Fatalf("未配置邀请码应拒绝: %+v", e)
+	}
+}
+
+func TestVerifyInviteAcceptsCorrectCode(t *testing.T) {
+	st := openStore(t)
+	svc := New(st)
+	if err := svc.SetInviteCode("let-me-in"); err != nil {
+		t.Fatal(err)
+	}
+	if e := svc.VerifyInvite(guestReq("let-me-in", "203.0.113.7:1234")); e != nil {
+		t.Fatalf("正确邀请码应通过: %+v", e)
+	}
+	// 首尾空白被容忍：邀请码常从聊天工具复制，夹带空白是常态；
+	// 拒绝它只会制造无谓的失败，不增加任何安全性。
+	if e := svc.VerifyInvite(guestReq(" let-me-in ", "203.0.113.7:1234")); e != nil {
+		t.Fatalf("首尾空白应被容忍: %+v", e)
+	}
+	// 但中间空白不宽容：那是不同的字符串
+	if e := svc.VerifyInvite(guestReq("let me in", "203.0.113.7:1234")); e == nil {
+		t.Fatal("中间含空白的邀请码不应通过")
+	}
+}
+
+func TestVerifyInviteRejectsWrongCodeAndRateLimits(t *testing.T) {
+	st := openStore(t)
+	svc := New(st)
+	if err := svc.SetInviteCode("right"); err != nil {
+		t.Fatal(err)
+	}
+	const host = "198.51.100.9:5555"
+
+	for i := range maxGuestFailures {
+		e := svc.VerifyInvite(guestReq("wrong", host))
+		if e == nil || e.Status != http.StatusForbidden {
+			t.Fatalf("第 %d 次错误邀请码应 403: %+v", i, e)
+		}
+	}
+	// 超过阈值后进入 429，且正确邀请码也一并拒绝（防在线爆破）
+	e := svc.VerifyInvite(guestReq("right", host))
+	if e == nil || e.Status != http.StatusTooManyRequests {
+		t.Fatalf("超限后应 429: %+v", e)
+	}
+	// 其他来源不受影响
+	if e := svc.VerifyInvite(guestReq("right", "198.51.100.10:5555")); e != nil {
+		t.Fatalf("其他来源不应被牵连: %+v", e)
+	}
+}
+
+// 成功校验应清空该来源的失败计数（与后台密钥同语义）。
+func TestVerifyInviteSuccessClearsFailures(t *testing.T) {
+	st := openStore(t)
+	svc := New(st)
+	if err := svc.SetInviteCode("right"); err != nil {
+		t.Fatal(err)
+	}
+	const host = "198.51.100.11:5555"
+
+	for range maxGuestFailures - 1 {
+		_ = svc.VerifyInvite(guestReq("wrong", host))
+	}
+	if e := svc.VerifyInvite(guestReq("right", host)); e != nil {
+		t.Fatalf("阈值内正确码应通过: %+v", e)
+	}
+	// 计数已清零：再来 maxGuestFailures-1 次错误仍不该触发 429
+	for i := range maxGuestFailures - 1 {
+		e := svc.VerifyInvite(guestReq("wrong", host))
+		if e == nil || e.Status == http.StatusTooManyRequests {
+			t.Fatalf("计数未清零，第 %d 次即超限: %+v", i, e)
+		}
+	}
+}
+
+// 每日配额：同一 IP 达到上限后拒绝，换 IP 恢复，跨日重置。
+func TestAllowGuestSubmissionDailyQuota(t *testing.T) {
+	svc := New(openStore(t))
+	const host = "203.0.113.20:1234"
+
+	for i := range guestDailyLimit {
+		if !svc.AllowGuestSubmission(guestReq("", host)) {
+			t.Fatalf("第 %d 次应在配额内", i+1)
+		}
+	}
+	if svc.AllowGuestSubmission(guestReq("", host)) {
+		t.Fatalf("超过每日上限（%d）应拒绝", guestDailyLimit)
+	}
+	if !svc.AllowGuestSubmission(guestReq("", "203.0.113.21:1234")) {
+		t.Fatal("其他 IP 不应受同一配额限制")
+	}
+
+	// 跨日重置：把计数条目的日期改成昨天，再提交应放行
+	svc.mu.Lock()
+	entry := svc.guestCounts[ClientHost(guestReq("", host))]
+	entry.day = "2000-01-01"
+	svc.guestCounts[ClientHost(guestReq("", host))] = entry
+	svc.mu.Unlock()
+
+	if !svc.AllowGuestSubmission(guestReq("", host)) {
+		t.Fatal("跨日后配额应重置")
+	}
+}
+
+// 配额表按条目数阈值清理过期日期，避免长期运行后无界增长。
+func TestGuestCountsSweepDropsStaleDays(t *testing.T) {
+	svc := New(openStore(t))
+
+	svc.mu.Lock()
+	for i := range guestSweepThreshold {
+		svc.guestCounts[fmt.Sprintf("10.%d.%d.1", i/256, i%256)] = guestCount{day: "2000-01-01", used: 1}
+	}
+	svc.mu.Unlock()
+
+	// 触发一次写入（阈值命中时先清扫）
+	if !svc.AllowGuestSubmission(guestReq("", "203.0.113.30:1234")) {
+		t.Fatal("应放行")
+	}
+
+	svc.mu.Lock()
+	remaining := len(svc.guestCounts)
+	svc.mu.Unlock()
+	if remaining > 2 {
+		t.Fatalf("过期条目应被清理，实际剩 %d 条", remaining)
+	}
+}

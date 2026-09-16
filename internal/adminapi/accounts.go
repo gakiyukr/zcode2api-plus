@@ -521,6 +521,8 @@ func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"admin_key":              h.Store.AdminKey(),
 		"gateway_key":            h.Store.GatewayKey(),
 		"quota_refresh_interval": h.Store.QuotaRefreshInterval(),
+		// 邀请码回显给管理员（后台已鉴权）；空值表示访客入口关闭
+		"guest_invite_code": h.Auth.InviteCode(),
 	})
 }
 
@@ -549,6 +551,13 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.Store.SetSetting("gateway_key", key); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	if v, ok := payload["guest_invite_code"]; ok {
+		// 空值合法：表示关闭访客入口（与 admin_key/gateway_key 的必填语义相反）
+		if err := h.Auth.SetInviteCode(strings.TrimSpace(strOf(v))); err != nil {
 			writeError500(w, err)
 			return
 		}

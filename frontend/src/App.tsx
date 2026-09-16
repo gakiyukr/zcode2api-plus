@@ -10,6 +10,7 @@ import { AccountsPage } from '@/pages/accounts'
 import { ProxiesPage } from '@/pages/proxies'
 import { CaptchaPage } from '@/pages/captcha'
 import { SettingsPage } from '@/pages/settings'
+import { GuestPage } from '@/pages/guest'
 
 /* 主框架：驗證通過才掛側欄與頂欄，頁面內容由巢狀路由提供 */
 function Shell() {
@@ -33,6 +34,8 @@ export default function App() {
     <Routes>
       <Route path="/" element={<Navigate to="/admin/dashboard" replace />} />
       <Route path="/admin/login" element={<LoginPage />} />
+      {/* 訪客提交頁：獨立於後台框架，不使用後台密鑰 */}
+      <Route path="/guest" element={<GuestPage />} />
       <Route element={<Shell />}>
         <Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} />
         <Route path="/admin/dashboard" element={<DashboardPage />} />

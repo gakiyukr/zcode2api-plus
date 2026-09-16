@@ -22,7 +22,7 @@ func NewSPA(dist fs.FS) *SPA {
 
 // Register 在 mux 上注册页面路由：
 // / → 307 /admin，/admin → 307 /admin/dashboard，
-// /assets 静态直出，/admin/{path...} 回落 index.html，
+// /assets 静态直出，/admin/{path...} 与 /guest 回落 index.html，
 // /meta 提供版本信息。/admin/api/* 由 adminapi 更精确的 pattern 接管。
 func (s *SPA) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +32,8 @@ func (s *SPA) Register(mux *http.ServeMux) {
 		http.Redirect(w, r, "/admin/dashboard", http.StatusTemporaryRedirect)
 	})
 	mux.HandleFunc("GET /admin/{path...}", s.handleIndex)
+	// 访客提交页：与后台同一份 SPA 产物，但走独立路由，访客无需后台密钥。
+	mux.HandleFunc("GET /guest", s.handleIndex)
 	if s.dist != nil {
 		if assets, err := fs.Sub(s.dist, "assets"); err == nil {
 			mux.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServerFS(assets)))

@@ -148,6 +148,72 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		"所有账号均不可用或额度已用完，请在后台检查账号状态")
 }
 
+// TestAccountResult 定向测试单个账号的结果。
+type TestAccountResult struct {
+	OK     bool   // 上游返回了可交付的 200 响应
+	Status int    // 失败时的 HTTP 状态码（OK 时为 200）
+	Reason string // 失败原因（面向调用方的简述，不含凭证）
+}
+
+// TestAccount 对指定账号发起一次真实的最小请求，验证其确实可用。
+//
+// 与 RunMessages 的区别：不做选号轮询，只测这一个账号；不交付给客户端，
+// 只判断上游是否给出了可用的 200 响应。用于访客提交账号时「测试调用一次
+// 才能入池」——OAuth 授权只证明访客持有该账号，不证明它当下能服务请求。
+//
+// 注意：本方法会写账号状态（401 标 invalid、429 标 cooling 等），这正是
+// 期望行为——测试失败就该如实反映在账号状态上。
+func (e *Engine) TestAccount(ctx context.Context, acc *model.Account, modelName string) TestAccountResult {
+	if acc == nil {
+		return TestAccountResult{OK: false, Status: http.StatusBadRequest, Reason: "账号不存在"}
+	}
+	if modelName == "" {
+		modelName = AvailableModels[len(AvailableModels)-1]
+	}
+
+	body := map[string]any{
+		"model":      modelName,
+		"max_tokens": float64(1),
+		"messages": []any{
+			map[string]any{"role": "user", "content": "ping"},
+		},
+	}
+	reqID := util.RandomHex(3)
+	web.Req(reqID, orDash(modelName), false)
+
+	// 收集型 deliver：TestAccount 只关心上游是否给了 200，不把内容写出去。
+	// 必须读完 Body，否则引擎的 usage 统计与连接复用都会受影响。
+	var delivered bool
+	deliver := func(d Delivery) error {
+		delivered = true
+		_, _ = io.Copy(io.Discard, d.Body)
+		return nil
+	}
+
+	res := e.tryAccount(ctx, reqID, acc, body, modelName, false, nil, deliver)
+	if delivered {
+		web.ReqOk(reqID, 0)
+		return TestAccountResult{OK: true, Status: http.StatusOK}
+	}
+
+	// 未交付：res.final 携带失败原因（switchAccount/retryCaptcha 在单账号
+	// 语境下等价于「这次尝试没能拿到 200」）。
+	status := res.final.Status
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+	reason := "上游未返回可用响应"
+	if body, ok := res.final.Body.(map[string]any); ok {
+		if errObj, ok := body["error"].(map[string]any); ok {
+			if msg, ok := errObj["message"].(string); ok && msg != "" {
+				reason = msg
+			}
+		}
+	}
+	web.ReqErr(reqID, reason)
+	return TestAccountResult{OK: false, Status: status, Reason: reason}
+}
+
 // tryAccount 单个账号的尝试：内层为验证码重试（对齐 MAX_CAPTCHA_RETRIES）。
 func (e *Engine) tryAccount(
 	ctx context.Context,

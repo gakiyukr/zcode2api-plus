@@ -612,6 +612,77 @@ func TestClientCancelDoesNotCoolAccounts(t *testing.T) {
 	}
 }
 
+// TestAccount 只测指定账号、不走选号轮询，且不把响应交付给客户端。
+//
+// 用途是访客提交账号时的「实测通过才入池」：OAuth 授权只证明提交者持有
+// 账号，不证明它当下可用。这里验证成功路径判定与失败路径的原因提取。
+func TestTestAccount(t *testing.T) {
+	t.Run("上游 200 判定为可用", func(t *testing.T) {
+		f := newFixture(t)
+		f.respond = jsonResp(200, okUpstreamJSON)
+		acc, _ := f.st.AddAccount(model.ProviderZai, "probe", "sk-1")
+
+		res := f.eng.TestAccount(context.Background(), acc, "GLM-5.3")
+		if !res.OK || res.Status != http.StatusOK {
+			t.Fatalf("应判定可用: %+v", res)
+		}
+		if f.callCount() != 1 {
+			t.Fatalf("应恰好请求上游一次: %d", f.callCount())
+		}
+		// 请求体必须是最小的：max_tokens=1，避免为了一次探测消耗额度
+		call := f.lastCall()
+		if call.Body["max_tokens"] != float64(1) {
+			t.Fatalf("探测请求应使用 max_tokens=1: %v", call.Body["max_tokens"])
+		}
+		if _, ok := call.Body["stream"]; ok {
+			t.Fatalf("探测应为非流式: %v", call.Body)
+		}
+	})
+
+	t.Run("上游 401 判定为不可用", func(t *testing.T) {
+		f := newFixture(t)
+		f.respond = jsonResp(401, "")
+		acc, _ := f.st.AddAccount(model.ProviderZai, "probe", "sk-1")
+
+		res := f.eng.TestAccount(context.Background(), acc, "GLM-5.3")
+		if res.OK {
+			t.Fatalf("401 不应判定可用: %+v", res)
+		}
+		if res.Reason == "" {
+			t.Fatal("失败应给出原因")
+		}
+		// 状态如实反映：401 会把账号标为 invalid，这正是期望行为
+		if got := f.st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusInvalid {
+			t.Fatalf("401 应把账号标为 invalid: %s", got.Status)
+		}
+	})
+
+	t.Run("nil 账号安全拒绝", func(t *testing.T) {
+		f := newFixture(t)
+		res := f.eng.TestAccount(context.Background(), nil, "GLM-5.3")
+		if res.OK {
+			t.Fatal("nil 账号不应判定可用")
+		}
+		if f.callCount() != 0 {
+			t.Fatal("nil 账号不应发起上游请求")
+		}
+	})
+
+	t.Run("空模型名回退到可用清单", func(t *testing.T) {
+		f := newFixture(t)
+		f.respond = jsonResp(200, okUpstreamJSON)
+		acc, _ := f.st.AddAccount(model.ProviderZai, "probe", "sk-1")
+
+		res := f.eng.TestAccount(context.Background(), acc, "")
+		if !res.OK {
+			t.Fatalf("空模型名应回退并成功: %+v", res)
+		}
+		if f.callCount() != 1 {
+			t.Fatalf("应请求上游一次: %d", f.callCount())
+		}
+	})
+}
+
 func TestModelsEndpoint(t *testing.T) {
 	f := newFixture(t)
 	// Python 版 /v1/models 带 Depends(verify_gateway_key)，同样需要鉴权

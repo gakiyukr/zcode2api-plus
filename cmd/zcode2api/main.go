@@ -21,6 +21,7 @@ import (
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
+	"zcode2api/internal/guest"
 	"zcode2api/internal/model"
 	"zcode2api/internal/openai"
 	"zcode2api/internal/quota"
@@ -70,6 +71,10 @@ func serve() error {
 
 	// OpenAI 兼容层：/v1/chat/completions 复用同一引擎（M4）
 	openai.New(engine, authSvc).Register(mux)
+
+	// 访客账号提交（/guest/*）：仅 OAuth + 实测通过才入池。
+	// 默认关闭——需管理员在后台设置邀请码后才开放。
+	guest.New(st, authSvc, cm, qs, engine).Register(mux)
 
 	// Async 空闲池：与 Python 版一致按设置条件挂载
 	if config.AsyncEnabled {
