@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"zcode2api/internal/auth"
+	"zcode2api/internal/util"
 )
 
 // Handler 网关 HTTP 层。
@@ -122,7 +123,7 @@ func IncomingHeaders(r *http.Request) map[string]string {
 
 func WriteJSON(w http.ResponseWriter, status int, body any) {
 	// 与 Python JSONResponse 对齐：紧凑序列化、不转义 HTML、无尾部换行
-	data, err := marshalJSON(body)
+	data, err := util.MarshalJSON(body)
 	if err != nil {
 		http.Error(w, `{"error":{"message":"响应序列化失败","type":"internal_error"}}`, http.StatusInternalServerError)
 		return

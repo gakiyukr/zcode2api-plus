@@ -5,7 +5,6 @@ package oauth
 
 import (
 	"bytes"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"zcode2api/internal/util"
 )
 
 const (
@@ -40,18 +40,14 @@ type Flow struct {
 func NewFlow() *Flow {
 	return &Flow{
 		RedirectURI: registeredRedirectURI,
-		FlowID:      tokenURLSafe(24),
-		Nonce:       tokenURLSafe(24),
+		FlowID:      util.RandomTokenURLSafe(24),
+		Nonce:       util.RandomTokenURLSafe(24),
 		CreatedAt:   time.Now(),
 	}
 }
 
 // tokenURLSafe 生成 n 字节随机数据的 base64url 字符串（无填充）。
-func tokenURLSafe(n int) string {
-	raw := make([]byte, n)
-	_, _ = rand.Read(raw)
-	return base64.RawURLEncoding.EncodeToString(raw)
-}
+
 
 // Init 构造 state 并返回 (flow_id, authorize_url)。
 func (f *Flow) Init() (string, string, error) {
@@ -352,7 +348,7 @@ func postJSON(url string, payload any) ([]byte, error) {
 		return nil, fmt.Errorf("读取上游响应失败: %v", err)
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("上游请求失败 (%d): %s", res.StatusCode, truncate(string(body), 200))
+		return nil, fmt.Errorf("上游请求失败 (%d): %s", res.StatusCode, util.Truncate(string(body), 200))
 	}
 	return body, nil
 }
@@ -376,7 +372,7 @@ func postJSONAuth(client *http.Client, url, token string, payload any) (map[stri
 		return nil, fmt.Errorf("读取上游响应失败: %v", err)
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("上游请求失败 (%d): %s", res.StatusCode, truncate(string(body), 200))
+		return nil, fmt.Errorf("上游请求失败 (%d): %s", res.StatusCode, util.Truncate(string(body), 200))
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -402,7 +398,7 @@ func getJSON(client *http.Client, url, token string) (map[string]any, error) {
 		return nil, fmt.Errorf("读取上游响应失败: %v", err)
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("上游请求失败 (%d): %s", res.StatusCode, truncate(string(body), 200))
+		return nil, fmt.Errorf("上游请求失败 (%d): %s", res.StatusCode, util.Truncate(string(body), 200))
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -412,12 +408,7 @@ func getJSON(client *http.Client, url, token string) (map[string]any, error) {
 }
 
 // truncate 截断错误详情。
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
+
 
 // ExtractUserEmail 从 OAuth 用户资料递归取邮箱（对齐 Python extract_user_email）。
 func ExtractUserEmail(user any) *string {

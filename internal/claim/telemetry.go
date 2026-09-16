@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/util"
 )
 
 // EventReportURL 激活事件上报端点（测试可覆写指向 mock）。
@@ -70,7 +71,7 @@ func BuildActivationEventBody(element, userID, deviceMid string) map[string]any 
 		osCategory = "linux"
 	}
 	return map[string]any{
-		"event_id":           newUUID(),
+		"event_id":           util.NewUUID(),
 		"client_timezone":    timezone(),
 		"client_language":    language(),
 		"element_name":       element,
@@ -109,12 +110,12 @@ func PostActivationEvent(userID, element, deviceMid string) error {
 	raw, _ := io.ReadAll(res.Body)
 	text := string(raw)
 	if res.StatusCode >= 400 {
-		return fmt.Errorf("event/report %s HTTP %d: %s", element, res.StatusCode, truncateStr(text, 120))
+		return fmt.Errorf("event/report %s HTTP %d: %s", element, res.StatusCode, util.Truncate(text, 120))
 	}
 	var parsed map[string]any
 	_ = json.Unmarshal(raw, &parsed)
 	if code := BusinessCode(parsed); code != 0 {
-		return fmt.Errorf("event/report %s 业务码异常(%d): %s", element, code, truncateStr(text, 120))
+		return fmt.Errorf("event/report %s 业务码异常(%d): %s", element, code, util.Truncate(text, 120))
 	}
 	return nil
 }
@@ -143,9 +144,4 @@ func toInt(v any) int {
 	return -1
 }
 
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
+

@@ -4,7 +4,6 @@
 package openai
 
 import (
-	"bufio"
 	"encoding/json"
 	"io"
 	"strings"
@@ -13,40 +12,8 @@ import (
 
 // reencodeResponsesSSE 读取上游 SSE 并写出 Responses 事件流。
 func reencodeResponsesSSE(body io.Reader, write func(string) error) error {
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-
 	enc := &responsesEncoder{write: write, startedAt: time.Now()}
-	event := ""
-	var data strings.Builder
-
-	flush := func() error { return enc.dispatch(event, data.String()) }
-	reset := func() { event, data = "", strings.Builder{} }
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		switch {
-		case strings.HasPrefix(line, "event:"):
-			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-		case strings.HasPrefix(line, "data:"):
-			if data.Len() > 0 {
-				data.WriteByte('\n')
-			}
-			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		case line == "":
-			if err := flush(); err != nil {
-				return err
-			}
-			reset()
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	if event != "" || data.Len() > 0 {
-		return flush()
-	}
-	return nil
+	return scanSSE(body, enc.dispatch)
 }
 
 // responsesEncoder 跨事件流状态。

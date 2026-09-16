@@ -2,8 +2,7 @@
 
 > 本仓库 `C:\Projects\zcode2api-plus`（分支 `go-rewrite`）即 Go 重写仓库（原 `go/`
 > 子目录已上提到仓库根，Python 版实验工作区内容已移除）。计划与行为契约参照
-> Python 版（原主仓库 `app/` + `main.py`，现归档于本仓库 `python-legacy` 分支）
-> 与 `HANDOFF.md`。
+> Python 版（原主仓库 `app/` + `main.py`，现归档于本仓库 `python-legacy` 分支）。
 > 目标：用 Go 重写 Python 版的全部后端功能，
 > 做到**与 Python 版行为对齐、数据互通（共用同一个 `data/accounts.db`）、前端零改动**。
 > 本文档是唯一的计划与进度台账，每完成一项就勾选对应 `- [ ]`。

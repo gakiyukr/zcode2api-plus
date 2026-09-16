@@ -4,14 +4,13 @@
 package model
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
+	"zcode2api/internal/util"
 )
 
 const ProviderZai = "zai"
@@ -691,11 +690,7 @@ func newAccountID(name string) string {
 	if safe == "" {
 		safe = "account"
 	}
-	return safe + "-" + randomHex(4)
+	return safe + "-" + util.RandomHex(4)
 }
 
-func randomHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
+

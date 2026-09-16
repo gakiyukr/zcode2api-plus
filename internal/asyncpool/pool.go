@@ -6,9 +6,7 @@ package asyncpool
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +25,7 @@ import (
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
+	"zcode2api/internal/util"
 	"zcode2api/internal/web"
 )
 
@@ -76,12 +75,12 @@ func (p *Pool) Register(mux *http.ServeMux) {
 // handleAsyncMessages 创建 async ticket 并 SSE 等待结果。
 func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 	if e := p.Auth.VerifyGatewayKey(r); e != nil {
-		writeJSONStatus(w, e.Status, map[string]any{"detail": e.Message})
+		gateway.WriteAuthError(w, e)
 		return
 	}
 
 	if !config.AsyncEnabled {
-		writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+		gateway.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": map[string]any{"message": "Async 路由未启用", "type": "feature_disabled"},
 		})
 		return
@@ -89,7 +88,7 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 
 	var body map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+		gateway.WriteJSON(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]any{"message": "请求体不是合法 JSON", "type": "invalid_request"},
 		})
 		return
@@ -102,9 +101,9 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 
 	// 模型白名單與 /v1/messages 一致：僅開放清單內模型，其餘在建票前一律拒絕
 	if !gateway.ModelAllowed(body["model"]) {
-		modelName := anyToString(body["model"])
+		modelName := gateway.AnyToString(body["model"])
 		web.Warn("async", fmt.Sprintf("模型 %s 不在開放清單內，拒絕建票", modelName))
-		writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+		gateway.WriteJSON(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]any{
 				"message": fmt.Sprintf("模型 %s 不在可用清單內，僅支持 %s", modelName, strings.Join(gateway.AvailableModels, ", ")),
 				"type":    "model_not_allowed",
@@ -194,7 +193,7 @@ func (p *Pool) streamTicket(ctx context.Context, write func(string) error, ticke
 // newTicket 创建 ticket 并启动后台任务，返回 ticket_id。
 func (p *Pool) newTicket(body map[string]any) string {
 	p.sweepExpiredTickets()
-	ticketID := newUUID()
+	ticketID := util.NewUUID()
 	ctx, cancel := context.WithCancel(context.Background())
 	tk := &ticket{
 		status:    "pending",
@@ -297,7 +296,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		// 每个账号在副本上注入 zcode_system（NormalizeBody 的 system 注入不幂等）
 		actualBody := shallowCopyBody(body)
 		gateway.NormalizeBody(actualBody, true)
-		payload, err := marshalJSON(actualBody)
+		payload, err := util.MarshalJSON(actualBody)
 		if err != nil {
 			p.emitError(ctx, ticketID, "请求体序列化失败", "build_error")
 			return
@@ -454,8 +453,8 @@ func (p *Pool) attemptUpstream(
 		// 402 → 该模型额度用完
 		if resp.StatusCode == http.StatusPaymentRequired {
 			gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
-				fmt.Sprintf("%s 額度已用完", orCurrent(modelName)))
-			web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+				fmt.Sprintf("%s 額度已用完", gateway.OrCurrent(modelName)))
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, gateway.OrCurrent(modelName)))
 			return false, errNetwork{bodyText}
 		}
 
@@ -469,8 +468,8 @@ func (p *Pool) attemptUpstream(
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if gateway.IsQuotaExhaustedCode(bodyText) {
 				gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
-					fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
-				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
+					fmt.Sprintf("%s 額度/用量上限已達", gateway.OrCurrent(modelName)))
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, gateway.OrCurrent(modelName)))
 			} else {
 				gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling, "上游限流 HTTP 429", time.Now())
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
@@ -527,8 +526,8 @@ func (p *Pool) handleUpstreamJSON(
 	case code == "1005":
 		// 每日额度用完：该模型从池中摘除，换号重试
 		gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
-			fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)))
-		web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 每日額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+			fmt.Sprintf("%s 每日額度已用完", gateway.OrCurrent(modelName)))
+		web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 每日額度用完，切換下一個", acc.Name, gateway.OrCurrent(modelName)))
 		return false, errNetwork{text}
 
 	case code == "3007":
@@ -565,14 +564,6 @@ func (p *Pool) handleUpstreamJSON(
 
 // errCaptchaRejected 上游拒绝验证码：调用方在内层循环内换令牌重试（不换号）。
 var errCaptchaRejected = errors.New("上游拒绝验证码")
-
-// orCurrent 模型名为空时的占位文案（与 gateway 同语义）。
-func orCurrent(modelName string) string {
-	if modelName == "" {
-		return "當前模型"
-	}
-	return modelName
-}
 
 // errDelivered 非 200 错误体已作为 error 事件投递给客户端，任务直接结束。
 var errDelivered = errors.New("已投递错误事件")
@@ -669,21 +660,13 @@ func (p *Pool) clientFor(acc *model.Account) *http.Client {
 
 // marshalJSON 与网关一致（Python json.dumps(ensure_ascii=False) 形态）：
 // 紧凑序列化、不转义 HTML 字符、无尾部换行。
-func marshalJSON(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
+
 
 // sseJSON 对齐 Python json.dumps 默认的 ensure_ascii=True：非 ASCII 字符
 // 转义为 \uXXXX（含 UTF-16 代理对），HTML 字符不转义。分隔符沿用 Go 紧凑
 // 形态（Python 默认逗号冒号后带空格，SSE 消费方按 JSON 解析无感知）。
 func sseJSON(v any) string {
-	data, err := marshalJSON(v)
+	data, err := util.MarshalJSON(v)
 	if err != nil {
 		return "{}"
 	}
@@ -711,31 +694,8 @@ func shallowCopyBody(body map[string]any) map[string]any {
 	return out
 }
 
-// anyToString 对应 Python str(v or "")：nil → 空串。
-func anyToString(v any) string {
-	if v == nil {
-		return ""
-	}
-	return fmt.Sprint(v)
-}
-
 // newUUID 生成 UUIDv4（不引入第三方依赖）。
-func newUUID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
+
 
 // writeJSONStatus 错误 JSON 响应（与网关 writeJSON 同形态）。
-func writeJSONStatus(w http.ResponseWriter, status int, body any) {
-	data, err := marshalJSON(body)
-	if err != nil {
-		http.Error(w, `{"error":{"message":"响应序列化失败","type":"internal_error"}}`, http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(data)
-}
+

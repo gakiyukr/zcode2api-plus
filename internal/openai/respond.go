@@ -4,7 +4,6 @@ package openai
 
 import (
 	"encoding/json"
-	"fmt"
 	"time"
 )
 
@@ -167,6 +166,3 @@ func usageChunk(id, model string, usage map[string]any) map[string]any {
 		"usage":   usage,
 	}
 }
-
-// errStr 安全取错误信息（格式化任意值）。
-func errStr(v any) string { return fmt.Sprint(v) }

@@ -9,19 +9,16 @@ import (
 	"strings"
 )
 
-// reencodeSSE 读取上游 SSE 流并写出 OpenAI chunk 流；includeUsage 为 true 时
-// 终止前附 usage chunk。write 只接收 `data: ...\n\n` 形态的完整事件。
-// 返回 write 或读取的错误（客户端中断由调用方经 write 错误感知）。
-func reencodeSSE(body io.Reader, includeUsage bool, write func(string) error) error {
+// scanSSE 逐行解析上游 SSE，把每个完整事件（event 名 + data 正文）交给 dispatch。
+// 事件边界是空行；流以事件收尾而非空行时同样分发。注释行（: keepalive）忽略。
+//
+// /v1/chat/completions 与 /v1/responses 共用这段骨架，仅 dispatch 的实现不同。
+func scanSSE(body io.Reader, dispatch func(event, data string) error) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
-	enc := &sseEncoder{write: write, includeUsage: includeUsage}
 	event := ""
 	var data strings.Builder
-
-	flush := func() error { return enc.dispatch(event, data.String()) }
-	reset := func() { event, data = "", strings.Builder{} }
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -34,24 +31,29 @@ func reencodeSSE(body io.Reader, includeUsage bool, write func(string) error) er
 			}
 			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 		case line == "":
-			if err := flush(); err != nil {
+			if err := dispatch(event, data.String()); err != nil {
 				return err
 			}
-			reset()
+			event, data = "", strings.Builder{}
 		}
-		// 注释行（: keepalive）与其他行忽略
 	}
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-	// 流以事件收尾而非空行时同样分发
 	if event != "" || data.Len() > 0 {
-		if err := flush(); err != nil {
-			return err
-		}
+		return dispatch(event, data.String())
 	}
 	return nil
 }
+
+// reencodeSSE 读取上游 SSE 流并写出 OpenAI chunk 流；includeUsage 为 true 时
+// 终止前附 usage chunk。write 只接收 `data: ...\n\n` 形态的完整事件。
+// 返回 write 或读取的错误（客户端中断由调用方经 write 错误感知）。
+func reencodeSSE(body io.Reader, includeUsage bool, write func(string) error) error {
+	enc := &sseEncoder{write: write, includeUsage: includeUsage}
+	return scanSSE(body, enc.dispatch)
+}
+
 
 // sseEncoder 持有跨事件的流状态（id/model/tool 序号/usage）。
 type sseEncoder struct {

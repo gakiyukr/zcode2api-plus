@@ -4,7 +4,6 @@
 package adminapi
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"zcode2api/internal/model"
 	"zcode2api/internal/quota"
 	"zcode2api/internal/store"
+	"zcode2api/internal/util"
 )
 
 // Handler 后台管理 HTTP 层。
@@ -87,7 +87,7 @@ func errNotFound(msg string) *apiError { return &apiError{http.StatusNotFound, m
 
 // writeJSON 与 Python JSONResponse 对齐：紧凑序列化、不转义 HTML、无尾部换行。
 func writeJSON(w http.ResponseWriter, status int, body any) {
-	data, err := marshalJSON(body)
+	data, err := util.MarshalJSON(body)
 	if err != nil {
 		http.Error(w, `{"detail":"响应序列化失败"}`, http.StatusInternalServerError)
 		return
@@ -111,15 +111,7 @@ func writeError500(w http.ResponseWriter, err error) {
 }
 
 // marshalJSON 与 Python json.dumps(ensure_ascii=False) 对齐：不转义 HTML 字符。
-func marshalJSON(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
+
 
 // decodeBody 解析 JSON 请求体；非法 JSON 一律 400
 // （FastAPI 为 422，仅错误码差异，detail 形态一致）。

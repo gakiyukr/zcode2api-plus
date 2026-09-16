@@ -7,11 +7,7 @@
 package store
 
 import (
-	"bytes"
-	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +23,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
+	"zcode2api/internal/util"
 )
 
 const (
@@ -157,7 +154,7 @@ func (s *Store) bootstrapAuthKeys() error {
 		if config.AdminKeyEnv != "" {
 			adminKey = config.AdminKeyEnv
 		} else {
-			adminKey = randomTokenURLSafe(24)
+			adminKey = util.RandomTokenURLSafe(24)
 			s.GeneratedAdminKey = adminKey
 		}
 		if err := s.setMeta("admin_key", adminKey); err != nil {
@@ -170,7 +167,7 @@ func (s *Store) bootstrapAuthKeys() error {
 		if config.GatewayKeyEnv != "" {
 			gatewayKey = config.GatewayKeyEnv
 		} else {
-			gatewayKey = "sk-" + randomTokenURLSafe(24)
+			gatewayKey = "sk-" + util.RandomTokenURLSafe(24)
 			s.GeneratedGatewayKey = gatewayKey
 		}
 		if err := s.setMeta("gateway_key", gatewayKey); err != nil {
@@ -239,7 +236,7 @@ func (s *Store) load() error {
 // ── 持久化（调用方须持有 s.mu）──────────────────────────────────────────────
 
 func (s *Store) persistAccountLocked(acc *model.Account) error {
-	data, err := marshalJSON(acc)
+	data, err := util.MarshalJSON(acc)
 	if err != nil {
 		return err
 	}
@@ -263,15 +260,7 @@ func (s *Store) setMeta(key, value string) error {
 }
 
 // marshalJSON 与 Python json.dumps(ensure_ascii=False) 对齐：不转义 HTML 字符。
-func marshalJSON(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
+
 
 // ── 设置 ────────────────────────────────────────────────────────────────────
 
@@ -350,7 +339,7 @@ func (s *Store) listProxyProfilesLocked() []ProxyProfile {
 }
 
 func (s *Store) saveProxyProfilesLocked(profiles []ProxyProfile) error {
-	data, err := marshalJSON(profiles)
+	data, err := util.MarshalJSON(profiles)
 	if err != nil {
 		return err
 	}
@@ -379,7 +368,7 @@ func (s *Store) AddProxyProfile(name, url string, enabled bool) (ProxyProfile, e
 			return ProxyProfile{}, errors.New("代理名稱已存在")
 		}
 	}
-	profile := ProxyProfile{ID: "proxy-" + randomHex(4), Name: name, URL: *normalized, Enabled: enabled}
+	profile := ProxyProfile{ID: "proxy-" + util.RandomHex(4), Name: name, URL: *normalized, Enabled: enabled}
 	profiles = append(profiles, profile)
 	return profile, s.saveProxyProfilesLocked(profiles)
 }
@@ -879,17 +868,9 @@ func (s *Store) ImportAccounts(payload ImportPayload) (int, error) {
 
 // ── 内部工具 ────────────────────────────────────────────────────────────────
 
-func randomTokenURLSafe(nBytes int) string {
-	b := make([]byte, nBytes)
-	_, _ = rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
-}
 
-func randomHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
+
+
 
 func boolToInt(b bool) int {
 	if b {

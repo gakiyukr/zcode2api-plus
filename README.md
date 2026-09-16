@@ -115,13 +115,34 @@ JWT 賬號入池（批量添加 / OAuth / CLI login）後自動：激活事件�
 
 ## 發佈與開發
 
+```bash
+go build ./... && go vet ./... && go test ./...   # 全量驗證
+go test -race ./...                               # 併發檢查（需 C 工具鏈）
+```
+
 - 推 `v*` tag → GitHub Actions 自動交叉編譯 Linux 產物（linux/amd64、linux/arm64）
   並上傳 Releases。僅維護這兩個平台：本項目面向服務端自部署。
-- 全量驗證：`go build ./... && go vet ./... && go test ./...`；併發檢查 `go test -race ./...`
-  （需 C 工具鏈）。
-- 前端改動：`cd frontend && npm install && npm run build`，並把更新後的 `frontend/dist` 一併提交
-  （`dist` 已入庫並由 `go:embed` 打包）。
-- 行為契約與里程碑台账見 `PLAN.md`；交接注意事項見 `HANDOFF.md`。
+- 前端改動：`cd frontend && npm install && npm run build`，把更新後的 `frontend/dist`
+  一併提交（`dist` 已入庫並由 `go:embed` 打包；改版後要刪掉舊的 hash 檔）。
+- 行為契約與里程碑台账見 [`PLAN.md`](PLAN.md)（唯一權威，含逐項驗收狀態）。
+
+### 維護者注意
+
+- **`deploy/manage.sh` 的 systemd 模板有兩份**：`deploy/zcode2api.service` 與腳本內
+  `write_unit()` 的 heredoc（單獨下載腳本時走後者）。改模板時**兩處都要改**。
+- **部署腳本必須保持 LF**：`.gitattributes` 已對 `*.sh` / `*.service` 強制 `eol=lf`，
+  改動後用 `git ls-files --eol deploy/` 確認索引為 `i/lf`；可執行位用
+  `git update-index --chmod=+x` 設定（Windows 檔案系統不保留該位）。
+- **`.env` 不會被自動載入**：專案未引入 dotenv，`manage.sh` 產生的 `.env` 由 systemd
+  的 `EnvironmentFile` 讀取；本機直接跑二進制時需自行 source。
+- **`frontend/dist` 的 embed 宣告必須在倉庫根包**（`webui.go`）：`go:embed` 只能引用
+  宣告檔所在目錄樹內的文件，`internal/web` 無法引用它。
+- **上游回應形態**：zcode.z.ai 的非流式回應是**標準 Anthropic Messages 頂層形態**
+  （`id`/`content`/`stop_reason`/`usage` 都在頂層，**沒有**嵌套 `message` 物件）。
+  權威依據見 `internal/gateway/usage.go` 頭部註釋。
+- **測試隔離**：一律 `config.DBPath = filepath.Join(t.TempDir(), "accounts.db")`；
+  captcha 測試用 `SetSolver`（假求解器）+ `SetConfigProvider`（固定配置），否則會打真實
+  上游；e2e 帳號用 api_key 模式（憑證不含兩個點）即不觸發驗證碼路徑，離線穩定。
 
 ## 賬號歸檔
 

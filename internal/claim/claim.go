@@ -6,7 +6,6 @@ package claim
 
 import (
 	"bytes"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -21,6 +20,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
+	"zcode2api/internal/util"
 	"zcode2api/internal/web"
 )
 
@@ -121,7 +121,7 @@ func ParsePlan(raw map[string]any) map[string]any {
 			grants = append(grants, map[string]any{
 				"name":   name,
 				"units":  asFloat(firstNonNil(ent["grant_units"], ent["grantUnits"])),
-				"period": orDefault(orFirst(ent, "period"), "one_time"),
+				"period": util.OrDefault(orFirst(ent, "period"), "one_time"),
 			})
 		}
 	}
@@ -423,12 +423,7 @@ func orFirst(m map[string]any, keys ...string) string {
 	return ""
 }
 
-func orDefault(v, fallback string) string {
-	if v == "" {
-		return fallback
-	}
-	return v
-}
+
 
 // firstNonNil 取首个非 nil 值。
 func firstNonNil(values ...any) any {
@@ -483,11 +478,4 @@ func indexOf(s, sub string) int {
 	return -1
 }
 
-// newUUID 随机 UUID v4（事件体 event_id）。
-func newUUID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
+

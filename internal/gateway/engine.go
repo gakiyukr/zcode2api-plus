@@ -6,7 +6,6 @@ package gateway
 import (
 	"bytes"
 	"context"
-	cryptoRand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +22,7 @@ import (
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
+	"zcode2api/internal/util"
 	"zcode2api/internal/web"
 )
 
@@ -61,7 +61,7 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 		Store:           st,
 		Captcha:         cm,
 		Client:          client,
-		BusyRetryDelays: []time.Duration{time.Second, 2 * time.Second},
+		BusyRetryDelays: startPlanBusyRetryDelays,
 		now:             time.Now,
 	}
 }
@@ -118,7 +118,7 @@ type attemptResult struct {
 func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingHeaders map[string]string, deliver DeliverFunc) runResult {
 	modelName, _ := body["model"].(string)
 	stream := bodyBool(body, "stream")
-	reqID := randomHex(3)
+	reqID := util.RandomHex(3)
 	web.Req(reqID, orDash(modelName), stream)
 
 	tried := map[string]bool{}
@@ -181,7 +181,7 @@ func (e *Engine) tryAccount(
 		// 每个账号在副本上做 NormalizeBody（system 注入不幂等，见 body.go）
 		actualBody := shallowCopyBody(body)
 		NormalizeBody(actualBody, needsCaptcha)
-		payload, err := marshalJSON(actualBody)
+		payload, err := util.MarshalJSON(actualBody)
 		if err != nil {
 			web.Err(reqID, fmt.Sprintf("请求体序列化失败: %v", err))
 			return attemptResult{final: errResult(http.StatusBadRequest, "invalid_request", "请求体无法序列化")}
@@ -309,8 +309,8 @@ func (e *Engine) handleUpstreamError(
 
 	// 3) 402 → 该模型耗尽
 	if resp.StatusCode == http.StatusPaymentRequired {
-		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度已用完", orCurrent(modelName)))
-		web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度已用完", OrCurrent(modelName)))
+		web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, OrCurrent(modelName)))
 		e.fireRefresh(acc)
 		return attemptResult{switchAccount: true}
 	}
@@ -337,8 +337,8 @@ func (e *Engine) handleUpstreamError(
 	// 5) 429：官方用量上限码族 → 该模型耗尽；其余瞬时限流 → 冷却
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if quotaExhaustedCodes[UpstreamBusinessCode(text)] {
-			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
-			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
+			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", OrCurrent(modelName)))
+			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, OrCurrent(modelName)))
 			e.fireRefresh(acc)
 		} else {
 			e.mark(acc, model.StatusCooling, "上游限流 HTTP 429")
@@ -382,8 +382,8 @@ func (e *Engine) handleUpstreamJSON(
 
 	switch {
 	case code == "1005":
-		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)))
-		web.Warn(reqID, fmt.Sprintf("帳號 %s 的 %s 每日額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 每日額度已用完", OrCurrent(modelName)))
+		web.Warn(reqID, fmt.Sprintf("帳號 %s 的 %s 每日額度用完，切換下一個", acc.Name, OrCurrent(modelName)))
 		e.fireRefresh(acc)
 		return attemptResult{switchAccount: true}
 
@@ -591,15 +591,7 @@ func (e *Engine) captchaRequired(reqID, detail string) runResult {
 // ── 小工具 ──────────────────────────────────────────────────────────────────
 
 // marshalJSON 与 Python json.dumps(ensure_ascii=False) 对齐：不转义 HTML 字符。
-func marshalJSON(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
+
 
 // teeReader 在读取时同步餵入 usage 收集器。
 type teeReader struct {
@@ -695,7 +687,9 @@ func hasCaptchaChallengeHeader(header http.Header) bool {
 	return false
 }
 
-func orCurrent(modelName string) string {
+// OrCurrent 模型名为空时的占位文案。
+// 导出供 asyncpool 复用：两条路径对同一情境必须给出相同文案。
+func OrCurrent(modelName string) string {
 	if modelName == "" {
 		return "當前模型"
 	}
@@ -709,8 +703,4 @@ func orDash(modelName string) string {
 	return modelName
 }
 
-func randomHex(n int) string {
-	b := make([]byte, n)
-	_, _ = cryptoRand.Read(b)
-	return fmt.Sprintf("%x", b)
-}
+

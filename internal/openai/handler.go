@@ -81,7 +81,9 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 }
 
 // deliverJSON 非流式交付：读上游 Anthropic JSON → 转换为 OpenAI 形态回写。
-func deliverJSON(w http.ResponseWriter, d gateway.Delivery) error {
+// deliverJSONWith 把上游 JSON 经 convert 转换后写出。
+// /v1/chat/completions 与 /v1/responses 仅转换器不同，共用这段读取与错误映射。
+func deliverJSONWith(w http.ResponseWriter, d gateway.Delivery, convert func(map[string]any) map[string]any) error {
 	buffered, err := io.ReadAll(d.Body)
 	if err != nil {
 		return err
@@ -91,7 +93,7 @@ func deliverJSON(w http.ResponseWriter, d gateway.Delivery) error {
 		writeError(w, http.StatusBadGateway, "上游响应不是合法 JSON", "invalid_upstream_response")
 		return nil
 	}
-	converted := ConvertResponse(payload)
+	converted := convert(payload)
 	if converted == nil {
 		writeError(w, http.StatusBadGateway, "上游响应缺少消息内容", "invalid_upstream_response")
 		return nil
@@ -100,8 +102,15 @@ func deliverJSON(w http.ResponseWriter, d gateway.Delivery) error {
 	return nil
 }
 
+func deliverJSON(w http.ResponseWriter, d gateway.Delivery) error {
+	return deliverJSONWith(w, d, ConvertResponse)
+}
+
 // deliverStream 流式交付：SSE 头 + 逐事件重编码。
-func deliverStream(w http.ResponseWriter, d gateway.Delivery, includeUsage bool) error {
+// deliverSSEWith 设置 SSE 响应头，把 reencode 产出的每个事件写给客户端并 flush，
+// 收尾时把剩余字节读完以触发引擎的 usage 统计（对齐 finishDelivery 的完整交付语义）。
+// /v1/chat/completions 与 /v1/responses 仅重编码器不同，共用这段交付骨架。
+func deliverSSEWith(w http.ResponseWriter, d gateway.Delivery, reencode func(io.Reader, func(string) error) error) error {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
@@ -109,7 +118,7 @@ func deliverStream(w http.ResponseWriter, d gateway.Delivery, includeUsage bool)
 	if flusher != nil {
 		flusher.Flush()
 	}
-	err := reencodeSSE(d.Body, includeUsage, func(event string) error {
+	err := reencode(d.Body, func(event string) error {
 		if _, werr := io.WriteString(w, event); werr != nil {
 			return werr
 		}
@@ -121,9 +130,14 @@ func deliverStream(w http.ResponseWriter, d gateway.Delivery, includeUsage bool)
 	if err != nil {
 		return err
 	}
-	// 完整收尾：触发引擎的 usage 统计（对齐 finishDelivery 的完整交付语义）
 	_, err = io.Copy(io.Discard, d.Body)
 	return err
+}
+
+func deliverStream(w http.ResponseWriter, d gateway.Delivery, includeUsage bool) error {
+	return deliverSSEWith(w, d, func(body io.Reader, emit func(string) error) error {
+		return reencodeSSE(body, includeUsage, emit)
+	})
 }
 
 // writeError OpenAI 错误形态（error.message / error.type）。

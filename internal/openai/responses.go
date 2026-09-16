@@ -6,7 +6,6 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -384,45 +383,10 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 // deliverResponsesJSON 非流式交付。
 func deliverResponsesJSON(w http.ResponseWriter, d gateway.Delivery) error {
-	buffered, err := io.ReadAll(d.Body)
-	if err != nil {
-		return err
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(buffered, &payload); err != nil {
-		writeError(w, http.StatusBadGateway, "上游响应不是合法 JSON", "invalid_upstream_response")
-		return nil
-	}
-	converted := ConvertResponsesResponse(payload)
-	if converted == nil {
-		writeError(w, http.StatusBadGateway, "上游响应缺少消息内容", "invalid_upstream_response")
-		return nil
-	}
-	gateway.WriteJSON(w, http.StatusOK, converted)
-	return nil
+	return deliverJSONWith(w, d, ConvertResponsesResponse)
 }
 
 // deliverResponsesStream 流式交付：上游 SSE → response.* 事件流。
 func deliverResponsesStream(w http.ResponseWriter, d gateway.Delivery) error {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
-	if flusher != nil {
-		flusher.Flush()
-	}
-	err := reencodeResponsesSSE(d.Body, func(event string) error {
-		if _, werr := io.WriteString(w, event); werr != nil {
-			return werr
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(io.Discard, d.Body)
-	return err
+	return deliverSSEWith(w, d, reencodeResponsesSSE)
 }
