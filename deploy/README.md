@@ -89,7 +89,16 @@ sudo ./deploy/manage.sh adopt --dir /opt/zcode2api-custom
   `zcode-legacy.service`），接管會停用它並改用標準單元——否則兩個單元會同時
   拉起同一二進制、爭搶同一端口。
 
-納管後，後續命令需顯式指定目錄：
+**部署已在 `/opt/zcode2api`**（手工放進去、非腳本安裝）時同樣適用——目錄無需搬動，
+`adopt` 就地補上 `.installed-version` 與 systemd 單元：
+
+```bash
+sudo ./deploy/manage.sh adopt --dir /opt/zcode2api
+# 之後即可直接
+sudo ./deploy/manage.sh update
+```
+
+搬動過的部署，後續命令需顯式指定目錄：
 
 ```bash
 sudo ./deploy/manage.sh update --dir /opt/zcode2api-custom
@@ -120,7 +129,7 @@ sudo ./deploy/manage.sh migrate --dir /opt/zcode2api-custom
 7. **詢問是否刪除舊目錄**。數據已確認遷移後才問；選否則保留，可手動清理。
 
 原地升級：若源目錄本就是 `/opt/zcode2api`，則無處可搬，直接原地替換二進制，
-`data/` 與 `.env` 不動。
+`data/` 與 `.env` 不動（`migrate` 輸出會標明「原地升級」）。
 
 目標目錄已被佔用（存在另一個部署）時，會改用 `/opt/zcode2api-migrated`，
 避免把兩個不同實例合併到同一目錄。

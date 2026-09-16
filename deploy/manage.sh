@@ -739,12 +739,13 @@ menu_migrate() {
 
 	local -a cands=()
 	local bin
-	# 候选来自 scan 的同一判据：basename 恰为 zcode2api 且可执行
+	# 候选来自 scan 的同一判据：basename 恰为 zcode2api 且可执行。
+	# 标准目录也算候选：手工放进去的部署同样缺元数据，需要纳管或升级，
+	# 只是处理方式不同（就地而非搬迁），故在下方标注出来。
 	while IFS= read -r bin; do
 		[ -n "$bin" ] || continue
 		[ -x "$bin" ] || continue
 		[ "$(basename "$bin")" = "zcode2api" ] || continue
-		[ "$(dirname "$bin")" = "$DIR" ] && continue
 		cands+=("$(dirname "$bin")")
 	done < <(find "$SCAN_ROOT" -maxdepth 4 -type f -name 'zcode2api' 2>/dev/null | sort)
 
@@ -753,7 +754,7 @@ menu_migrate() {
 	hr
 
 	if [ "${#cands[@]}" -eq 0 ]; then
-		warn "未在 $SCAN_ROOT 下找到可迁移的部署（已排除标准目录 $DIR）"
+		warn "未在 $SCAN_ROOT 下找到本程序的部署"
 		info "若部署在别处，用命令行指定: sudo $SELF_BASENAME migrate --dir <目录>"
 		echo
 		return 0
@@ -762,7 +763,11 @@ menu_migrate() {
 	local i
 	for i in "${!cands[@]}"; do
 		bin="${cands[$i]}/zcode2api"
-		printf '  %s%d)%s %s\n' "$C_CYAN" "$((i + 1))" "$C_RST" "${cands[$i]}"
+		local note=""
+		if [ "${cands[$i]}" = "$DIR" ]; then
+			note="  （标准目录，就地纳管并升级）"
+		fi
+		printf '  %s%d)%s %s%s\n' "$C_CYAN" "$((i + 1))" "$C_RST" "${cands[$i]}" "$note"
 		printf '       版本 %s   %s\n' \
 			"$(probe_binary_version "$bin" || echo '?')" \
 			"$(probe_binary_service "$bin" || echo '未运行')"
@@ -968,14 +973,19 @@ bin_adopt() {
 	[ -x "$bin" ] || die "$bin 没有可执行权限，请先 chmod +x"
 	src="$(cd "$src" && pwd)"
 
-	if [ "$src" = "$DIR" ]; then
-		info "$src 已是管理脚本的默认目录，无需接管"
-		return 0
-	fi
+	# 已在标准目录的部署同样需要纳管：手工放进去的二进制没有 .installed-version，
+	# 也没有 systemd 单元，status 会显示版本未知、update 无从比对。
+	# 故此处不再早退，只是无需搬迁。
+	local in_place="false"
+	[ "$src" = "$DIR" ] && in_place="true"
 
 	local ver
 	ver="$(probe_binary_version "$bin")"
-	info "接管目录: $src"
+	if [ "$in_place" = "true" ]; then
+		info "接管目录: $src（已在标准目录，就地纳管）"
+	else
+		info "接管目录: $src"
+	fi
 	[ -n "$ver" ] && info "检测到版本: $ver" || warn "未能从二进制提取版本，接管后 update 将无法比对版本"
 
 	confirm "确认接管 $src？" || { info "已取消"; return 0; }
@@ -1023,8 +1033,12 @@ bin_adopt() {
 	fi
 
 	echo
-	warn "注意：管理脚本的默认目录仍是 $old_dir"
-	info "后续 update/status 需指定目录: sudo $SELF_BASENAME update --dir $src"
+	if [ "$in_place" = "true" ]; then
+		ok "已纳管，后续可直接执行: sudo $SELF_BASENAME update"
+	else
+		warn "注意：管理脚本的默认目录仍是 $old_dir"
+		info "后续 update/status 需指定目录: sudo $SELF_BASENAME update --dir $src"
+	fi
 	echo
 }
 
