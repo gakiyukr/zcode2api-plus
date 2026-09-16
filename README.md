@@ -19,6 +19,7 @@ Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主�
 | `POST /async/v1/messages` | Anthropic 異步 | ticket + keepalive + 流中斷語義 |
 | `GET /v1/models` | 雙兼容超集 | Anthropic 與 OpenAI 形態字段並存 |
 | `/admin/*` | — | 內嵌 React 管理後台 |
+| `/guest` | — | 訪客帳號提交頁（需管理員開啟邀請碼） |
 
 對外三種請求格式，內部統一走 Anthropic Messages 上游管道：選號循環、驗證碼求解、
 錯誤分類（401/402/429 碼族/3010/F001）、賬號狀態機與用量統計只維護一份。
@@ -101,6 +102,8 @@ sudo ./deploy/manage.sh docker-install         # Docker（未驗證）
 | `ZCODE_CAPTCHA_BROWSER_BIN` | 自動發現 | Chromium 二進制路徑 |
 | `ZCODE_ASYNC_ENABLED` | true | 掛載 /async/v1/messages 空閒池 |
 
+訪客提交的邀請碼存於數據庫（後台「設置」頁可改），不走環境變量。
+
 ## 賬號級出站代理
 
 賬號配置 `proxy_url` 後，該賬號的網關請求、額度查詢與套餐領取均走對應代理；
@@ -143,6 +146,23 @@ go test -race ./...                               # 併發檢查（需 C 工具�
 - **測試隔離**：一律 `config.DBPath = filepath.Join(t.TempDir(), "accounts.db")`；
   captcha 測試用 `SetSolver`（假求解器）+ `SetConfigProvider`（固定配置），否則會打真實
   上游；e2e 帳號用 api_key 模式（憑證不含兩個點）即不觸發驗證碼路徑，離線穩定。
+
+## 訪客提交帳號
+
+管理員在後台「設置」頁填寫**邀請碼**後，`/guest` 頁面即對外開放（清空邀請碼
+即關閉）。訪客的提交路徑刻意比後台窄：
+
+- **只走 OAuth 授權**，不提供令牌輸入框。完成授權能證明提交者確實持有該帳號；
+  貼上一串 JWT 什麼都證明不了。
+- **實測通過才入池**。授權只說明「現在持有」，不說明「當下可用」——帳號可能已
+  被封、額度耗盡或地區受限。後端會用該憑證發起一次最小的真實請求
+  （`max_tokens=1`），成功才寫入賬號池；失敗直接丟棄。
+- **不回顯任何帳號信息**。回應只有成功與否，不含 ID、郵箱、額度或賬號列表。
+- **邀請碼 + 每 IP 每日 3 次**。配額在開始授權時扣減；未設邀請碼時入口關閉
+  （fail closed）而非開放。
+
+> ⚠️ 實測需要驗證碼求解器，因此訪客提交**要求 `ZCODE_CAPTCHA_BROWSER=true`**；
+> 未啟用時提交會因驗證碼不可用而失敗。
 
 ## 賬號歸檔
 

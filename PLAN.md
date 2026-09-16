@@ -133,6 +133,7 @@
     ├── web/
     │   ├── spa.go               # /admin catch-all + /assets 静态 + /meta
     │   └── logs.go              # ← app/logs.py（彩色终端）
+    ├── guest/guest.go           # 访客账号提交（/guest/*）：仅 OAuth + 实测通过才入池
     └── util/util.go             # 跨包复用的无依赖工具（JSON/UUID/随机/截断/时间）
                                  #   仅依赖标准库，故任何包都可安全引入（无环）
 ```
@@ -655,6 +656,34 @@ Previous read at ... by goroutine 11:
 
 净减约 230 行；`go test ./...` 与 `-race` 全绿。
 
+### M14 访客账号提交（2026-09-16）
+
+新增 `/guest` 公开入口，让访客提交自己的 Z.AI 账号。三条约束塑造了整个设计：
+
+1. **只走 OAuth，不提供令牌输入框** — 完成授权能证明提交者确实持有该账号；
+   贴上一串 JWT 什么也证明不了，开放输入框等于让任何人往池里塞不属于自己的串。
+2. **实测通过才入池** — 授权只说明「现在持有」，不说明「当下可用」（可能已封禁、
+   额度耗尽、地区受限）。账号先在内存构造，经 `Engine.TestAccount` 发一次最小的
+   真实请求（`max_tokens=1`），成功才写 Store。
+   注意不能用 `quota.FetchQuota` 代替：它经 Store 解析账号，而 probe 刻意不在池中，
+   会直接回「账号已不存在」——这是实现时踩到的坑。
+3. **不回显任何账号信息** — 响应只有状态，无 ID/邮箱/额度/账号列表；
+   `/guest/api/info` 只报一个布尔量，不回显邀请码本身。
+
+访问控制：邀请码（存 settings，后台可改/可清空）+ 每 IP 每日 3 次配额。
+**未设邀请码时入口关闭**（fail closed）。配额在 start 阶段扣减——每个 flow 会
+占内存直到 TTL 过期，不限制 start 本身就是资源泄漏；访客 flow 绑定来源 IP，
+授权链接被转发也无法跨 IP 完成。
+
+新增文件：`internal/guest/guest.go`（+ 测试）、`frontend/src/pages/guest.tsx`；
+`auth` 增加邀请码与配额；`gateway.Engine` 增加 `TestAccount`；`web/spa.go` 放行
+`/guest` 路由（否则页面 404）。
+
+**部署前提**：实测需要验证码求解器，故访客提交要求 `ZCODE_CAPTCHA_BROWSER=true`。
+
+验证：浏览器端到端（页面渲染、按钮禁用态、授权跳转、非法回调被拒、关闭态切换）+
+配额 429 实测 + 未完成授权时确认零账号入池；`go test ./...` 与 `-race` 全绿。
+
 ### 审查中确认**无缺陷**的范围
 
 - 死锁：22 个 `Update` 调用点的闭包体逐一核对，无嵌套加锁（`model` 包方法皆不引用 `Store`）。
@@ -666,7 +695,7 @@ Previous read at ... by goroutine 11:
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
-  保持同名用例语义，便于两边对照。当前 25 个测试文件、203 个 `Test` 函数，`go test ./...` 全绿。
+  保持同名用例语义，便于两边对照。当前 26 个测试文件、214 个 `Test` 函数，`go test ./...` 全绿。
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
   最终用 openai 官方客户端（python）指向网关做真客户端回归（待真实账号环境）。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。
