@@ -2,7 +2,7 @@
 
 本目錄提供 Linux 的一鍵部署：**裸二進制 + systemd**（推薦、已實測）與 **Docker**（未經驗證）。
 
-Windows / macOS 直接下載 Releases 二進制執行即可，無需本目錄的腳本。
+本目錄面向 Linux 服務端；Releases 僅提供 linux/amd64 與 linux/arm64 產物。
 
 > ⚠️ **Docker 方案不提供任何保證**
 >

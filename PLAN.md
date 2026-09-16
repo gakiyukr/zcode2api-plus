@@ -37,8 +37,9 @@
 - [x] 验证码：真实 Chromium 池（rod）+ 人工回填兜底
 - [x] SQLite 持久化（accounts + meta，WAL）与 **Python 版数据库互通**
 - [x] CLI 子命令（serve / login / add-account / accounts / remove-account / quota / status / set-admin-key / export / import）
-- [x] Release CI（2026-09-11 定案：放弃 Docker 裸二进制交付；GitHub Actions 推 v* tag 构建五平台
-  linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64 并上传 Releases）— `.github/workflows/release.yml`
+- [x] Release CI（2026-09-11 定案：放弃 Docker 裸二进制交付；GitHub Actions 推 v* tag 构建
+  linux/amd64、linux/arm64 并上传 Releases）— `.github/workflows/release.yml`
+  （仅维护 Linux 双架构：本項目面向服务端自部署，其余平台不发布）
 - [x] **Linux 一键部署**（仅 Linux）：`deploy/manage.sh` 单一交互式管理脚本
   （二进制的安装/更新/卸载/状态 + Docker 的安装/更新/卸载 + 服务控制，**已实测**）
   + systemd 单元模板。另有 `Dockerfile` + `docker-compose.yml` 作为参考实现，
@@ -331,7 +332,7 @@ meta(key TEXT PK, value TEXT)
 - [x] OAuth 登录链（internal/oauth + adminapi login 端点 + CLI login）、账号代理出口
   （internal/proxy：http/https CONNECT + 手写 socks4/4a/5/5h，Transport 缓存；引擎与 quota 已接线）、
   CLI 子命令（serve/login/add-account/accounts/remove-account/quota/status/set-admin-key/export/import）、
-  Release CI（推 `v*` tag 交叉编译五平台并上传 Releases）
+  Release CI（推 `v*` tag 交叉编译 linux/amd64 与 linux/arm64 并上传 Releases）
 - [x] Linux 一键部署（`deploy/manage.sh` 单一交互式管理脚本，**已实测**）：
   二进制安装/更新（版本比对+回滚）/卸载/状态 + Docker 安装/更新/卸载 + 服务控制；
   systemd 单元模板内嵌于脚本，单文件可部署。另附 `Dockerfile` + `docker-compose.yml`
@@ -660,9 +661,9 @@ Previous read at ... by goroutine 11:
 ## 9. 交付形态
 
 - `go build ./cmd/zcode2api` → 单二进制（前端已 embed），仅 Chromium 运行库为外部依赖。
-- Release CI：推 `v*` tag → GitHub Actions 交叉编译五平台产物
-  （linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64；
-  CGO_ENABLED=0，`-trimpath -ldflags="-s -w"`）→ 上传 GitHub Releases。
+- Release CI：推 `v*` tag → GitHub Actions 交叉编译 Linux 产物
+  （linux/amd64、linux/arm64；CGO_ENABLED=0，`-trimpath -ldflags="-s -w"`）
+  → 上传 GitHub Releases。仅发布这两个平台。
 - **Linux 一键部署（`deploy/manage.sh`，单一入口）**：
   - 交互式选单：安装/更新/卸载二进制、查看状态、服务控制（启停/重启/日志）、Docker 三个操作。
   - 非交互子命令：`install` / `update` / `uninstall` / `status` / `docker-install` /

@@ -26,7 +26,7 @@ Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主�
 ## 快速開始
 
 ```bash
-# 下載現成產物（Releases 頁：linux × amd64/arm64、darwin × amd64/arm64、windows × amd64）
+# 下載現成產物（Releases 頁：linux × amd64/arm64）
 # 或源碼構建：
 go build -o zcode2api ./cmd/zcode2api
 ./zcode2api serve            # http://127.0.0.1:3000
@@ -115,8 +115,8 @@ JWT 賬號入池（批量添加 / OAuth / CLI login）後自動：激活事件�
 
 ## 發佈與開發
 
-- 推 `v*` tag → GitHub Actions 自動交叉編譯五平台產物（linux/amd64、linux/arm64、
-  darwin/amd64、darwin/arm64、windows/amd64）並上傳 Releases。
+- 推 `v*` tag → GitHub Actions 自動交叉編譯 Linux 產物（linux/amd64、linux/arm64）
+  並上傳 Releases。僅維護這兩個平台：本項目面向服務端自部署。
 - 全量驗證：`go build ./... && go vet ./... && go test ./...`；併發檢查 `go test -race ./...`
   （需 C 工具鏈）。
 - 前端改動：`cd frontend && npm install && npm run build`，並把更新後的 `frontend/dist` 一併提交

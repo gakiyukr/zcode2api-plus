@@ -1,4 +1,5 @@
-# Release CI：推 tag（v*）时构建跨平台产物并上传到 GitHub Releases。
+# Release CI：推 tag（v*）时构建 Linux 产物并上传到 GitHub Releases。
+# 仅发布 linux/amd64 与 linux/arm64：服务端部署只需这两个，其余平台不维护。
 # 前端 dist 已提交且 go:embed，无需 node 构建；CGO 关闭纯静态编译。
 name: release
 
@@ -16,9 +17,6 @@ jobs:
         include:
           - { goos: linux,  goarch: amd64 }
           - { goos: linux,  goarch: arm64 }
-          - { goos: darwin, goarch: amd64 }
-          - { goos: darwin, goarch: arm64 }
-          - { goos: windows, goarch: amd64 }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,9 +31,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         shell: bash
         run: |
-          EXT=""
-          [ "$GOOS" = "windows" ] && EXT=".exe"
-          OUT="zcode2api-${GOOS}-${GOARCH}${EXT}"
+          OUT="zcode2api-${GOOS}-${GOARCH}"
           CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$OUT" ./cmd/zcode2api
 
       - name: Upload to Release
