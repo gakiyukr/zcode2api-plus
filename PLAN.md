@@ -130,9 +130,11 @@
     ├── proxy/                   # ← app/proxy.py（Transport 缓存 + socks4/4a/5/5h 拨号器）
     │   ├── proxy.go             # URL 归一化与 scheme 白名单
     │   └── client.go            # TransportFor / ClientFor / socks 握手
-    └── web/
-        ├── spa.go               # /admin catch-all + /assets 静态 + /meta
-        └── logs.go              # ← app/logs.py（彩色终端）
+    ├── web/
+    │   ├── spa.go               # /admin catch-all + /assets 静态 + /meta
+    │   └── logs.go              # ← app/logs.py（彩色终端）
+    └── util/util.go             # 跨包复用的无依赖工具（JSON/UUID/随机/截断/时间）
+                                 #   仅依赖标准库，故任何包都可安全引入（无环）
 ```
 
 Python 版 `app/zcode_system.json` 已复制为 `internal/upstream/zcode_system.json` 并 `embed`。
@@ -625,6 +627,33 @@ Previous read at ... by goroutine 11:
 下载校验链（Ed25519 验签不降级 + SHA256 比对在解包前 + 原子安装）、
 路径穿越（tar 的 `Name` 与 symlink、zip 的 `Name`）、
 `GetVerifyParam` 的 `(nil, nil)` 语义与三个调用方的契约、rod/leakless 进程兜底。
+
+### M13 代码整理：收敛重复实现（2026-09-16）
+
+各包此前各自抄了一份相同的辅助函数，仓库里有 4 份 `marshalJSON`、3 份 `newUUID`、
+3 份 `randomHex`、2 份 `randomTokenURLSafe`、2 份 `truncate`、2 份 `orDefault`、
+2 份 `orCurrent`、2 份 `anyToString`。这些副本逐字相同——正是最危险的情形：
+只要有人改动其中一份而漏掉另一份，同一份数据就会在不同路径上被序列化成不同形态。
+
+新增 `internal/util` 收录它们（只依赖标准库，任何包引入都不会成环）。同时：
+- 删除死码 `openai.errStr`（零调用者）与 `gateway.startPlanBusyRetryDelays`
+  （声明后从未被读，`NewEngine` 内联了同一字面量；现改为引用该变量）。
+- OpenAI 的两对交付函数（`deliverJSON`/`deliverResponsesJSON`、
+  `deliverStream`/`deliverResponsesStream`）逐行相同，仅转换器不同，已参数化。
+- `stream.go` 与 `responses_stream.go` 的 SSE 框架循环逐字相同，抽出 `scanSSE`。
+- `asyncpool.writeJSONStatus` 与 `gateway.WriteJSON` 逐字相同、鉴权错误内联与
+  `gateway.WriteAuthError` 等价，均已复用。
+
+**刻意保持独立**（重复编码了真实差异，合并会改变行为）：
+- `clientFor` 四份：超时与回退策略按调用链选择（网关 120s 响应头、async 180s
+  响应头、quota 20s 总超时、claim 25s 总超时）。
+- `strOf` 两份：adminapi 版实现 Python 的 `str(v or "")`（依赖 `truthy` 做空值链），
+  model 版是纯值格式化；反向覆盖会让后台 API 的 nil 变成 `"<nil>"`。
+- `toInt` 两份：claim 版以 `-1` 表示业务码解析失败，usage 版以 `0` 表示无用量。
+- engine 与 asyncpool 的错误分类链：出路型别（`attemptResult` vs `(midStream, error)`）
+  与重试策略不同，仅判定函数与文案已共用。
+
+净减约 230 行；`go test ./...` 与 `-race` 全绿。
 
 ### 审查中确认**无缺陷**的范围
 
