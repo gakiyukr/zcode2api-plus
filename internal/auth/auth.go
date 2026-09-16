@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"zcode2api/internal/capverify"
 	"zcode2api/internal/store"
 )
 
@@ -167,6 +168,27 @@ func (s *Service) InviteCode() string {
 // SetInviteCode 设置邀请码并落库；空值即关闭访客入口。
 func (s *Service) SetInviteCode(code string) error {
 	return s.Store.SetSetting("guest_invite_code", code)
+}
+
+// ── 人机验证（Cap）────────────────────────────────────────────────────────
+//
+// 两项配置都为空时整个校验被跳过——自建 Cap 实例的地址因部署而异，无法给出
+// 合理默认值，所以默认关闭而不是默认指向某个占位地址。只填了其中一项则视为
+// 配置不完整，由 capverify.Config.Enabled 判定为未启用。
+
+// CapConfig 返回当前 Cap 校验配置。
+func (s *Service) CapConfig() capverify.Config {
+	endpoint, _ := s.Store.GetSetting("cap_endpoint")
+	secret, _ := s.Store.GetSetting("cap_secret")
+	return capverify.Config{Endpoint: endpoint, Secret: secret}
+}
+
+// SetCapConfig 保存 Cap 配置；空值表示停用人机验证。
+func (s *Service) SetCapConfig(endpoint, secret string) error {
+	if err := s.Store.SetSetting("cap_endpoint", strings.TrimSpace(endpoint)); err != nil {
+		return err
+	}
+	return s.Store.SetSetting("cap_secret", strings.TrimSpace(secret))
 }
 
 // VerifyInvite 校验访客提交的邀请码。

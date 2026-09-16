@@ -95,6 +95,9 @@ export interface SettingsResponse {
   quota_refresh_interval: number
   /* 訪客邀請碼：空字串表示訪客入口關閉 */
   guest_invite_code: string
+  /* 人機驗證（自建 Cap）配置；兩項皆空表示未啟用 */
+  cap_endpoint: string
+  cap_secret: string
 }
 
 export interface EgressInfo {

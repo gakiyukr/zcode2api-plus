@@ -1,4 +1,4 @@
-/* 系統設定頁：後台密碼、網關 API Key、額度刷新間隔、訪客邀請碼與使用說明 */
+/* 系統設定頁：後台密碼、網關 API Key、額度刷新間隔、訪客邀請碼、人機驗證與使用說明 */
 import { useEffect, useState, type FormEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
@@ -22,6 +22,8 @@ export function SettingsPage() {
   const [gatewayKey, setGatewayKey] = useState('')
   const [quotaInterval, setQuotaInterval] = useState('60')
   const [inviteCode, setInviteCode] = useState('')
+  const [capEndpoint, setCapEndpoint] = useState('')
+  const [capSecret, setCapSecret] = useState('')
   const [showKeys, setShowKeys] = useState(false)
   const [saving, setSaving] = useState(false)
 
@@ -32,6 +34,8 @@ export function SettingsPage() {
     setGatewayKey(data.gateway_key || '')
     setQuotaInterval(String(data.quota_refresh_interval ?? 60))
     setInviteCode(data.guest_invite_code || '')
+    setCapEndpoint(data.cap_endpoint || '')
+    setCapSecret(data.cap_secret || '')
   }, [data])
 
   async function save(e: FormEvent) {
@@ -56,6 +60,8 @@ export function SettingsPage() {
         gateway_key: gatewayKey.trim(),
         quota_refresh_interval: interval,
         guest_invite_code: inviteCode.trim(),
+        cap_endpoint: capEndpoint.trim(),
+        cap_secret: capSecret.trim(),
       })
       /* 同步本機儲存的密鑰，避免改密後被登出 */
       await adminKey.set(adminKeyInput.trim())
@@ -134,6 +140,34 @@ export function SettingsPage() {
                 value={inviteCode}
                 placeholder="留空則關閉訪客提交"
                 onChange={(e) => setInviteCode(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-cap-endpoint">人機驗證地址（Cap）</Label>
+              <div className="text-xs text-muted-foreground">
+                自建 Cap 實例的公開地址，含 site key，例如{' '}
+                <code className="rounded bg-muted px-1">https://cap.example.com/d9256640cb53/</code>
+                。填寫後訪客頁會要求通過人機驗證。留空即停用。
+              </div>
+              <Input
+                id="set-cap-endpoint"
+                type="text"
+                value={capEndpoint}
+                placeholder="https://cap.example.com/<site-key>/"
+                onChange={(e) => setCapEndpoint(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-cap-secret">人機驗證密鑰（Cap）</Label>
+              <div className="text-xs text-muted-foreground">
+                Cap 後台的 secret key（<span className="font-medium text-foreground">不是</span>
+                管理員 ADMIN_KEY）。只留在服務端，不會下發給瀏覽器。填了地址就必須一併填寫。
+              </div>
+              <Input
+                id="set-cap-secret"
+                type={showKeys ? 'text' : 'password'}
+                value={capSecret}
+                onChange={(e) => setCapSecret(e.target.value)}
               />
             </div>
             <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">

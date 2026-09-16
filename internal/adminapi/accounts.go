@@ -517,12 +517,16 @@ func (h *Handler) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
+	capCfg := h.Auth.CapConfig()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"admin_key":              h.Store.AdminKey(),
 		"gateway_key":            h.Store.GatewayKey(),
 		"quota_refresh_interval": h.Store.QuotaRefreshInterval(),
 		// 邀请码回显给管理员（后台已鉴权）；空值表示访客入口关闭
 		"guest_invite_code": h.Auth.InviteCode(),
+		// 人机验证配置；两项皆空表示未启用
+		"cap_endpoint": capCfg.Endpoint,
+		"cap_secret":   capCfg.Secret,
 	})
 }
 
@@ -558,6 +562,24 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if v, ok := payload["guest_invite_code"]; ok {
 		// 空值合法：表示关闭访客入口（与 admin_key/gateway_key 的必填语义相反）
 		if err := h.Auth.SetInviteCode(strings.TrimSpace(strOf(v))); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	if _, ok := payload["cap_endpoint"]; ok {
+		// 两项一起处理：分开写会让「改地址但没改密钥」的中间态落库，
+		// 那一刻校验会指向旧密钥而全部失败。
+		endpoint := strings.TrimSpace(strOf(payload["cap_endpoint"]))
+		secret := strings.TrimSpace(strOf(payload["cap_secret"]))
+		if endpoint != "" && secret == "" {
+			writeAPIError(w, errBadRequest("填了人机验证地址就必须填密钥"))
+			return
+		}
+		if endpoint != "" && !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+			writeAPIError(w, errBadRequest("人机验证地址必须以 http:// 或 https:// 开头"))
+			return
+		}
+		if err := h.Auth.SetCapConfig(endpoint, secret); err != nil {
 			writeError500(w, err)
 			return
 		}

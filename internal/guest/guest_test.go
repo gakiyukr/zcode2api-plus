@@ -207,3 +207,115 @@ func TestGuestInfoHidesInviteCode(t *testing.T) {
 		t.Fatalf("配置后应显示开启: %v", resp)
 	}
 }
+
+// ── 人机验证（Cap）─────────────────────────────────────────────────────────
+//
+// 校验本身由 internal/capverify 单测覆盖；这里验证的是接线：何时跳过、
+// 何时拦截、以及访客能看到的响应形态。
+
+// 未配置 Cap 时必须放行：自建实例地址因部署而异，未配置是合法的关闭状态，
+// 不能把访客提交整个堵死。
+func TestCaptchaSkippedWhenUnconfigured(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	if !h.verifyCaptcha(rec, req) {
+		t.Fatalf("未配置时应放行，却返回了 %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("放行时不应写响应体: %s", rec.Body.String())
+	}
+}
+
+// 配置了 Cap 但请求没带 token → 拒绝。
+func TestCaptchaRejectsMissingToken(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetCapConfig("https://cap.example.com/site/", "secret"); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	if h.verifyCaptcha(rec, req) {
+		t.Fatal("缺少 token 时应拒绝")
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("期望 400，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Cap 服务不可达时返回 502 而非 400：这是管理员要查的配置/网络问题，
+// 报成「验证未通过」会把排查方向带偏。
+func TestCaptchaServiceFailureIsNotBlamedOnVisitor(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	// 指向必然连不上的地址
+	if err := h.Auth.SetCapConfig("http://127.0.0.1:1/", "secret"); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	req.Header.Set("x-cap-token", "some-token")
+	if h.verifyCaptcha(rec, req) {
+		t.Fatal("服务不可用时不应放行")
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("期望 502，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 只填地址不填密钥视为未启用：否则校验会拿空密钥去问 Cap，
+// 全部失败而管理员看不出原因。
+func TestCaptchaIncompleteConfigStaysDisabled(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetCapConfig("https://cap.example.com/site/", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	if !h.verifyCaptcha(rec, req) {
+		t.Fatalf("配置不完整应视为未启用而放行，却返回 %d", rec.Code)
+	}
+}
+
+// info 回显 Cap 地址（widget 需要它取题）但绝不回显 secret——
+// secret 泄露等于任何人都能自造 token，绕过整个验证。
+func TestGuestInfoExposesEndpointButNotSecret(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetCapConfig("https://cap.example.com/site/", "SUPER-SECRET"); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleInfo(rec, httptest.NewRequest(http.MethodGet, "/guest/api/info", nil))
+	body := rec.Body.String()
+	if strings.Contains(body, "SUPER-SECRET") {
+		t.Fatalf("info 泄露了 Cap 密钥: %s", body)
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp["captcha"] != true {
+		t.Fatalf("配置完整时应报告需要人机验证: %v", resp)
+	}
+	if resp["cap_endpoint"] != "https://cap.example.com/site/" {
+		t.Fatalf("应回显 endpoint 供 widget 使用: %v", resp)
+	}
+}
+
+// 未配置时不应出现 cap_endpoint 字段，前端据此判断不渲染 widget。
+func TestGuestInfoOmitsEndpointWhenUnconfigured(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+
+	rec := httptest.NewRecorder()
+	h.handleInfo(rec, httptest.NewRequest(http.MethodGet, "/guest/api/info", nil))
+	var resp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if _, ok := resp["cap_endpoint"]; ok {
+		t.Fatalf("未配置时不应有 cap_endpoint: %v", resp)
+	}
+	if resp["captcha"] != false {
+		t.Fatalf("未配置时应报告无需人机验证: %v", resp)
+	}
+}

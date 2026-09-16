@@ -17,6 +17,7 @@ package guest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"zcode2api/internal/auth"
+	"zcode2api/internal/capverify"
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
@@ -48,6 +50,7 @@ type Handler struct {
 	Captcha *captcha.Manager
 	Quota   *quota.Service
 	Engine  *gateway.Engine
+	Cap     *capverify.Client
 
 	mu    sync.Mutex
 	flows map[string]*guestFlow
@@ -68,6 +71,7 @@ func New(st *store.Store, authSvc *auth.Service, cm *captcha.Manager, qs *quota.
 		Captcha: cm,
 		Quota:   qs,
 		Engine:  eng,
+		Cap:     capverify.New(),
 		flows:   map[string]*guestFlow{},
 	}
 }
@@ -82,18 +86,57 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /guest/api/complete", h.handleComplete)
 }
 
-// handleInfo 返回访客入口是否开放。
+// handleInfo 返回访客入口是否开放，以及前端渲染人机验证所需的信息。
 //
-// 只暴露「开/关」这一个布尔量：邀请码本身绝不回显，否则任何访问者都能拿到。
+// 邀请码绝不回显（否则任何访问者都能拿到）；Cap 的 endpoint 必须回显——
+// 它就是浏览器要访问的公开地址，widget 靠它取题。secret 只留在服务端，
+// 绝不能出现在响应里，否则任何人都能自造 token。
 func (h *Handler) handleInfo(w http.ResponseWriter, r *http.Request) {
-	gateway.WriteJSON(w, http.StatusOK, map[string]any{
+	capCfg := h.Auth.CapConfig()
+	resp := map[string]any{
 		"enabled": h.Auth.InviteCode() != "",
-	})
+		"captcha": capCfg.Enabled(),
+	}
+	if capCfg.Enabled() {
+		resp["cap_endpoint"] = capCfg.Endpoint
+	}
+	gateway.WriteJSON(w, http.StatusOK, resp)
+}
+
+// verifyCaptcha 校验请求携带的 Cap token。
+//
+// 返回 false 表示已写回错误响应，调用方应立即返回。
+// 未配置 Cap 时直接放行——自建实例地址因部署而异，无法给出默认值，
+// 因此「未配置」是合法的关闭状态而非配置错误。
+func (h *Handler) verifyCaptcha(w http.ResponseWriter, r *http.Request) bool {
+	cfg := h.Auth.CapConfig()
+	if !cfg.Enabled() {
+		return true
+	}
+	token := strings.TrimSpace(r.Header.Get("x-cap-token"))
+	err := h.Cap.Verify(r.Context(), cfg, token)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, capverify.ErrInvalidToken):
+		writeDetail(w, http.StatusBadRequest, "人机验证未通过，请重新验证")
+	default:
+		// 服务端故障与「访客没解对」是两回事：前者要管理员去查配置，
+		// 报成「验证失败」会把排查方向带偏。
+		web.Warn("guest", "人机验证服务不可用: "+err.Error())
+		writeDetail(w, http.StatusBadGateway, "人机验证服务暂时不可用，请稍后再试")
+	}
+	return false
 }
 
 func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	if e := h.Auth.VerifyInvite(r); e != nil {
 		gateway.WriteAuthError(w, e)
+		return
+	}
+	// 人机验证在配额之前：机器人刷 start 会先被挡在这里，不至于白扣访客的
+	// 当日额度（配额是给人用的，不该被自动化请求消耗）。
+	if !h.verifyCaptcha(w, r) {
 		return
 	}
 	// 配额在 start 就扣减：每个 flow 会占内存直到 TTL 过期，不限制的话
@@ -124,6 +167,12 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleComplete(w http.ResponseWriter, r *http.Request) {
 	if e := h.Auth.VerifyInvite(r); e != nil {
 		gateway.WriteAuthError(w, e)
+		return
+	}
+	// 第二步再验一次：Cap token 是一次性的，start 用过的那枚已经失效，
+	// 前端会为这一步重新求解。两处都验可以防止「先解一次，然后脚本化
+	// 重复调用 complete」。
+	if !h.verifyCaptcha(w, r) {
 		return
 	}
 	payload, ok := decodeBody(r)
