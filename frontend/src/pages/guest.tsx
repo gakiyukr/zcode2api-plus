@@ -6,7 +6,7 @@
  *
  * 人機驗證用自建的 Cap（PoW，無第三方）。兩步各驗一次：Cap token 是一次性的，
  * 第一步用過就失效，所以第二步要重新求解。未配置 Cap 時整段不渲染，後端也跳過。 */
-import { ExternalLink, Layers, Loader2, ShieldCheck } from 'lucide-react'
+import { Copy, ExternalLink, Layers, Loader2, ShieldCheck } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type DetailedHTMLProps, type FormEvent } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -188,6 +188,17 @@ export function GuestPage() {
     }
   }
 
+  /* 與後台「授權登入」一致：輸入框 + 複製 + 開啟。
+     有些訪客會在同一台裝置上完成授權，複製連結比開新視窗順手；
+     反之亦然，故兩者都給。 */
+  function copyAuthorizeURL() {
+    if (!authorizeURL) return
+    navigator.clipboard
+      .writeText(authorizeURL)
+      .then(() => toast.success('已複製'))
+      .catch(() => toast.error('複製失敗'))
+  }
+
   function onStart(e: FormEvent) {
     e.preventDefault()
     void start()
@@ -301,13 +312,25 @@ export function GuestPage() {
           ) : (
             <div className="flex flex-col gap-4">
               <div className="flex flex-col gap-2">
-                <p className="text-sm font-medium">1. 前往授權頁完成登入</p>
-                <Button asChild variant="outline" className="w-full">
-                  <a href={authorizeURL} target="_blank" rel="noopener noreferrer">
-                    開啟 Z.AI 授權頁
-                    <ExternalLink className="size-3.5" />
-                  </a>
-                </Button>
+                <p className="text-sm font-medium">1. 開啟授權頁並完成 Z.AI 登入</p>
+                <div className="flex items-center gap-2">
+                  <Input
+                    readOnly
+                    value={authorizeURL}
+                    className="min-w-0 flex-1 font-mono text-xs"
+                    onFocus={(e) => e.currentTarget.select()}
+                  />
+                  <Button variant="outline" size="sm" onClick={copyAuthorizeURL}>
+                    <Copy className="size-3.5" />
+                    複製
+                  </Button>
+                  <Button asChild size="sm">
+                    <a href={authorizeURL} target="_blank" rel="noopener noreferrer">
+                      開啟
+                      <ExternalLink className="size-3.5" />
+                    </a>
+                  </Button>
+                </div>
               </div>
               <form className="flex flex-col gap-2" onSubmit={onComplete}>
                 <p className="text-sm font-medium">2. 貼上授權完成後的頁面地址</p>
