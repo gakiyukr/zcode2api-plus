@@ -1,4 +1,4 @@
-/* 系統設定頁：後台密碼、網關 API Key、額度刷新間隔與使用說明 */
+/* 系統設定頁：後台密碼、網關 API Key、額度刷新間隔、訪客邀請碼與使用說明 */
 import { useEffect, useState, type FormEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
@@ -21,6 +21,7 @@ export function SettingsPage() {
   const [adminKeyInput, setAdminKeyInput] = useState('')
   const [gatewayKey, setGatewayKey] = useState('')
   const [quotaInterval, setQuotaInterval] = useState('60')
+  const [inviteCode, setInviteCode] = useState('')
   const [showKeys, setShowKeys] = useState(false)
   const [saving, setSaving] = useState(false)
 
@@ -30,6 +31,7 @@ export function SettingsPage() {
     setAdminKeyInput(data.admin_key || '')
     setGatewayKey(data.gateway_key || '')
     setQuotaInterval(String(data.quota_refresh_interval ?? 60))
+    setInviteCode(data.guest_invite_code || '')
   }, [data])
 
   async function save(e: FormEvent) {
@@ -53,6 +55,7 @@ export function SettingsPage() {
         admin_key: adminKeyInput.trim(),
         gateway_key: gatewayKey.trim(),
         quota_refresh_interval: interval,
+        guest_invite_code: inviteCode.trim(),
       })
       /* 同步本機儲存的密鑰，避免改密後被登出 */
       await adminKey.set(adminKeyInput.trim())
@@ -103,10 +106,6 @@ export function SettingsPage() {
                 onChange={(e) => setGatewayKey(e.target.value)}
               />
             </div>
-            <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">
-              <Checkbox checked={showKeys} onCheckedChange={(v) => setShowKeys(v === true)} />
-              顯示密鑰明文
-            </label>
             <div className="flex flex-col gap-2">
               <Label htmlFor="set-quota-interval">額度刷新間隔（秒）</Label>
               <div className="text-xs text-muted-foreground">
@@ -121,6 +120,26 @@ export function SettingsPage() {
                 onChange={(e) => setQuotaInterval(e.target.value)}
               />
             </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-invite-code">訪客邀請碼</Label>
+              <div className="text-xs text-muted-foreground">
+                設定後 <code className="rounded bg-muted px-1">/guest</code>{' '}
+                頁面即對外開放，訪客可透過 Z.AI 授權提交自己的帳號（實測通過才入池）。
+                <span className="font-medium text-foreground">留空即關閉訪客入口</span>
+                ，每 IP 每日最多 3 次。修改後即時生效。
+              </div>
+              <Input
+                id="set-invite-code"
+                type={showKeys ? 'text' : 'password'}
+                value={inviteCode}
+                placeholder="留空則關閉訪客提交"
+                onChange={(e) => setInviteCode(e.target.value)}
+              />
+            </div>
+            <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+              <Checkbox checked={showKeys} onCheckedChange={(v) => setShowKeys(v === true)} />
+              顯示密鑰與邀請碼明文
+            </label>
             <div className="flex justify-end">
               <Button type="submit" disabled={saving}>
                 {saving ? <Loader2 className="animate-spin" /> : null}

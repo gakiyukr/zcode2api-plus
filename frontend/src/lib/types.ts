@@ -93,6 +93,8 @@ export interface SettingsResponse {
   admin_key: string
   gateway_key: string
   quota_refresh_interval: number
+  /* 訪客邀請碼：空字串表示訪客入口關閉 */
+  guest_invite_code: string
 }
 
 export interface EgressInfo {
