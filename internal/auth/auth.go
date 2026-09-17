@@ -172,23 +172,31 @@ func (s *Service) SetInviteCode(code string) error {
 
 // ── 人机验证（Cap）────────────────────────────────────────────────────────
 //
-// 两项配置都为空时整个校验被跳过——自建 Cap 实例的地址因部署而异，无法给出
-// 合理默认值，所以默认关闭而不是默认指向某个占位地址。只填了其中一项则视为
-// 配置不完整，由 capverify.Config.Enabled 判定为未启用。
+// 三个值分开存放，对应 Cap 后台给出的三项（实例地址 / site key / secret key）。
+// 全部为空时整个校验被跳过——自建实例地址因部署而异，无法给出合理默认值，
+// 所以默认关闭而不是指向某个占位地址。缺任意一项视为配置不完整，
+// 由 capverify.Config.Enabled 判定为未启用。
 
 // CapConfig 返回当前 Cap 校验配置。
 func (s *Service) CapConfig() capverify.Config {
-	endpoint, _ := s.Store.GetSetting("cap_endpoint")
+	instance, _ := s.Store.GetSetting("cap_instance")
+	siteKey, _ := s.Store.GetSetting("cap_site_key")
 	secret, _ := s.Store.GetSetting("cap_secret")
-	return capverify.Config{Endpoint: endpoint, Secret: secret}
+	return capverify.Config{Instance: instance, SiteKey: siteKey, Secret: secret}
 }
 
-// SetCapConfig 保存 Cap 配置；空值表示停用人机验证。
-func (s *Service) SetCapConfig(endpoint, secret string) error {
-	if err := s.Store.SetSetting("cap_endpoint", strings.TrimSpace(endpoint)); err != nil {
-		return err
+// SetCapConfig 保存 Cap 配置；三项皆空表示停用人机验证。
+func (s *Service) SetCapConfig(instance, siteKey, secret string) error {
+	for _, kv := range []struct{ key, value string }{
+		{"cap_instance", instance},
+		{"cap_site_key", siteKey},
+		{"cap_secret", secret},
+	} {
+		if err := s.Store.SetSetting(kv.key, strings.TrimSpace(kv.value)); err != nil {
+			return err
+		}
 	}
-	return s.Store.SetSetting("cap_secret", strings.TrimSpace(secret))
+	return nil
 }
 
 // VerifyInvite 校验访客提交的邀请码。

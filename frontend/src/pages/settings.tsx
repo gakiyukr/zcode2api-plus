@@ -22,7 +22,8 @@ export function SettingsPage() {
   const [gatewayKey, setGatewayKey] = useState('')
   const [quotaInterval, setQuotaInterval] = useState('60')
   const [inviteCode, setInviteCode] = useState('')
-  const [capEndpoint, setCapEndpoint] = useState('')
+  const [capInstance, setCapInstance] = useState('')
+  const [capSiteKey, setCapSiteKey] = useState('')
   const [capSecret, setCapSecret] = useState('')
   const [showKeys, setShowKeys] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -34,7 +35,8 @@ export function SettingsPage() {
     setGatewayKey(data.gateway_key || '')
     setQuotaInterval(String(data.quota_refresh_interval ?? 60))
     setInviteCode(data.guest_invite_code || '')
-    setCapEndpoint(data.cap_endpoint || '')
+    setCapInstance(data.cap_instance || '')
+    setCapSiteKey(data.cap_site_key || '')
     setCapSecret(data.cap_secret || '')
   }, [data])
 
@@ -60,7 +62,8 @@ export function SettingsPage() {
         gateway_key: gatewayKey.trim(),
         quota_refresh_interval: interval,
         guest_invite_code: inviteCode.trim(),
-        cap_endpoint: capEndpoint.trim(),
+        cap_instance: capInstance.trim(),
+        cap_site_key: capSiteKey.trim(),
         cap_secret: capSecret.trim(),
       })
       /* 同步本機儲存的密鑰，避免改密後被登出 */
@@ -143,25 +146,39 @@ export function SettingsPage() {
               />
             </div>
             <div className="flex flex-col gap-2">
-              <Label htmlFor="set-cap-endpoint">人機驗證地址（Cap）</Label>
+              <Label htmlFor="set-cap-instance">人機驗證實例地址（Cap）</Label>
               <div className="text-xs text-muted-foreground">
-                自建 Cap 實例的公開地址，含 site key，例如{' '}
-                <code className="rounded bg-muted px-1">https://cap.example.com/d9256640cb53/</code>
-                。填寫後訪客頁會要求通過人機驗證。留空即停用。
+                自建 Cap 實例的公開地址，不含 site key，例如{' '}
+                <code className="rounded bg-muted px-1">https://cap.example.com</code>。
+                須為訪客瀏覽器可達的地址。
               </div>
               <Input
-                id="set-cap-endpoint"
+                id="set-cap-instance"
                 type="text"
-                value={capEndpoint}
-                placeholder="https://cap.example.com/<site-key>/"
-                onChange={(e) => setCapEndpoint(e.target.value)}
+                value={capInstance}
+                placeholder="https://cap.example.com"
+                onChange={(e) => setCapInstance(e.target.value)}
               />
             </div>
             <div className="flex flex-col gap-2">
-              <Label htmlFor="set-cap-secret">人機驗證密鑰（Cap）</Label>
+              <Label htmlFor="set-cap-site-key">Site Key（Cap）</Label>
+              <div className="text-xs text-muted-foreground">
+                Cap 後台建立 site key 後取得的識別碼，例如{' '}
+                <code className="rounded bg-muted px-1">d9256640cb53</code>。
+              </div>
+              <Input
+                id="set-cap-site-key"
+                type="text"
+                value={capSiteKey}
+                placeholder="d9256640cb53"
+                onChange={(e) => setCapSiteKey(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-cap-secret">密鑰（Cap）</Label>
               <div className="text-xs text-muted-foreground">
                 Cap 後台的 secret key（<span className="font-medium text-foreground">不是</span>
-                管理員 ADMIN_KEY）。只留在服務端，不會下發給瀏覽器。填了地址就必須一併填寫。
+                管理員 ADMIN_KEY）。只留在服務端，不會下發給瀏覽器。
               </div>
               <Input
                 id="set-cap-secret"
@@ -169,6 +186,20 @@ export function SettingsPage() {
                 value={capSecret}
                 onChange={(e) => setCapSecret(e.target.value)}
               />
+            </div>
+            <div className="rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
+              {capInstance.trim() && capSiteKey.trim() && capSecret.trim() ? (
+                <>
+                  人機驗證已啟用，實際呼叫地址：
+                  <code className="ml-1 break-all rounded bg-muted px-1 font-mono">
+                    {capInstance.trim().replace(/\/+$/, '')}/{capSiteKey.trim().replace(/^\/+|\/+$/g, '')}/siteverify
+                  </code>
+                </>
+              ) : capInstance.trim() || capSiteKey.trim() || capSecret.trim() ? (
+                <span className="text-destructive">三項須全部填寫才會啟用；只填部分無法儲存。</span>
+              ) : (
+                '三項皆留空即停用人機驗證。'
+              )}
             </div>
             <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">
               <Checkbox checked={showKeys} onCheckedChange={(v) => setShowKeys(v === true)} />

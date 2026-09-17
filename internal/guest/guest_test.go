@@ -231,7 +231,7 @@ func TestCaptchaSkippedWhenUnconfigured(t *testing.T) {
 // 配置了 Cap 但请求没带 token → 拒绝。
 func TestCaptchaRejectsMissingToken(t *testing.T) {
 	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
-	if err := h.Auth.SetCapConfig("https://cap.example.com/site/", "secret"); err != nil {
+	if err := h.Auth.SetCapConfig("https://cap.example.com", "site", "secret"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -250,7 +250,7 @@ func TestCaptchaRejectsMissingToken(t *testing.T) {
 func TestCaptchaServiceFailureIsNotBlamedOnVisitor(t *testing.T) {
 	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
 	// 指向必然连不上的地址
-	if err := h.Auth.SetCapConfig("http://127.0.0.1:1/", "secret"); err != nil {
+	if err := h.Auth.SetCapConfig("http://127.0.0.1:1", "k", "secret"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -269,7 +269,7 @@ func TestCaptchaServiceFailureIsNotBlamedOnVisitor(t *testing.T) {
 // 全部失败而管理员看不出原因。
 func TestCaptchaIncompleteConfigStaysDisabled(t *testing.T) {
 	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
-	if err := h.Auth.SetCapConfig("https://cap.example.com/site/", ""); err != nil {
+	if err := h.Auth.SetCapConfig("https://cap.example.com", "site", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -284,7 +284,7 @@ func TestCaptchaIncompleteConfigStaysDisabled(t *testing.T) {
 // secret 泄露等于任何人都能自造 token，绕过整个验证。
 func TestGuestInfoExposesEndpointButNotSecret(t *testing.T) {
 	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
-	if err := h.Auth.SetCapConfig("https://cap.example.com/site/", "SUPER-SECRET"); err != nil {
+	if err := h.Auth.SetCapConfig("https://cap.example.com", "site", "SUPER-SECRET"); err != nil {
 		t.Fatal(err)
 	}
 

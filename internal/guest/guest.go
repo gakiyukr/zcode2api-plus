@@ -98,7 +98,9 @@ func (h *Handler) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"captcha": capCfg.Enabled(),
 	}
 	if capCfg.Enabled() {
-		resp["cap_endpoint"] = capCfg.Endpoint
+		// 拼好的地址而非三个原始值：前端拿到的就是 widget 该用的值，
+		// 拼接规则只在 capverify 一处维护。
+		resp["cap_endpoint"] = capCfg.Endpoint()
 	}
 	gateway.WriteJSON(w, http.StatusOK, resp)
 }

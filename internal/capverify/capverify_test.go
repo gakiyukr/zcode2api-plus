@@ -13,9 +13,12 @@ func TestVerifyDisabledWithoutConfig(t *testing.T) {
 	// 未配置时不应发起请求，也不应把 token 当作有效
 	for _, cfg := range []Config{
 		{},
-		{Endpoint: "https://cap.example.com/abc/"},
+		{Instance: "https://cap.example.com"},
+		{SiteKey: "abc"},
 		{Secret: "secret"},
-		{Endpoint: "   ", Secret: "  "},
+		{Instance: "https://cap.example.com", Secret: "s"},
+		{Instance: "https://cap.example.com", SiteKey: "abc"},
+		{Instance: "   ", SiteKey: "  ", Secret: "  "},
 	} {
 		if cfg.Enabled() {
 			t.Fatalf("配置 %+v 不应被视为已启用", cfg)
@@ -40,7 +43,7 @@ func TestVerifySuccess(t *testing.T) {
 	defer srv.Close()
 
 	c := New()
-	cfg := Config{Endpoint: srv.URL + "/sitekey/", Secret: "sec"}
+	cfg := Config{Instance: srv.URL, SiteKey: "sitekey", Secret: "sec"}
 	if err := c.Verify(context.Background(), cfg, "tok"); err != nil {
 		t.Fatalf("校验应通过，得到 %v", err)
 	}
@@ -60,7 +63,7 @@ func TestVerifyRejected(t *testing.T) {
 	defer srv.Close()
 
 	c := New()
-	cfg := Config{Endpoint: srv.URL, Secret: "sec"}
+	cfg := Config{Instance: srv.URL, SiteKey: "k", Secret: "sec"}
 	err := c.Verify(context.Background(), cfg, "bad")
 	if !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("期望 ErrInvalidToken，得到 %v", err)
@@ -76,7 +79,7 @@ func TestVerifyEmptyTokenRejectedWithoutRequest(t *testing.T) {
 	defer srv.Close()
 
 	c := New()
-	cfg := Config{Endpoint: srv.URL, Secret: "sec"}
+	cfg := Config{Instance: srv.URL, SiteKey: "k", Secret: "sec"}
 	// 空 token 必须在本地就被拒，不能白跑一趟网络请求
 	if err := c.Verify(context.Background(), cfg, "  "); !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("期望 ErrInvalidToken，得到 %v", err)
@@ -93,7 +96,7 @@ func TestVerifyServerError(t *testing.T) {
 	defer srv.Close()
 
 	c := New()
-	cfg := Config{Endpoint: srv.URL, Secret: "sec"}
+	cfg := Config{Instance: srv.URL, SiteKey: "k", Secret: "sec"}
 	err := c.Verify(context.Background(), cfg, "tok")
 	// 服务端故障必须与「校验失败」区分：前者是配置/网络问题，后者是访客的问题
 	if err == nil || errors.Is(err, ErrInvalidToken) {
@@ -103,7 +106,7 @@ func TestVerifyServerError(t *testing.T) {
 
 func TestVerifyUnreachable(t *testing.T) {
 	c := New()
-	cfg := Config{Endpoint: "http://127.0.0.1:1/", Secret: "sec"}
+	cfg := Config{Instance: "http://127.0.0.1:1", SiteKey: "k", Secret: "sec"}
 	err := c.Verify(context.Background(), cfg, "tok")
 	if err == nil || errors.Is(err, ErrInvalidToken) || errors.Is(err, ErrNotConfigured) {
 		t.Fatalf("连接失败应返回网络错误，得到 %v", err)
@@ -117,7 +120,7 @@ func TestVerifyMalformedResponse(t *testing.T) {
 	defer srv.Close()
 
 	c := New()
-	cfg := Config{Endpoint: srv.URL, Secret: "sec"}
+	cfg := Config{Instance: srv.URL, SiteKey: "k", Secret: "sec"}
 	if err := c.Verify(context.Background(), cfg, "tok"); err == nil {
 		t.Fatal("非法响应应报错")
 	}
@@ -133,4 +136,34 @@ func contains(s, sub string) bool {
 			}
 			return false
 		}())
+}
+
+
+// Endpoint 的拼接是配置里最容易出错的一环：管理员会照抄 Cap 后台的三个值，
+// 而斜杠有无、site key 是否带路径分隔符都不该影响结果。
+func TestEndpointComposition(t *testing.T) {
+	cases := []struct {
+		name     string
+		instance string
+		siteKey  string
+		want     string
+	}{
+		{"常规", "https://cap.example.com", "abc123", "https://cap.example.com/abc123/"},
+		{"实例带尾斜杠", "https://cap.example.com/", "abc123", "https://cap.example.com/abc123/"},
+		{"site key 带斜杠", "https://cap.example.com", "/abc123/", "https://cap.example.com/abc123/"},
+		{"两者都带斜杠", "https://cap.example.com/", "/abc123/", "https://cap.example.com/abc123/"},
+		{"带端口", "http://127.0.0.1:3000", "abc", "http://127.0.0.1:3000/abc/"},
+		{"带子路径", "https://example.com/cap", "abc", "https://example.com/cap/abc/"},
+		{"两端空白", "  https://cap.example.com  ", "  abc  ", "https://cap.example.com/abc/"},
+		{"缺 site key", "https://cap.example.com", "", ""},
+		{"缺实例", "", "abc", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Config{Instance: c.instance, SiteKey: c.siteKey}.Endpoint()
+			if got != c.want {
+				t.Fatalf("Endpoint() = %q，期望 %q", got, c.want)
+			}
+		})
+	}
 }

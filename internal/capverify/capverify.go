@@ -29,18 +29,37 @@ import (
 // 校验发生在访客提交路径上，网络慢时宁可放行失败也不能长时间挂住请求。
 const verifyTimeout = 10 * time.Second
 
-// Config 一次校验所需的配置。
-// Endpoint 是 Cap 实例的公开地址（含 site key），例如
-// https://cap.example.com/d9256640cb53/
+// Config 一次校验所需的配置，对应 Cap 后台给出的三个值。
+//
+// Cap 把实例地址与 site key 分开给出，本结构照此保留三个字段而非预先拼成
+// 一个字符串：合成单栏后管理员得自己拼出 {地址}/{site key}/，把 site key
+// 填进地址栏或漏掉结尾斜杠都会得到一个看起来合理却永远失败的 URL。
 type Config struct {
-	Endpoint string
-	Secret   string
+	// Instance Cap 实例的公开地址，例如 https://cap.example.com
+	Instance string
+	// SiteKey Cap 后台的 site key，例如 d9256640cb53
+	SiteKey string
+	// Secret Cap 后台的 secret key（不是 ADMIN_KEY）
+	Secret string
+}
+
+// Endpoint 拼出 widget 与 siteverify 共用的地址：{instance}/{siteKey}/
+//
+// 两处必须用同一个值：widget 从这里取题、服务端往这里提交答案，
+// 指向不同的 site key 会表现为「验证永远不通过」。
+func (c Config) Endpoint() string {
+	instance := strings.TrimRight(strings.TrimSpace(c.Instance), "/")
+	siteKey := strings.Trim(strings.TrimSpace(c.SiteKey), "/")
+	if instance == "" || siteKey == "" {
+		return ""
+	}
+	return instance + "/" + siteKey + "/"
 }
 
 // Enabled 判断配置是否完整。
-// 两项都填齐才启用：只填地址没填密钥会静默放行，等于没验证。
+// 三项都填齐才启用：缺任意一项都会让校验要么静默放行，要么必然失败。
 func (c Config) Enabled() bool {
-	return strings.TrimSpace(c.Endpoint) != "" && strings.TrimSpace(c.Secret) != ""
+	return c.Endpoint() != "" && strings.TrimSpace(c.Secret) != ""
 }
 
 // ErrNotConfigured 表示未配置 Cap，调用方应跳过校验。
@@ -72,7 +91,7 @@ func (c *Client) Verify(ctx context.Context, cfg Config, token string) error {
 		return ErrInvalidToken
 	}
 
-	url := strings.TrimSuffix(cfg.Endpoint, "/") + "/siteverify"
+	url := strings.TrimSuffix(cfg.Endpoint(), "/") + "/siteverify"
 	body, err := json.Marshal(map[string]string{
 		"secret":   cfg.Secret,
 		"response": token,
