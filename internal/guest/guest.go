@@ -136,19 +136,31 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		gateway.WriteAuthError(w, e)
 		return
 	}
-	// 人机验证在配额之前：机器人刷 start 会先被挡在这里，不至于白扣访客的
-	// 当日额度（配额是给人用的，不该被自动化请求消耗）。
-	if !h.verifyCaptcha(w, r) {
-		return
-	}
-	// 配额在 start 就扣减：每个 flow 会占内存直到 TTL 过期，不限制的话
-	// 一次 start 就能堆一批会话（cleanupFlows 只在下次请求时才清扫）。
-	// 扣在这里也意味着「开始一次授权」即计入当日额度，与用户直觉一致。
-	if !h.Auth.AllowGuestSubmission(r) {
-		writeDetail(w, http.StatusTooManyRequests, "今日提交次数已用完")
-		return
-	}
+
+	host := auth.ClientHost(r)
 	h.cleanupFlows()
+
+	// 同一 IP 只保留一个进行中会话：已有会话时这次请求是「换个链接」，
+	// 替换旧的即可，既不重复扣当日配额、也不要求再解一次人机验证。
+	//
+	// 换链接不产生任何上游开销，也不增加内存（旧会话先被删掉），重新解一次
+	// PoW 只会让访客白等；而真正昂贵的 complete（真实上游实测）仍然每次都
+	// 需要一枚新 token，所以放宽这里不构成绕过。
+	replacing := h.hasFlowForHost(host)
+	if !replacing {
+		// 人机验证在配额之前：机器人刷 start 会先被挡在这里，不至于白扣访客的
+		// 当日额度（配额是给人用的，不该被自动化请求消耗）。
+		if !h.verifyCaptcha(w, r) {
+			return
+		}
+		// 配额在首次生成时扣减，这是当日额度的实际闸门：complete 会消耗掉会话，
+		// 下次生成又算首次，故一个来源最多提交 3 次。若不在这里扣，昂贵的实测
+		// （真实上游调用 + 验证码求解，上限 90s）就能被无限重试。
+		if !h.Auth.AllowGuestSubmission(r) {
+			writeDetail(w, http.StatusTooManyRequests, "今日提交次数已用完")
+			return
+		}
+	}
 
 	flow := oauth.NewFlow()
 	flowID, authorizeURL, err := flow.Init()
@@ -156,10 +168,43 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		gateway.WriteJSON(w, http.StatusBadGateway, map[string]any{"detail": "授权初始化失败"})
 		return
 	}
+
+	// 先构造好新会话再替换旧的：Init 失败时旧会话仍在，访客不至于两头落空。
+	if replacing {
+		h.dropFlowForHost(host)
+	}
 	h.mu.Lock()
-	h.flows[flowID] = &guestFlow{flow: flow, createdAt: time.Now(), host: auth.ClientHost(r)}
+	h.flows[flowID] = &guestFlow{flow: flow, createdAt: time.Now(), host: host}
 	h.mu.Unlock()
 	gateway.WriteJSON(w, http.StatusOK, map[string]any{"flow_id": flowID, "authorize_url": authorizeURL})
+}
+
+// hasFlowForHost 该来源 IP 是否已有进行中的会话。
+func (h *Handler) hasFlowForHost(host string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, gf := range h.flows {
+		if gf.host == host {
+			return true
+		}
+	}
+	return false
+}
+
+// dropFlowForHost 删除该来源 IP 的进行中会话。
+//
+// 一个 IP 同时只保留一个会话：会话带 TTL 且只在下次请求时才清扫，允许同一
+// 来源反复生成会让内存随请求次数增长；而「换个链接」本来也不需要保留旧的
+// ——旧 state 一旦被替换就再没有对应的会话，用旧链接完成会得到明确的
+// 「会话不存在」而不是含糊的失败。
+func (h *Handler) dropFlowForHost(host string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for id, gf := range h.flows {
+		if gf.host == host {
+			delete(h.flows, id)
+		}
+	}
 }
 
 // handleComplete 完成授权：兑换凭证 → 实测 → 通过才入池。

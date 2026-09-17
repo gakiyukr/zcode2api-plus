@@ -319,3 +319,169 @@ func TestGuestInfoOmitsEndpointWhenUnconfigured(t *testing.T) {
 		t.Fatalf("未配置时应报告无需人机验证: %v", resp)
 	}
 }
+
+// ── 重新生成授权链接 ────────────────────────────────────────────────────────
+//
+// 访客可能想换一个链接（旧链接发错地方、或想换个设备重来）。重新生成不该
+// 重复扣当日配额，也不该要求再解一次人机验证——它没有任何上游开销。
+
+// 同一 IP 重复 start：只保留一个会话，旧链接失效。
+func TestStartReplacesExistingFlowForSameHost(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetInviteCode("CODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	host := "203.0.113.7:1234"
+	rec1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	req1.Header.Set("x-invite-code", "CODE")
+	req1.RemoteAddr = host
+	h.handleStart(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("首次生成应 200: %d %s", rec1.Code, rec1.Body.String())
+	}
+	var first map[string]string
+	_ = json.Unmarshal(rec1.Body.Bytes(), &first)
+
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	req2.Header.Set("x-invite-code", "CODE")
+	req2.RemoteAddr = host
+	h.handleStart(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("重新生成应 200: %d %s", rec2.Code, rec2.Body.String())
+	}
+	var second map[string]string
+	_ = json.Unmarshal(rec2.Body.Bytes(), &second)
+
+	if first["flow_id"] == second["flow_id"] {
+		t.Fatal("重新生成应产生新的 flow_id")
+	}
+	// 旧会话必须被移除：留着会让内存随生成次数增长
+	h.mu.Lock()
+	n := len(h.flows)
+	_, oldAlive := h.flows[first["flow_id"]]
+	h.mu.Unlock()
+	if oldAlive {
+		t.Fatal("旧会话应被替换掉")
+	}
+	if n != 1 {
+		t.Fatalf("同一 IP 应只保留一个会话，实际 %d", n)
+	}
+}
+
+// 重新生成不扣配额：否则访客换几次链接就没额度可提交了。
+func TestStartRegenerationDoesNotConsumeQuota(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetInviteCode("CODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	host := "203.0.113.9:1234"
+	// 首次生成扣 1 次配额，其余为重新生成。次数取 auth 包的每日上限之上，
+	// 若重新生成也扣配额，这里必然撞 429。
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+		req.Header.Set("x-invite-code", "CODE")
+		req.RemoteAddr = host
+		h.handleStart(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("第 %d 次生成应放行（重新生成不扣配额），得到 %d: %s",
+				i+1, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// 不同 IP 各自独立，互不影响。
+func TestStartIsolatesFlowsPerHost(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetInviteCode("CODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, host := range []string{"203.0.113.1:1", "203.0.113.2:2"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+		req.Header.Set("x-invite-code", "CODE")
+		req.RemoteAddr = host
+		h.handleStart(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s 应放行: %d", host, rec.Code)
+		}
+	}
+	h.mu.Lock()
+	n := len(h.flows)
+	h.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("不同来源应各保留一个会话，实际 %d", n)
+	}
+}
+
+// 放宽重新生成后，配额仍须对「首次生成」生效。
+//
+// 这是当日额度的实际闸门：complete 会消耗掉会话，下次生成又算首次，
+// 所以一个 IP 最多提交 3 次。若这里被绕过，昂贵的实测（真实上游调用 +
+// 验证码求解，上限 90s）就能被无限重试。
+func TestStartBlockedWhenQuotaExhausted(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetInviteCode("CODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	const host = "198.51.100.50:1234"
+	// 直接把该来源的当日额度用尽（等价于已提交 3 次）
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+		req.RemoteAddr = host
+		if !h.Auth.AllowGuestSubmission(req) {
+			t.Fatalf("第 %d 次预扣应放行", i+1)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	req.Header.Set("x-invite-code", "CODE")
+	req.RemoteAddr = host
+	h.handleStart(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("额度用尽后应 429，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 已有会话时不该再看配额：换链接是免费的，额度用尽也不该挡。
+func TestStartRegenerationIgnoresExhaustedQuota(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetInviteCode("CODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	const host = "198.51.100.60:1234"
+	// 先建一个会话
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	req.Header.Set("x-invite-code", "CODE")
+	req.RemoteAddr = host
+	h.handleStart(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("首次生成应放行: %d", rec.Code)
+	}
+
+	// 用尽剩余额度
+	for i := 0; i < 3; i++ {
+		r := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+		r.RemoteAddr = host
+		h.Auth.AllowGuestSubmission(r)
+	}
+
+	// 换链接仍应放行
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	req.Header.Set("x-invite-code", "CODE")
+	req.RemoteAddr = host
+	h.handleStart(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("额度用尽后换链接应仍放行，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+}

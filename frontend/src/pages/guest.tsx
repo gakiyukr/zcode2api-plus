@@ -6,7 +6,7 @@
  *
  * 人機驗證用自建的 Cap（PoW，無第三方）。兩步各驗一次：Cap token 是一次性的，
  * 第一步用過就失效，所以第二步要重新求解。未配置 Cap 時整段不渲染，後端也跳過。 */
-import { Copy, ExternalLink, Layers, Loader2, ShieldCheck } from 'lucide-react'
+import { Copy, ExternalLink, Layers, Loader2, RefreshCw, ShieldCheck } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type DetailedHTMLProps, type FormEvent } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -134,7 +134,10 @@ export function GuestPage() {
     setCapKey((k) => k + 1)
   }, [])
 
-  async function start() {
+  /* 生成授權連結。
+     regenerate 為 true 時是「換一個」：後端會替換掉同一來源的舊會話，
+     不重複扣當日配額，故無需再解一次人機驗證。 */
+  async function start(regenerate = false) {
     const code = invite.trim()
     if (!code || busy) return
     setBusy(true)
@@ -152,6 +155,11 @@ export function GuestPage() {
       const d = (await r.json()) as { flow_id: string; authorize_url: string }
       setFlowID(d.flow_id)
       setAuthorizeURL(d.authorize_url)
+      // 换了链接，上一步贴的回调地址属于旧会话，继续留着只会让人误提交
+      if (regenerate) {
+        setCallbackURL('')
+        toast.success('已生成新的授權連結')
+      }
       // 不自動開窗：未經使用者點擊就跳轉到外部站台容易被當成彈窗廣告，
       // 也會在瀏覽器攔截時留下「什麼都沒發生」的困惑。改為明確的按鈕。
     } catch {
@@ -202,6 +210,10 @@ export function GuestPage() {
   function onStart(e: FormEvent) {
     e.preventDefault()
     void start()
+  }
+
+  function onRegenerate() {
+    void start(true)
   }
 
   function onComplete(e: FormEvent) {
@@ -303,7 +315,7 @@ export function GuestPage() {
                 disabled={busy || !invite.trim() || captchaBlocked}
               >
                 {busy ? <Loader2 className="size-4 animate-spin" /> : null}
-                開始授權
+                生成授權連結
               </Button>
               <p className="text-xs text-muted-foreground">
                 授權僅用於驗證你確實持有該帳號；通過一次真實請求實測後才會入池。
@@ -330,6 +342,26 @@ export function GuestPage() {
                       <ExternalLink className="size-3.5" />
                     </a>
                   </Button>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="text-muted-foreground"
+                    disabled={busy}
+                    onClick={onRegenerate}
+                  >
+                    {busy ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="size-3.5" />
+                    )}
+                    重新生成
+                  </Button>
+                  <span className="text-xs text-muted-foreground">
+                    連結失效或想換一個時使用；不佔用今日提交次數
+                  </span>
                 </div>
               </div>
               <form className="flex flex-col gap-2" onSubmit={onComplete}>
