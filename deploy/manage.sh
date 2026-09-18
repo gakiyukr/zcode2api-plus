@@ -353,26 +353,66 @@ resolve_run_user() {
 	[ -n "$RUN_GROUP" ] || die "無法確定賬號 $RUN_USER 的主組"
 }
 
+# bin_show_keys 打印當前密鑰。
+# 獨立成命令的理由：密鑰存在數據庫裡，忘了就只能在後台看，而後台需要密鑰才
+# 進得去——沒有這個出口，遺忘等於重建。直接讀庫繞開這個死結。
+bin_show_keys() {
+	require_root
+	local db="$DIR/data/accounts.db"
+	[ -f "$db" ] || die "未找到數據庫: $db（請確認安裝目錄或用 --dir 指定）"
+	command -v sqlite3 >/dev/null 2>&1 || die "需要 sqlite3 讀取密鑰，請先安裝"
+
+	local admin_key gateway_key
+	admin_key="$(sqlite3 "$db" "SELECT value FROM meta WHERE key='admin_key';" 2>/dev/null || true)"
+	gateway_key="$(sqlite3 "$db" "SELECT value FROM meta WHERE key='gateway_key';" 2>/dev/null || true)"
+
+	echo
+	printf '%s密鑰%s\n' "$C_BOLD" "$C_RST"
+	hr
+	printf '  目錄           %s\n' "$DIR"
+	printf '  後台密碼       %s\n' "${admin_key:-（未設置）}"
+	printf '  網關 API Key   %s\n' "${gateway_key:-（未設置）}"
+	echo
+	info "後台位址: http://$(hostname -I 2>/dev/null | awk '{print $1}'):$PORT/admin/login"
+	echo
+}
+
 print_keys_hint() {
 	local ip
 	ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
 	[ -n "$ip" ] || ip="<本機IP>"
-	if systemctl is-active --quiet zcode2api.service 2>/dev/null; then
-		ok "服務運行中: http://$ip:$PORT/admin/login"
-		local key_line
-		key_line="$(journalctl -u zcode2api --since "-2min" --no-pager 2>/dev/null \
-			| grep -E "初始後台密碼|網關 API Key" | tail -2 || true)"
-		if [ -n "$key_line" ]; then
-			echo
-			warn "以下密鑰僅在首次啟動時顯示，請立即保存："
-			printf '%s\n' "$key_line" | sed 's/^/    /'
-		else
-			echo
-			info "密鑰已存在於數據庫中（非首次啟動）。遺忘可在後台「系統設置」查看。"
-		fi
-	else
+	if ! systemctl is-active --quiet zcode2api.service 2>/dev/null; then
 		warn "服務未處於運行狀態，請執行: journalctl -u zcode2api -n 50"
+		return 0
 	fi
+	ok "服務運行中: http://$ip:$PORT/admin/login"
+
+	# 直接讀庫而非 grep 日誌。原本靠 journalctl 匹配二進制橫幅的字串，那條
+	# 依賴極脆：文案改一個字（簡繁差異即足夠）就永遠匹配不到，而失敗是靜默的
+	# ——首次安裝的密鑰提示會退化成「已存在於數據庫」，把剛生成的密鑰藏起來。
+	# 庫裡的 meta 表是唯一權威來源，不受語言、日誌輪替與時間窗口影響。
+	local db="$DIR/data/accounts.db"
+	if [ ! -f "$db" ] || ! command -v sqlite3 >/dev/null 2>&1; then
+		echo
+		info "密鑰存放於 $db（meta 表）。"
+		info "遺忘可在後台「系統設置」查看，或執行: sudo $SELF_BASENAME show-keys"
+		return 0
+	fi
+
+	local admin_key gateway_key
+	admin_key="$(sqlite3 "$db" "SELECT value FROM meta WHERE key='admin_key';" 2>/dev/null || true)"
+	gateway_key="$(sqlite3 "$db" "SELECT value FROM meta WHERE key='gateway_key';" 2>/dev/null || true)"
+
+	if [ -z "$admin_key" ] && [ -z "$gateway_key" ]; then
+		echo
+		info "未能從數據庫讀取密鑰；可在後台「系統設置」查看。"
+		return 0
+	fi
+
+	echo
+	printf '  %s後台密碼%s      %s\n' "$C_DIM" "$C_RST" "${admin_key:-（未設置）}"
+	printf '  %s網關 API Key%s   %s\n' "$C_DIM" "$C_RST" "${gateway_key:-（未設置）}"
+	printf '  %s如已遺忘，可在此查看或於後台「系統設置」修改。%s\n' "$C_DIM" "$C_RST"
 }
 
 # ── 二進制：安裝 / 更新 / 卸載 / 狀態 ───────────────────────────────────────
@@ -1350,6 +1390,7 @@ ${C_BOLD}zcode2api 管理腳本（Linux）${C_RST}
   update             更新二進制（比對 Release 版本）
   uninstall          卸載二進制
   status             查看安裝狀態
+  show-keys          顯示後台密碼與網關 API Key
   scan               掃描 /opt 下已有的本程序安裝（含手工編譯的）
   adopt              把手工部署的目錄納入管理（--dir 指定）
   migrate            接管 + 部署最新 + 遷移數據（--dir 指定源目錄）
@@ -1377,6 +1418,7 @@ ${C_BOLD}zcode2api 管理腳本（Linux）${C_RST}
 示例:
   sudo $0 install --port 3010 --user zcode
   sudo $0 update -y
+  sudo $0 show-keys
   sudo $0 scan
   sudo $0 adopt --dir /opt/zcode2api-custom
   sudo $0 migrate --dir /opt/zcode2api-custom
@@ -1429,6 +1471,7 @@ main() {
 		update)       require_linux; bin_update ;;
 		uninstall)    require_linux; bin_uninstall ;;
 		status)       require_linux; bin_status ;;
+		show-keys)    require_linux; bin_show_keys ;;
 		scan)         require_linux; bin_scan ;;
 		adopt)        require_linux; bin_adopt ;;
 		migrate)      require_linux; bin_migrate ;;
