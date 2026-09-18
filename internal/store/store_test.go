@@ -552,3 +552,26 @@ func TestRemoveAccountKeepsMemoryOnPersistFailure(t *testing.T) {
 		t.Fatal("落库失败后账号不应从内存消失（会与 DB 分叉）")
 	}
 }
+
+// AddAccount 落库失败时不得留下内存账号。
+//
+// 与 RemoveAccount 对称：反过来会让账号在本次进程里可用、重启后消失，而调用方
+// 收到错误以为没建成——「界面显示已保存、重启后回滚」的镜像版本。
+func TestAddAccountKeepsMemoryCleanOnPersistFailure(t *testing.T) {
+	s := newTestStore(t)
+	// 关掉底层连接，让 INSERT 必然失败
+	if err := s.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	acc, err := s.AddAccount(model.ProviderZai, "ghost", "header.payload.signature")
+	if err == nil {
+		t.Fatal("落库失败应返回错误")
+	}
+	if acc != nil {
+		t.Fatal("失败时不应返回账号")
+	}
+	if s.Find(model.ProviderZai, "ghost") != nil {
+		t.Fatal("落库失败后内存不应留下账号（会与 DB 分叉）")
+	}
+}

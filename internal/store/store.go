@@ -570,10 +570,12 @@ func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error
 			return a.Clone(), nil // 跳过重复 token
 		}
 	}
-	s.accounts[provider] = append(s.accounts[provider], acc)
+	// 先落库再改内存：落库失败时内存不能留下一个不存在的账号。反过来会让
+	// 账号在本次进程里可用、重启后消失，而调用方收到 500 以为没建成。
 	if err := s.persistAccountLocked(acc); err != nil {
 		return nil, err
 	}
+	s.accounts[provider] = append(s.accounts[provider], acc)
 	return acc.Clone(), nil
 }
 

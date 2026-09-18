@@ -550,16 +550,20 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, apiErr)
 		return
 	}
+
+	// 先把全部字段验证一遍再落库。逐段「验证一段写一段」会让中途失败留下半套
+	// 生效的配置：管理员收到 500 以为整批没生效，实际前面的字段已经写进去了。
+	// 改密码正是为了撤销泄露时，「以为失败但已轮换」会让人用旧密码重试到锁死。
+	type setting struct{ key, value string }
+	var pending []setting
+
 	if v, ok := payload["admin_key"]; ok {
 		key := strings.TrimSpace(strOf(v))
 		if key == "" {
 			writeAPIError(w, errBadRequest("后台密钥不能为空"))
 			return
 		}
-		if err := h.Store.SetSetting("admin_key", key); err != nil {
-			writeError500(w, err)
-			return
-		}
+		pending = append(pending, setting{"admin_key", key})
 	}
 	if v, ok := payload["gateway_key"]; ok {
 		key := strings.TrimSpace(strOf(v))
@@ -568,21 +572,13 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("网关 API Key 不能为空"))
 			return
 		}
-		if err := h.Store.SetSetting("gateway_key", key); err != nil {
-			writeError500(w, err)
-			return
-		}
+		pending = append(pending, setting{"gateway_key", key})
 	}
 	if v, ok := payload["guest_invite_code"]; ok {
 		// 空值合法：表示关闭访客入口（与 admin_key/gateway_key 的必填语义相反）
-		if err := h.Auth.SetInviteCode(strings.TrimSpace(strOf(v))); err != nil {
-			writeError500(w, err)
-			return
-		}
+		pending = append(pending, setting{"guest_invite_code", strings.TrimSpace(strOf(v))})
 	}
 	if _, ok := payload["cap_instance"]; ok {
-		// 三项一起处理：分开写会让「改了地址但没改 site key」的中间态落库，
-		// 那一刻校验指向旧组合而全部失败。
 		instance := strings.TrimSpace(strOf(payload["cap_instance"]))
 		siteKey := strings.TrimSpace(strOf(payload["cap_site_key"]))
 		secret := strings.TrimSpace(strOf(payload["cap_secret"]))
@@ -595,20 +591,16 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 				writeAPIError(w, errBadRequest("人机验证需同时填写实例地址、Site Key 与密钥；三项皆留空即停用"))
 				return
 			}
-			if err := h.Auth.SetCapConfig("", "", ""); err != nil {
-				writeError500(w, err)
-				return
-			}
-		} else {
-			if !strings.HasPrefix(instance, "http://") && !strings.HasPrefix(instance, "https://") {
-				writeAPIError(w, errBadRequest("实例地址必须以 http:// 或 https:// 开头"))
-				return
-			}
-			if err := h.Auth.SetCapConfig(instance, siteKey, secret); err != nil {
-				writeError500(w, err)
-				return
-			}
+		} else if !strings.HasPrefix(instance, "http://") && !strings.HasPrefix(instance, "https://") {
+			writeAPIError(w, errBadRequest("实例地址必须以 http:// 或 https:// 开头"))
+			return
 		}
+		// 三项作为一组写入：分开写会让「改了地址但没改 site key」的中间态落库，
+		// 那一刻校验指向旧组合而全部失败。
+		pending = append(pending,
+			setting{"cap_instance", instance},
+			setting{"cap_site_key", siteKey},
+			setting{"cap_secret", secret})
 	}
 	if v, ok := payload["quota_refresh_interval"]; ok {
 		interval, valid := pyInt(v)
@@ -616,8 +608,14 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("刷新间隔必须是非负整数"))
 			return
 		}
-		interval = max(0, interval)
-		if err := h.Store.SetSetting("quota_refresh_interval", strconv.Itoa(interval)); err != nil {
+		pending = append(pending, setting{"quota_refresh_interval", strconv.Itoa(max(0, interval))})
+	}
+
+	// 验证全部通过后才落库。单次写入仍可能在中途失败（磁盘满、DB 只读），
+	// 但那时所有字段都已是合法值，重试整批即可，不会出现「一半新一半旧」的
+	// 组合被当成成功。
+	for _, kv := range pending {
+		if err := h.Store.SetSetting(kv.key, kv.value); err != nil {
 			writeError500(w, err)
 			return
 		}

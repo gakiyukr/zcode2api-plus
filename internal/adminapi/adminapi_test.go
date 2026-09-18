@@ -613,3 +613,45 @@ func TestExportImportRoundTrip(t *testing.T) {
 		t.Fatal("导入应保留账号")
 	}
 }
+
+// 设定更新必须先验证全部字段再落库。
+//
+// 逐段「验证一段写一段」会让中途失败留下半套生效的配置：管理员收到 400 以为
+// 整批被拒，实际前面的字段已经写进去了。改密码正是为了撤销泄露时，「以为失败
+// 但已轮换」会让人拿旧密码重试到锁死。
+func TestSettingsUpdateIsAtomic(t *testing.T) {
+	mux, st, _ := setup(t)
+	before := st.AdminKey()
+
+	// 同一请求里 admin_key 合法、gateway_key 非法：整批都不得生效
+	code, _ := do(t, mux, st, http.MethodPut, "/admin/api/settings", map[string]any{
+		"admin_key":              "NEW-ADMIN-KEY",
+		"gateway_key":            "", // 非法
+		"quota_refresh_interval": 999,
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("应 400: %d", code)
+	}
+	if got := st.AdminKey(); got != before {
+		t.Fatalf("验证失败时不得写入任何字段，admin_key 已变成 %q", got)
+	}
+	if got := st.QuotaRefreshInterval(); got == 999 {
+		t.Fatal("验证失败时 quota_refresh_interval 不应生效")
+	}
+
+	// Cap 三项只填一项同样整批拒绝，且不得留下残值
+	code, _ = do(t, mux, st, http.MethodPut, "/admin/api/settings", map[string]any{
+		"cap_instance": "https://cap.example.com",
+		"cap_site_key": "abc",
+		"cap_secret":   "", // 缺一项
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("Cap 部分填写应 400: %d", code)
+	}
+	if v, _ := st.GetSetting("cap_instance"); v != "" {
+		t.Fatalf("拒绝的请求不应写入 cap_instance，得到 %q", v)
+	}
+	if v, _ := st.GetSetting("cap_site_key"); v != "" {
+		t.Fatalf("拒绝的请求不应写入 cap_site_key，得到 %q", v)
+	}
+}
