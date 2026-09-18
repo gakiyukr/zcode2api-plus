@@ -612,8 +612,10 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 验证全部通过后才落库。单次写入仍可能在中途失败（磁盘满、DB 只读），
-	// 但那时所有字段都已是合法值，重试整批即可，不会出现「一半新一半旧」的
-	// 组合被当成成功。
+	// 此时已写入的字段会生效——SetSetting 逐条提交，没有跨字段事务。这是
+	// 有意的取舍：把「验证」与「落库」分开已经消除了最主要的半套用来源
+	// （非法值导致的拒绝），而落库期故障本就无法靠重试整批来「撤销」。
+	// 失败时返回 500，管理员重试整批即可把剩下的字段补齐。
 	for _, kv := range pending {
 		if err := h.Store.SetSetting(kv.key, kv.value); err != nil {
 			writeError500(w, err)

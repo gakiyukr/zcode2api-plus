@@ -24,6 +24,7 @@ import (
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/util"
+	"zcode2api/internal/web"
 )
 
 const (
@@ -273,11 +274,50 @@ func (s *Store) GetSetting(key string) (string, bool) {
 }
 
 // SetSetting 更新设置并落库。
+// logPersistFailure 记录一次落库失败。
+//
+// 统计路径（网关计 token、异步池计状态、额度刷新）刻意忽略 Update 的错误——
+// 不该因为统计写不进去就让用户的对话请求失败。但完全静默会让「磁盘满导致
+// 统计与状态全部不落库」没有任何线索可查：后台数字与实际持久化状态脱节，
+// 重启后回滚，而日志里什么都没有。这里集中记一次，涵盖所有调用方。
+//
+// 节流到每分钟一条：落库持续失败时（磁盘满）每个请求都会走到这里，
+// 不节流会把日志刷爆并掩盖其他信息。
+func logPersistFailure(scope, detail string, err error) {
+	if err == nil {
+		return
+	}
+	persistLogMu.Lock()
+	now := time.Now()
+	allow := now.Sub(persistLogLast) >= persistLogInterval
+	if allow {
+		persistLogLast = now
+	}
+	persistLogMu.Unlock()
+	if !allow {
+		return
+	}
+	web.Warn("store", fmt.Sprintf("落库失败（%s，%s）: %v；内存已改而 DB 未写入，重启后会回滚", scope, detail, err))
+}
+
+var (
+	persistLogMu       sync.Mutex
+	persistLogLast     time.Time
+	persistLogInterval = time.Minute
+)
+
 func (s *Store) SetSetting(key, value string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 先落库再改内存，与 AddAccount / RemoveAccount 同一原则：落库失败时内存
+	// 不能留下一个未持久化的值，否则本次进程按新值运行、重启后回滚，而调用方
+	// 收到错误以为没生效。
+	if err := s.setMeta(key, value); err != nil {
+		logPersistFailure("setting", key, err)
+		return err
+	}
 	s.settings[key] = value
-	return s.setMeta(key, value)
+	return nil
 }
 
 func (s *Store) AdminKey() string {
@@ -573,6 +613,7 @@ func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error
 	// 先落库再改内存：落库失败时内存不能留下一个不存在的账号。反过来会让
 	// 账号在本次进程里可用、重启后消失，而调用方收到 500 以为没建成。
 	if err := s.persistAccountLocked(acc); err != nil {
+		logPersistFailure("add", provider+"/"+acc.ID, err)
 		return nil, err
 	}
 	s.accounts[provider] = append(s.accounts[provider], acc)
@@ -601,6 +642,7 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 	// 已消失，重启后又从 DB 载入回来。删除常被用来撤销可疑或外泄的凭证，
 	// 这种「显示已删除、实际还在」是安全相关的静默失败。
 	if err := s.deleteAccountLocked(target.ID); err != nil {
+		logPersistFailure("delete", provider+"/"+target.ID, err)
 		return false, err
 	}
 	remaining := items[:0:0]
@@ -642,6 +684,9 @@ func (s *Store) Update(provider, id string, fn func(acc *model.Account)) error {
 
 	if !ok {
 		return ErrNotFound
+	}
+	if failed != nil {
+		logPersistFailure("update", provider+"/"+id, failed)
 	}
 	return failed
 }

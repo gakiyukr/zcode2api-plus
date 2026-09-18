@@ -575,3 +575,29 @@ func TestAddAccountKeepsMemoryCleanOnPersistFailure(t *testing.T) {
 		t.Fatal("落库失败后内存不应留下账号（会与 DB 分叉）")
 	}
 }
+
+// SetSetting 落库失败时不得改动内存。
+//
+// 与 AddAccount / RemoveAccount 同一原则：反过来会让进程按未持久化的值运行，
+// 重启后回滚到旧值，而调用方收到错误以为没生效。改密钥时这尤其危险——管理员
+// 以为轮换失败、实际新值只在本次进程内有效。
+func TestSetSettingKeepsMemoryOnPersistFailure(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SetSetting("probe_key", "original"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.GetSetting("probe_key"); v != "original" {
+		t.Fatalf("前置条件: %q", v)
+	}
+
+	if err := s.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetSetting("probe_key", "updated"); err == nil {
+		t.Fatal("落库失败应返回错误")
+	}
+	if v, _ := s.GetSetting("probe_key"); v != "original" {
+		t.Fatalf("落库失败后内存不应改动，得到 %q", v)
+	}
+}
