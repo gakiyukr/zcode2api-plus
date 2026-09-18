@@ -353,6 +353,33 @@ resolve_run_user() {
 	[ -n "$RUN_GROUP" ] || die "無法確定賬號 $RUN_USER 的主組"
 }
 
+# installed_port 读取实际生效的监听端口。
+#
+# 不能直接用脚本变量 $PORT：它只是「安装时用的端口」，而 .env 里的
+# ZCODE_PORT 才是服务实际监听的（用户可事后编辑 .env 改端口）。两者不一致时
+# 提示里的地址会指向一个没人监听的端口。
+installed_port() {
+	local env_file="$DIR/.env" p
+	if [ -f "$env_file" ]; then
+		p="$(sed -n 's/^ZCODE_PORT=//p' "$env_file" 2>/dev/null | tail -1)"
+		[ -n "$p" ] && { printf '%s' "$p"; return 0; }
+	fi
+	printf '%s' "$PORT"
+}
+
+# installed_host 读取实际监听地址；通配地址对浏览器无意义，显示回环。
+installed_host() {
+	local env_file="$DIR/.env" h
+	if [ -f "$env_file" ]; then
+		h="$(sed -n 's/^ZCODE_HOST=//p' "$env_file" 2>/dev/null | tail -1)"
+		case "$h" in
+			""|0.0.0.0|"::") ;; # 通配，回退到外部 IP
+			*) printf '%s' "$h"; return 0 ;;
+		esac
+	fi
+	hostname -I 2>/dev/null | awk '{print $1}'
+}
+
 # bin_show_keys 打印當前密鑰。
 # 獨立成命令的理由：密鑰存在數據庫裡，忘了就只能在後台看，而後台需要密鑰才
 # 進得去——沒有這個出口，遺忘等於重建。直接讀庫繞開這個死結。
@@ -373,19 +400,19 @@ bin_show_keys() {
 	printf '  後台密碼       %s\n' "${admin_key:-（未設置）}"
 	printf '  網關 API Key   %s\n' "${gateway_key:-（未設置）}"
 	echo
-	info "後台位址: http://$(hostname -I 2>/dev/null | awk '{print $1}'):$PORT/admin/login"
+	info "後台位址: http://$(installed_host):$(installed_port)/admin/login"
 	echo
 }
 
 print_keys_hint() {
 	local ip
-	ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+	ip="$(installed_host)"
 	[ -n "$ip" ] || ip="<本機IP>"
 	if ! systemctl is-active --quiet zcode2api.service 2>/dev/null; then
 		warn "服務未處於運行狀態，請執行: journalctl -u zcode2api -n 50"
 		return 0
 	fi
-	ok "服務運行中: http://$ip:$PORT/admin/login"
+	ok "服務運行中: http://$ip:$(installed_port)/admin/login"
 
 	# 直接讀庫而非 grep 日誌。原本靠 journalctl 匹配二進制橫幅的字串，那條
 	# 依賴極脆：文案改一個字（簡繁差異即足夠）就永遠匹配不到，而失敗是靜默的
