@@ -584,3 +584,43 @@ func TestRedact(t *testing.T) {
 		t.Fatalf("63 字符未达阈值应保留: %q", got)
 	}
 }
+
+// 排隊等待期間被取消，池容量不得減少。
+//
+// Solve 先从 g.idle 取到槽位，再 select 派发。若派发分支走 ctx.Done()，
+// 原实现直接返回而没有把槽位送回 g.idle，而槽位 goroutine 此后永远阻塞在
+// reqCh 上（唯一的出路 g.done 只在池关闭时触发）——池容量就此永久少一格。
+// 默认 workers=1 时，一次这样的事件就让整个池失效：后续每次 Solve 都等满
+// queueTimeout 才失败，且 IsStarted 仍为 true，不会被重建。
+func TestPoolSlotSurvivesDispatchPhaseCancel(t *testing.T) {
+	f := &scriptFactory{make: func(int) ([]stepFunc, error) {
+		return []stepFunc{slowStep(10*time.Millisecond, "tok")}, nil
+	}}
+	p := newTestPool(t, f.create, 1)
+	if err := p.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 反复取消「刚进入 Solve」的调用：取消时机落在派发 select 上的概率足够高
+	for i := 0; i < 30; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			// 立刻取消：此时调用多半停在「取槽位」或「派发」两个 select 上
+			cancel()
+		}()
+		_, _ = p.Solve(ctx)
+		cancel()
+	}
+
+	// 关键断言：池仍能服务。若槽位泄漏，这里会等满 queueTimeout 后失败。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	tok, err := p.Solve(ctx)
+	if err != nil {
+		t.Fatalf("取消若干次后池应仍可服务（槽位泄漏？）: %v", err)
+	}
+	// 只断言「拿到了非空结果」：反复取消可能触发 worker 重启，token 名字随之变化
+	if tok == "" {
+		t.Fatal("应返回非空求解结果")
+	}
+}

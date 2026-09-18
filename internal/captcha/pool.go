@@ -326,10 +326,16 @@ func (p *Pool) Solve(ctx context.Context) (string, error) {
 	select {
 	case s.reqCh <- req:
 	case <-ctx.Done():
+		// 槽位必须还回去：它此刻正阻塞在 reqCh 接收上，放回 idle 即恢复。
+		// 若直接返回，槽位既没收到请求也不会再入队（serveLoop 只在循环顶端
+		// 归还，一旦错过就永不执行），池容量永久少一格；默认 size=1 时
+		// 整个池就此失效，且 IsStarted 仍为 true 不会被重建。
 		p.abandon(req)
+		g.idle <- s
 		return "", ctx.Err()
 	case <-g.done:
 		p.abandon(req)
+		g.idle <- s
 		return "", ErrPoolClosed
 	}
 
