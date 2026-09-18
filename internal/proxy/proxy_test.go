@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -289,5 +290,99 @@ func TestSocks5LocalResolveFallsBackToIPv6(t *testing.T) {
 	}
 	if len(seenAddr) != 16 {
 		t.Fatalf("ATYP=0x04 应带 16 字节地址，得到 %d", len(seenAddr))
+	}
+}
+
+// 域名形式的 CONNECT 回复（ATYP=0x03）必须被完整消费。
+//
+// 回复头 5 字节里第 5 字节是域名长度，域名本身尚未读取。原实现把它当作
+// 「已读走 1 字节地址」而算出 len-1+2，少读 1 字节：那个字节会留在 socket
+// 里成为应用层数据流的第一个字节，表现为 TLS 握手失败或请求行被吃掉，
+// 而错误信息完全指不到原因。既有测试一律回 IPv4（0x01），因此长期未暴露。
+func TestSocks5DomainReplyFullyConsumed(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+	backendHost := strings.TrimPrefix(backend.URL, "http://")
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	// 假代理：按 RFC 1928 完成协商与 CONNECT，但回复用 ATYP=0x03（域名）。
+	// 回复的 ATYP 与请求无关，客户端必须能消费任意形式。
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				head := make([]byte, 2)
+				if _, e := readFull(c, head); e != nil || head[0] != 0x05 {
+					return
+				}
+				methods := make([]byte, head[1])
+				if _, e := readFull(c, methods); e != nil {
+					return
+				}
+				if _, e := c.Write([]byte{0x05, 0x00}); e != nil {
+					return
+				}
+				req := make([]byte, 4)
+				if _, e := readFull(c, req); e != nil || req[1] != 0x01 {
+					return
+				}
+				switch req[3] {
+				case 0x01:
+					b := make([]byte, 4+2)
+					if _, e := readFull(c, b); e != nil {
+						return
+					}
+				case 0x03:
+					l := make([]byte, 1)
+					if _, e := readFull(c, l); e != nil {
+						return
+					}
+					b := make([]byte, int(l[0])+2)
+					if _, e := readFull(c, b); e != nil {
+						return
+					}
+				}
+				domain := "bnd.example.com"
+				reply := []byte{0x05, 0x00, 0x00, 0x03, byte(len(domain))}
+				reply = append(reply, []byte(domain)...)
+				reply = append(reply, 0x1F, 0x90)
+				if _, e := c.Write(reply); e != nil {
+					return
+				}
+				up, err := net.Dial("tcp", backendHost)
+				if err != nil {
+					return
+				}
+				defer up.Close()
+				go copyBoth(up, c)
+				copyBoth(c, up)
+			}(c)
+		}
+	}()
+
+	transport, err := TransportFor("socks5://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	resp, err := client.Get(backend.URL)
+	if err != nil {
+		t.Fatalf("域名回复下请求失败（隧道被污染）: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ok" {
+		t.Fatalf("响应体被污染: %q", body)
 	}
 }

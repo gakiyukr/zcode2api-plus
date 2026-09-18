@@ -295,17 +295,24 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 	acc.Plans = plans
 
 	// balance 仅提供当期数值；周期与所属方案需由 entitlement 对应回来
-	entitlements := map[any]map[string]any{}
-	entitlementPlans := map[any]map[string]any{}
+	entitlements := map[string]map[string]any{}
+	entitlementPlans := map[string]map[string]any{}
 	for _, plan := range acc.Plans {
 		rawEnts, _ := plan["entitlements"].([]any)
 		for _, raw := range rawEnts {
 			ent, ok := raw.(map[string]any)
-			if !ok || !truthyAny(ent["entitlement_id"]) {
+			if !ok {
 				continue
 			}
-			entitlements[ent["entitlement_id"]] = ent
-			entitlementPlans[ent["entitlement_id"]] = plan
+			// 键必须是可哈希的：上游把 entitlement_id 回成数组或对象时，
+			// 直接拿它当 map[any] 的键会 panic（hash of unhashable type），
+			// 而本函数跑在无 recover 的 goroutine 里，会终止整个进程。
+			entID, ok := ent["entitlement_id"].(string)
+			if !ok || entID == "" {
+				continue
+			}
+			entitlements[entID] = ent
+			entitlementPlans[entID] = plan
 		}
 	}
 
@@ -320,7 +327,9 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 			continue
 		}
 		name := firstNonEmptyString(balance["show_name"], balance["model"], "model")
-		entID := balance["entitlement_id"]
+		// 与写入端同为 string：上游回非字符串时查不到对应项，退化为无周期信息，
+		// 而不是拿容器类型去查 map 触发 panic。
+		entID, _ := balance["entitlement_id"].(string)
 		ent := entitlements[entID]
 		plan := entitlementPlans[entID]
 		planName, planIsTrial := "", false
@@ -570,23 +579,6 @@ func (m *Monitor) Stop() {
 func isZeroNumber(v any) bool {
 	n, ok := asNumber(v)
 	return ok && n == 0
-}
-
-// truthyAny 对齐 Python 的真值判定（entitlement_id 缺失 / 空串 / 0 均视为无效）。
-func truthyAny(v any) bool {
-	switch x := v.(type) {
-	case nil:
-		return false
-	case string:
-		return x != ""
-	case bool:
-		return x
-	case float64:
-		return x != 0
-	case int:
-		return x != 0
-	}
-	return true
 }
 
 // firstNonEmptyString 依次取第一个非空字符串项（对齐 or 链），全空时取末位兜底。
