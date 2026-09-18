@@ -32,8 +32,14 @@ declare module 'react' {
 }
 
 /* 載入 Cap 的 widget 腳本。固定版本而非 latest：
-   widget 會隨上游更新，不固定版本等於讓外部決定本頁何時改變行為。 */
+   widget 會隨上游更新，不固定版本等於讓外部決定本頁何時改變行為。
+
+   SRI 為必須：本頁與後台同源，CDN 被投毒或套件被替換時，注入的腳本能讀取
+   同一個 origin 的 localStorage（後台金鑰就在那裡）。integrity 讓瀏覽器在
+   內容不符時拒絕執行，把「信任第三方」縮小到「信任這一份位元組」。
+   升級版本時必須一併更新此雜湊，否則頁面會載入失敗。 */
 const CAP_WIDGET_SRC = 'https://cdn.jsdelivr.net/npm/cap-widget@0.1.57'
+const CAP_WIDGET_SRI = 'sha384-jRVyBEwWeNAitIjhGT4Es7NBrYJS0WspXxvwUaxOve885Bj6sLTieyvmS85d9WF0'
 let capWidgetLoading: Promise<void> | null = null
 
 function loadCapWidget(): Promise<void> {
@@ -43,6 +49,8 @@ function loadCapWidget(): Promise<void> {
     const s = document.createElement('script')
     s.type = 'module'
     s.src = CAP_WIDGET_SRC
+    s.integrity = CAP_WIDGET_SRI
+    s.crossOrigin = 'anonymous'
     s.onload = () => resolve()
     s.onerror = () => {
       capWidgetLoading = null

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -102,5 +103,55 @@ func TestBodyLimitContract(t *testing.T) {
 	}
 	if rec.Body.String() != "ok" {
 		t.Fatalf("正常请求应被处理: %s", rec.Body.String())
+	}
+}
+
+// TestSecurityHeadersContract 约束浏览器侧的安全策略。
+//
+// 后台金钥存在 localStorage，而 localStorage 以 origin 为界、不分路径：公开的
+// /guest 页与 /admin 共用同一份存储。因此必须收紧「能执行脚本的来源」，并禁止
+// 本站被 iframe 嵌入（后台按钮单击即生效，点击劫持可用）。
+func TestSecurityHeadersContract(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("page"))
+	})
+	handler := securityHeaders(mux)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin", nil))
+
+	h := rec.Header()
+	csp := h.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("必须设置 Content-Security-Policy")
+	}
+	// 点击劫持：后台操作全是单击生效，必须禁止被嵌入
+	if !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("CSP 必须禁止被 iframe 嵌入: %s", csp)
+	}
+	// 前端实际加载两个外部脚本，缺任一都会让对应页面失效
+	for _, origin := range []string{"https://cdn.jsdelivr.net", "https://o.alicdn.com"} {
+		if !strings.Contains(csp, origin) {
+			t.Fatalf("CSP 必须放行 %s（页面依赖该脚本）: %s", origin, csp)
+		}
+	}
+	// Cap widget 把 PoW 放进 Blob URL 构造的 Web Worker；不放行 blob: 则
+	// worker 创建被拒，人机验证永远出不来题。
+	if !strings.Contains(csp, "blob:") {
+		t.Fatalf("CSP 必须放行 blob:（Cap widget 的 Web Worker 依赖）: %s", csp)
+	}
+	if !strings.Contains(csp, "worker-src") {
+		t.Fatalf("CSP 应显式声明 worker-src: %s", csp)
+	}
+	// MIME 嗅探：防止上传/返回的内容被当作脚本执行
+	if got := h.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options 应为 nosniff，得到 %q", got)
+	}
+	if h.Get("X-Frame-Options") == "" {
+		t.Fatal("应设置 X-Frame-Options 供旧浏览器兜底")
+	}
+	if h.Get("Referrer-Policy") == "" {
+		t.Fatal("应设置 Referrer-Policy")
 	}
 }

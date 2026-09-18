@@ -146,6 +146,48 @@ func limitBody(next http.Handler) http.Handler {
 	})
 }
 
+// securityHeaders 给响应加上浏览器侧的安全策略。
+//
+// 背景：后台金钥存在 localStorage，而 localStorage 以 origin 为界、不分路径
+// ——公开的 /guest 页与 /admin 共用同一份存储。任何能在本 origin 执行脚本的
+// 一方都能读走它，因此这里的目标是把「能执行脚本的来源」收紧到明确白名单，
+// 并禁止本站被嵌入 iframe（后台的按钮都是单击生效，iframe 点击劫持可用）。
+//
+// 只对页面响应生效：API 与 SSE 不经过浏览器渲染，加 CSP 没有意义；而这些
+// 标头对 JSON 响应也无副作用，故按路径前缀区分，避免误伤流式响应。
+func securityHeaders(next http.Handler) http.Handler {
+	// 前端实际加载的两个外部脚本：Cap widget（jsDelivr）与阿里云验证码 SDK
+	// （alicdn，后台「验证中心」页用）。两者的域名都要放行，否则对应页面失效。
+	//
+	// script-src 里的 blob: 是 Cap widget 的硬需求：它把工作量证明放进
+	// Blob URL 构造的 Web Worker 里跑，不放行则 worker 创建失败、人机验证
+	// 永远出不来题（实测确认，报错为「Creating a worker from 'blob:...'
+	// violates ... script-src」）。worker-src 单独列出以兼容只认该指令的浏览器。
+	const csp = "default-src 'self'; " +
+		"script-src 'self' 'unsafe-inline' blob: https://cdn.jsdelivr.net https://o.alicdn.com; " +
+		"worker-src 'self' blob:; " +
+		"style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' data: blob:; " +
+		"font-src 'self' data:; " +
+		// Cap 实例地址由管理员配置，可能是任意域名；widget 要直连它取题。
+		// 这里用 https: 与 http: 放行任意来源——收紧到具体域名需要把配置读进
+		// 中间件，而配置可随时变更，收益不及复杂度。
+		"connect-src 'self' https: http:; " +
+		"frame-ancestors 'none'; " +
+		"base-uri 'self'; " +
+		"form-action 'self'"
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", csp)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "same-origin")
+		// frame-ancestors 已覆盖现代浏览器；X-Frame-Options 供旧版兜底
+		h.Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // newServer 构造 HTTP 服务端。
 //
 // ReadHeaderTimeout 防 Slowloris（慢速发请求头占住连接）。
@@ -162,7 +204,7 @@ func limitBody(next http.Handler) http.Handler {
 func newServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           limitBody(handler),
+		Handler:           limitBody(securityHeaders(handler)),
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,

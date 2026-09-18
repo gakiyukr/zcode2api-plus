@@ -196,16 +196,29 @@ func (h *Handler) handleDeleteAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deleted := 0
+	var failed []string
 	for _, aid := range ids {
 		acc := h.Store.FindAny(aid)
 		if acc == nil {
 			continue
 		}
-		if ok, err := h.Store.RemoveAccount(acc.Provider, aid); err == nil && ok {
+		ok, err := h.Store.RemoveAccount(acc.Provider, aid)
+		switch {
+		case err != nil:
+			// 落库失败必须让调用方知道：吞掉错误会返回 200 而账号仍在库里，
+			// 前端据此提示「已删除」，管理员以为已撤销凭证。
+			failed = append(failed, aid)
+		case ok:
 			deleted++
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
+	resp := map[string]any{"deleted": deleted}
+	if len(failed) > 0 {
+		resp["failed"] = failed
+		writeJSON(w, http.StatusInternalServerError, resp)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {

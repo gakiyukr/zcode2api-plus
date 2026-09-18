@@ -520,3 +520,35 @@ func TestSelectAndMutateConcurrently(t *testing.T) {
 
 	wg.Wait()
 }
+
+// 落库失败时不得改动内存：否则账号在本进程消失、重启后又从 DB 回来。
+//
+// 删除常被用来撤销可疑或外泄的凭证，「显示已删除、实际还在」是安全相关的
+// 静默失败。原实现先改内存再落库，失败时内存已不可逆。
+func TestRemoveAccountKeepsMemoryOnPersistFailure(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "victim", "header.payload.signature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Find(model.ProviderZai, acc.ID) == nil {
+		t.Fatal("前置条件：账号应存在")
+	}
+
+	// 关掉底层连接，让 DELETE 必然失败
+	if err := s.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := s.RemoveAccount(model.ProviderZai, acc.ID)
+	if err == nil {
+		t.Fatal("落库失败应返回错误")
+	}
+	if ok {
+		t.Fatal("失败时不应报告已删除")
+	}
+	// 关键断言：内存状态必须与 DB 保持一致，账号仍在
+	if s.Find(model.ProviderZai, acc.ID) == nil {
+		t.Fatal("落库失败后账号不应从内存消失（会与 DB 分叉）")
+	}
+}

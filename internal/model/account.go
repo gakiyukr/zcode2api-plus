@@ -671,6 +671,10 @@ func unixTime(epoch float64) time.Time {
 
 // newAccountID 对应 Python 版 _account_id：<safe-name>-<8 hex>；
 // 字母数字（含 Unicode 字母，如中文）保留，其余替换为 -，截断 32 字符。
+//
+// 截断按 rune 而非 byte：Python 的 name[:32] 对 str 是 32 个字符，按 byte 切
+// 会切断多字节字符产生非法 UTF-8（如 11 个汉字 = 33 bytes），落库后 ID 变成
+// 含替换字符的版本，重启再载入时主键改变、同账号插入第二列。
 func newAccountID(name string) string {
 	if name == "" {
 		name = "account"
@@ -684,8 +688,8 @@ func newAccountID(name string) string {
 		}
 	}
 	safe := strings.Trim(b.String(), "-")
-	if len(safe) > 32 {
-		safe = strings.Trim(safe[:32], "-")
+	if runes := []rune(safe); len(runes) > 32 {
+		safe = strings.Trim(string(runes[:32]), "-")
 	}
 	if safe == "" {
 		safe = "account"

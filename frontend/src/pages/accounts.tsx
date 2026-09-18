@@ -271,8 +271,14 @@ export function AccountsPage() {
       ),
       onConfirm: async () => {
         try {
-          await api('DELETE', '/accounts', [a.id])
-          toast.success('已刪除')
+          // 后端对「ID 不存在」也回 200（deleted: 0），此时报成功会让管理员
+          // 以为凭证已撤销。按实际删除数提示。
+          const res = await api<{ deleted: number }>('DELETE', '/accounts', [a.id])
+          if (!res.deleted) {
+            toast.warning('帳號不存在或已被刪除')
+          } else {
+            toast.success('已刪除')
+          }
           invalidate()
         } catch (e) {
           toast.error('刪除失敗：' + errMsg(e))

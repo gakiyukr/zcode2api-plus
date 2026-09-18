@@ -3,8 +3,10 @@ package model
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // pythonAccountJSON 模拟 Python 版 json.dumps(asdict(account)) 的输出形态：
@@ -317,3 +319,33 @@ func TestAccumulateAndPublicView(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// 账号 ID 截断按字符而非字节。
+//
+// Python 版 _account_id 用 name[:32]（32 个字符），Go 版原按 byte 截断：11 个
+// 汉字 = 33 bytes 会被切断，产生非法 UTF-8。ID 是主键与寻址键，落库后重启
+// 再载入时主键改变、同账号插入第二列，跨版本互读也会对同一账号给出不同 ID。
+func TestAccountIDTruncatesByRune(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		desc string
+	}{
+		{"一二三四五六七八九十壹", "11 个汉字（33 bytes）"},
+		{"abcdefghijklmnopqrstuvwxyz0123456789", "纯 ASCII 超长"},
+		{"测试账号名", "短 CJK"},
+		{"emoji😀测试", "含 emoji（4 bytes）"},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			id := newAccountID(tc.name)
+			if !utf8.ValidString(id) {
+				t.Fatalf("ID 必须是合法 UTF-8: %q", id)
+			}
+			// 前缀部分（去掉 -xxxxxxxx 后缀）不超过 32 字符
+			if i := strings.LastIndex(id, "-"); i > 0 {
+				if n := utf8.RuneCountInString(id[:i]); n > 32 {
+					t.Fatalf("前缀应不超过 32 字符，实际 %d: %q", n, id)
+				}
+			}
+		})
+	}
+}
