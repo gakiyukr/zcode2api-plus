@@ -281,6 +281,10 @@ func (s *Store) GetSetting(key string) (string, bool) {
 // 统计与状态全部不落库」没有任何线索可查：后台数字与实际持久化状态脱节，
 // 重启后回滚，而日志里什么都没有。这里集中记一次，涵盖所有调用方。
 //
+// 调用方都持有 s.mu，故本函数必须自行确保「不在锁内做 I/O」——web.Warn 是同步
+// 的 stdout 写，stdout 阻塞（管道满、终端卡住）时会把整个 Store 锁住。做法是
+// 只在锁内做判断，把实际输出交给独立 goroutine。
+//
 // 节流到每分钟一条：落库持续失败时（磁盘满）每个请求都会走到这里，
 // 不节流会把日志刷爆并掩盖其他信息。
 func logPersistFailure(scope, detail string, err error) {
@@ -297,7 +301,8 @@ func logPersistFailure(scope, detail string, err error) {
 	if !allow {
 		return
 	}
-	web.Warn("store", fmt.Sprintf("落库失败（%s，%s）: %v；内存已改而 DB 未写入，重启后会回滚", scope, detail, err))
+	msg := fmt.Sprintf("落库失败（%s，%s）: %v；内存已改而 DB 未写入，重启后会回滚", scope, detail, err)
+	go web.Warn("store", msg)
 }
 
 var (
