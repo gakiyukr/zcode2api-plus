@@ -259,16 +259,20 @@ func (h *Handler) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 兑换前就消费掉会话：ExchangeCode 无论成败都已经向上游发出了一次真实
+	// 请求，保留会话等于允许在 10 分钟 TTL 内无限重放同一个 flow_id，把本机
+	// 变成对上游 token 端点的请求放大器（配额只在 start 扣一次，而「换链接」
+	// 按设计不扣）。失败后重新走一次 start 即可——那才会计入配额。
+	h.mu.Lock()
+	delete(h.flows, flowID)
+	h.mu.Unlock()
+
 	// 配额已在 start 阶段扣减（一次授权 = 一次配额），此处不再重复扣。
 	result, err := gf.flow.ExchangeCode(code, state)
 	if err != nil {
 		writeDetail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// 授权已消耗，会话不可重放
-	h.mu.Lock()
-	delete(h.flows, flowID)
-	h.mu.Unlock()
 
 	h.finishSubmission(r.Context(), w, result)
 }

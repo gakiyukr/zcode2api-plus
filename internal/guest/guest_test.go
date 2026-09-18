@@ -6,6 +6,7 @@
 package guest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -483,5 +484,63 @@ func TestStartRegenerationIgnoresExhaustedQuota(t *testing.T) {
 	h.handleStart(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("额度用尽后换链接应仍放行，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 兑换失败也必须消耗掉登录会话。
+//
+// ExchangeCode 无论成败都向上游发了一次真实请求。若失败时保留会话，持有邀请码
+// 者可在 TTL 内反复提交同一个 flow_id，每次触发一次上游往返——而配额只在 start
+// 扣一次（「换链接」按设计不扣），于是本机成了对上游 token 端点的请求放大器。
+func TestCompleteConsumesFlowEvenOnExchangeFailure(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetInviteCode("CODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	const host = "203.0.113.99:1234"
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	req.Header.Set("x-invite-code", "CODE")
+	req.RemoteAddr = host
+	h.handleStart(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("start 应成功: %d %s", rec.Code, rec.Body.String())
+	}
+	var started map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &started)
+	flowID := started["flow_id"]
+
+	// 用一个格式合法但无法兑换的 code/state 触发失败路径。
+	// state 必须与会话匹配，否则会在更早的校验处被拒、测不到兑换本身。
+	h.mu.Lock()
+	gf := h.flows[flowID]
+	h.mu.Unlock()
+	if gf == nil {
+		t.Fatal("前置条件：会话应存在")
+	}
+	// 必须构造格式合法的回調地址（含 redirect 參數），否則會在
+	// ParseCallbackURL 就被拒、走不到 ExchangeCode 那一步——而只有
+	// ExchangeCode 才真正打上游，也只有它需要消耗會話。
+	callback := "https://zcode.z.ai/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback" +
+		"&code=bogus-code&state=" + gf.flow.State
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/guest/api/complete", nil)
+	req.Header.Set("x-invite-code", "CODE")
+	req.RemoteAddr = host
+	body, _ := json.Marshal(map[string]string{"flow_id": flowID, "callback_url": callback})
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	h.handleComplete(rec, req)
+
+	t.Logf("complete 响应: %d %s", rec.Code, rec.Body.String())
+
+	// 无论兑换成败，会话都不该还在——这是防重放的唯一手段
+	h.mu.Lock()
+	_, stillThere := h.flows[flowID]
+	h.mu.Unlock()
+	if stillThere {
+		t.Fatalf("兑换失败后会话必须被消耗，否则可无限重放（响应: %d %s）",
+			rec.Code, rec.Body.String())
 	}
 }
