@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -50,6 +51,14 @@ type Store struct {
 	accounts map[string][]*model.Account
 	settings map[string]string
 	rotation map[string]int
+
+	// settingsSnapshot 是 settings 的不可变快照，供无锁读取。
+	//
+	// 读取 settings 的路径包含每次 API 请求的鉴权（VerifyGatewayKey →
+	// GetSetting），若与 Update 共用 s.mu，一次慢写（磁盘满、外部进程持写锁
+	// 时最多 busy_timeout 5s）会让所有请求的鉴权一起排队——DB 慢即服务不可用。
+	// 快照让读取完全不碰锁；写入仍是「改 map 后发布新快照」。
+	settingsSnapshot atomic.Pointer[map[string]string]
 
 	// GeneratedAdminKey / GeneratedGatewayKey：本次启动随机生成/轮换的密钥，
 	// 供启动横幅提示管理者（环境变量配置时不记录）。
@@ -209,6 +218,7 @@ func (s *Store) load() error {
 		settings["quota_refresh_interval"] = strconv.Itoa(config.QuotaRefreshInterval)
 	}
 	s.settings = settings
+	s.publishSettings()
 
 	accounts := map[string][]*model.Account{model.ProviderZai: {}}
 	rows, err = s.db.Query(fmt.Sprintf(
@@ -266,11 +276,28 @@ func (s *Store) setMeta(key, value string) error {
 // ── 设置 ────────────────────────────────────────────────────────────────────
 
 // GetSetting 读取设置（第二返回值表示是否存在）。
+//
+// 走原子快照而非 s.mu：鉴权路径（VerifyGatewayKey/VerifyAdminKey）每次都调用
+// 本函数，若与写路径共用锁，一次慢写就会让所有请求的鉴权排队。
 func (s *Store) GetSetting(key string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v, ok := s.settings[key]
+	snap := s.settingsSnapshot.Load()
+	if snap == nil {
+		return "", false
+	}
+	v, ok := (*snap)[key]
 	return v, ok
+}
+
+// publishSettings 发布 settings 的不可变快照（调用方须持有 s.mu）。
+//
+// 复制一份而非共享原 map：快照必须不可变，否则读到一半被并发写会触发
+// Go 的并发 map 读写检测。
+func (s *Store) publishSettings() {
+	cp := make(map[string]string, len(s.settings))
+	for k, v := range s.settings {
+		cp[k] = v
+	}
+	s.settingsSnapshot.Store(&cp)
 }
 
 // SetSetting 更新设置并落库。
@@ -322,6 +349,7 @@ func (s *Store) SetSetting(key, value string) error {
 		return err
 	}
 	s.settings[key] = value
+	s.publishSettings()
 	return nil
 }
 
@@ -389,6 +417,7 @@ func (s *Store) saveProxyProfilesLocked(profiles []ProxyProfile) error {
 		return err
 	}
 	s.settings["proxy_profiles"] = string(data)
+	s.publishSettings()
 	return s.setMeta("proxy_profiles", string(data))
 }
 

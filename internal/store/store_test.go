@@ -601,3 +601,38 @@ func TestSetSettingKeepsMemoryOnPersistFailure(t *testing.T) {
 		t.Fatalf("落库失败后内存不应改动，得到 %q", v)
 	}
 }
+
+// 读取设置不得依赖 s.mu。
+//
+// 鉴权路径（VerifyGatewayKey/VerifyAdminKey）每次请求都调 GetSetting。若它与
+// Update 共用 s.mu，一次慢写（磁盘满、外部进程持写锁，最多 busy_timeout 5s）
+// 会让所有请求的鉴权一起排队——DB 慢即全服务不可用。
+//
+// 验证方式：手动持锁，读取仍须立即返回。
+func TestGetSettingDoesNotBlockOnStoreLock(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SetSetting("probe", "value"); err != nil {
+		t.Fatal(err)
+	}
+
+	s.mu.Lock() // 模拟一次慢写正在持锁
+	done := make(chan struct{})
+	var got string
+	var ok bool
+	go func() {
+		defer close(done)
+		got, ok = s.GetSetting("probe")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		s.mu.Unlock()
+		t.Fatal("GetSetting 在 Store 锁被持有时阻塞了——鉴权路径会被慢写拖垮")
+	}
+	s.mu.Unlock()
+
+	if !ok || got != "value" {
+		t.Fatalf("读取结果不符: %q %v", got, ok)
+	}
+}
