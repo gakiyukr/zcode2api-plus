@@ -205,6 +205,12 @@ const sdkReadyJS = `() => (typeof window.initAliyunCaptcha === 'function')`
 // sdkLoadTimeout SDK 加载超时（对齐 Python worker 的 --sdk-load-timeout 默认 20s）。
 const sdkLoadTimeout = 20 * time.Second
 
+// probeTimeout 死亡探测（CDP Browser.getVersion）的超时上限。
+//
+// 这个探针只是区分「浏览器进程没了」与「页面级失败」，本身应当毫秒级返回。
+// 给 3 秒：假死的浏览器在这里被判为死亡，槽位得以重建，而不是永久卡住。
+const probeTimeout = 3 * time.Second
+
 // RodWorker 单个 rod 浏览器会话的求解 worker。
 // 页面内只保存求解结果，token 不落盘、不进日志。
 type RodWorker struct {
@@ -365,8 +371,17 @@ func (w *RodWorker) classify(ctx context.Context, err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	// 轻量 CDP 探测：浏览器进程已退出时必然失败
-	if _, perr := (proto.BrowserGetVersion{}).Call(w.browser); perr != nil {
+	// 轻量 CDP 探测：浏览器进程已退出时必然失败。
+	//
+	// 必须自带 deadline：w.browser 绑的是 browserCtx（WithCancel，无超时），
+	// 浏览器假死（CDP socket 连著但不回应）时 Call 会永久阻塞，而这里卡住等于
+	// 槽位永不归队——调用方即使超时也走不到「槽位 condemned → 重建」那一步。
+	// workers 默认 1 时，一次假死就让整个验证码池永久失效且 IsStarted 仍为 true。
+	//
+	// Context 返回克隆，故 probe 不影响 w.browser 自身的 ctx。
+	probeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	if _, perr := (proto.BrowserGetVersion{}).Call(w.browser.Context(probeCtx)); perr != nil {
 		return fmt.Errorf("%w: %v", ErrWorkerDead, err)
 	}
 	return err
