@@ -227,8 +227,15 @@ func (s *Service) clientFor(acc *model.Account) HTTPClient {
 		}
 		web.Warn("quota", fmt.Sprintf("账号 %s 代理无效，回退直连: %v", acc.Name, err))
 	}
-	return &http.Client{Timeout: 20 * time.Second}
+	return defaultClient
 }
+
+// defaultClient 直连用的共享客户端。
+//
+// 每次查询新建 http.Client 等于每次新建连接池：TCP 与 TLS 握手都要重来，
+// 高并发时还会累积 TIME_WAIT。共享一个实例让连接得以复用（与 claim 包的
+// eventClient 同一模式）。
+var defaultClient = &http.Client{Timeout: 20 * time.Second}
 
 // handleBillingResponse 处理计费端点响应：错误分类、快照解析与状态回写。
 func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response) map[string]any {

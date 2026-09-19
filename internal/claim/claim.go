@@ -73,8 +73,12 @@ func (s *Service) clientFor(acc *model.Account) HTTPClient {
 		}
 		web.Warn("claim", fmt.Sprintf("账号 %s 代理无效，回退直连", acc.Name))
 	}
-	return &http.Client{Timeout: 25 * time.Second}
+	return defaultClient
 }
+
+// defaultClient 直连用的共享客户端（同 quota 包的理由：复用连接池，
+// 避免每次领取都重做 TCP/TLS 握手并累积 TIME_WAIT）。
+var defaultClient = &http.Client{Timeout: 25 * time.Second}
 
 // failMessage 业务码 → 使用者文案（带上游 msg 补充）。
 func failMessage(code int, body map[string]any) string {
