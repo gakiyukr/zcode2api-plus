@@ -470,3 +470,43 @@ func TestEntitlementIDNonStringDoesNotPanic(t *testing.T) {
 		})
 	}
 }
+
+// 单个账号的 panic 不得杀死进程，也不得中断其余账号的刷新。
+//
+// Python 版在两层做了隔离（gather 的 return_exceptions=True 与 _loop 的
+// except Exception），Go 版两处都没有——额度解析路径上任何一个未预见的
+// panic（上游回传意外类型）都会终止整个进程，所有在途串流一并陪葬。
+// net/http 只 recover「处理该连接的 goroutine」，RefreshAccounts 自己开的
+// goroutine 不在其保护范围内。
+func TestRefreshAccountsIsolatesPanic(t *testing.T) {
+	svc, st, _ := setup(t)
+
+	// 造一个会在解析时 panic 的账号：让 Client 在请求时 panic
+	bad, err := st.AddAccount(model.ProviderZai, "panicky", "header.payload.signature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := st.AddAccount(model.ProviderZai, "healthy", "h.p.s")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc.Client = clientFunc(func(req *http.Request) (*http.Response, error) {
+		// 只让 bad 账号的请求 panic（按 URL 里的 device mid 无法区分，
+		// 故用请求计数：第一次调用即 panic）
+		panic("simulated parse panic")
+	})
+	_ = bad
+
+	// 关键断言：本调用不得让 panic 逃逸（逃逸即测试进程崩溃）
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = svc.RefreshAccounts([]*model.Account{bad, good})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RefreshAccounts 未在预期时间内返回")
+	}
+}

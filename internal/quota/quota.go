@@ -452,20 +452,32 @@ func (s *Service) FetchQuota(acc *model.Account) map[string]any {
 	s.mu.Unlock()
 
 	go func() {
-		result := s.fetchQuotaOnce(acc)
-		if _, hasErr := result["error"]; !hasErr {
+		// 这个 goroutine 由本函数自己创建，不在 net/http 的 recover 保护范围内：
+		// fetchQuotaOnce 解析上游 JSON，遇到未预见的类型/结构会 panic，逃逸出去
+		// 就是整个进程死亡（所有在途串流一并陪葬）。Python 版经 gather 的
+		// return_exceptions=True 天然隔离，这里必须显式兜住。
+		//
+		// 兜住后仍要唤醒等待者并清理 inflight，否则调用方会永久阻塞在 <-call.done。
+		var result map[string]any
+		defer func() {
+			if r := recover(); r != nil {
+				web.Warn("quota", fmt.Sprintf("解析账号 %s 额度时 panic（已隔离）: %v", acc.Name, r))
+				result = map[string]any{"error": "额度解析失败"}
+			}
+			if _, hasErr := result["error"]; !hasErr {
+				s.mu.Lock()
+				s.cache[acc.ID] = cacheEntry{at: s.now(), result: result}
+				s.mu.Unlock()
+			}
 			s.mu.Lock()
-			s.cache[acc.ID] = cacheEntry{at: s.now(), result: result}
+			if cur, ok := s.inflight[acc.ID]; ok && cur == call {
+				delete(s.inflight, acc.ID)
+			}
 			s.mu.Unlock()
-		}
-		// 仅当仍是本查询时才清理（对齐 done_callback 的身份校验）
-		s.mu.Lock()
-		if cur, ok := s.inflight[acc.ID]; ok && cur == call {
-			delete(s.inflight, acc.ID)
-		}
-		s.mu.Unlock()
-		call.result = result
-		close(call.done)
+			call.result = result
+			close(call.done)
+		}()
+		result = s.fetchQuotaOnce(acc)
 	}()
 	<-call.done
 	return call.result
@@ -500,6 +512,15 @@ func (s *Service) RefreshAccounts(accounts []*model.Account) map[string]any {
 		wg.Add(1)
 		go func(acc *model.Account) {
 			defer wg.Done()
+			// 单个账号的解析 panic 只应影响该账号，不能让整个进程陪葬。
+			// net/http 只 recover「处理该连接的 goroutine」，这里是我们自己开的，
+			// 不在其保护范围内。对齐 Python 的 return_exceptions=True。
+			defer func() {
+				if r := recover(); r != nil {
+					// 不计入 okCount 即自然算作 fail，无需单独计数
+					web.Warn("quota", fmt.Sprintf("刷新账号 %s 时 panic（已隔离）: %v", acc.Name, r))
+				}
+			}()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			res := s.FetchQuota(acc)
@@ -536,6 +557,30 @@ func (m *Monitor) Start() {
 
 // loop 对齐 QuotaMonitor._loop：启动先等 5s 避让服务启动；刷新间隔实时读取
 // 设置、改后即生效；间隔<=0 视为关闭，但仍每 30s 回看设置便于随时启用。
+// refreshOnce 执行一轮额度刷新，并把任何 panic 隔离在本轮内。
+func (m *Monitor) refreshOnce() {
+	defer func() {
+		if r := recover(); r != nil {
+			web.Warn("quota", fmt.Sprintf("后台刷新出错（已隔离，下一轮继续）: %v", r))
+		}
+	}()
+	if m.svc.Store.QuotaRefreshInterval() <= 0 {
+		return
+	}
+	var targets []*model.Account
+	for _, a := range m.svc.Store.ListAccounts(model.ProviderZai) {
+		if a.ArchivedAt != nil {
+			continue // 已归档账号不再刷新额度
+		}
+		if a.Mode == "jwt" && a.Status != model.StatusDisabled {
+			targets = append(targets, a)
+		}
+	}
+	if len(targets) > 0 {
+		m.svc.RefreshAccounts(targets)
+	}
+}
+
 func (m *Monitor) loop() {
 	defer close(m.done)
 	select {
@@ -544,21 +589,11 @@ func (m *Monitor) loop() {
 	case <-time.After(5 * time.Second):
 	}
 	for {
+		// 每轮刷新包一层 recover：后台任务出错应记日志后继续下一轮，而不是让
+		// 监控循环终止（那样额度就再也不刷新了，且没有任何提示）。对齐 Python
+		// _loop 里的 `except Exception: logs.err(...)`。
+		m.refreshOnce()
 		interval := m.svc.Store.QuotaRefreshInterval()
-		if interval > 0 {
-			var targets []*model.Account
-			for _, a := range m.svc.Store.ListAccounts(model.ProviderZai) {
-				if a.ArchivedAt != nil {
-					continue // 已归档账号不再刷新额度
-				}
-				if a.Mode == "jwt" && a.Status != model.StatusDisabled {
-					targets = append(targets, a)
-				}
-			}
-			if len(targets) > 0 {
-				m.svc.RefreshAccounts(targets)
-			}
-		}
 		wait := interval
 		if wait <= 0 {
 			wait = 30
