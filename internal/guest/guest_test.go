@@ -15,7 +15,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
@@ -492,6 +494,7 @@ func TestStartRegenerationIgnoresExhaustedQuota(t *testing.T) {
 // ExchangeCode 无论成败都向上游发了一次真实请求。若失败时保留会话，持有邀请码
 // 者可在 TTL 内反复提交同一个 flow_id，每次触发一次上游往返——而配额只在 start
 // 扣一次（「换链接」按设计不扣），于是本机成了对上游 token 端点的请求放大器。
+// 会话在锁内「取出即移除」，并发的两个 complete 也只有一个能拿到。
 func TestCompleteConsumesFlowEvenOnExchangeFailure(t *testing.T) {
 	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
 	if err := h.Auth.SetInviteCode("CODE"); err != nil {
@@ -542,5 +545,107 @@ func TestCompleteConsumesFlowEvenOnExchangeFailure(t *testing.T) {
 	if stillThere {
 		t.Fatalf("兑换失败后会话必须被消耗，否则可无限重放（响应: %d %s）",
 			rec.Code, rec.Body.String())
+	}
+}
+
+// 并发的 complete 只能有一个拿到会话。
+//
+// 会话若「先取出、检查、后删除」，两个并发请求都能通过检查并各自向上游兑换
+// 一次——一次授权换来两次（或更多次）上游往返。改成锁内「取出即移除」后，
+// 只有一个请求拿得到会话，其余得到 404。
+func TestConcurrentCompleteOnlyOneWins(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetInviteCode("CODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	const host = "203.0.113.77:1234"
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+	req.Header.Set("x-invite-code", "CODE")
+	req.RemoteAddr = host
+	h.handleStart(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("start 应成功: %d", rec.Code)
+	}
+	var started map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &started)
+	flowID := started["flow_id"]
+
+	h.mu.Lock()
+	gf := h.flows[flowID]
+	h.mu.Unlock()
+	if gf == nil {
+		t.Fatal("前置条件：会话应存在")
+	}
+	callback := "https://zcode.z.ai/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback" +
+		"&code=bogus&state=" + gf.flow.State
+
+	// 并发发起多个 complete。关键是检测「有多少个请求真正走到了上游」——
+	// 只看状态码不够：有竞态时两个请求都能通过检查并各自兑换，只是上游对
+	// 重复 code 可能都返回错误，状态码看起来一样。
+	//
+	// 用一个计数上游调用的假 HTTP 客户端来判定。
+	var upstreamCalls int32
+	// oauth.ExchangeCode 走 http.DefaultClient，用本地假服务器承接
+	oauthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		time.Sleep(50 * time.Millisecond) // 拉长窗口，让并发充分交错
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":2007,"msg":"http error"}`))
+	}))
+	defer oauthSrv.Close()
+	restore := oauth.SetTokenURLForTest(oauthSrv.URL)
+	defer restore()
+
+	// 让所有 goroutine 先跑到屏障再同时出发，并用 runtime.Gosched 逼出真正的
+	// 并行；否则它们会被逐个调度，测不出竞态。
+	const n = 8
+	codes := make([]int, n)
+	var wg sync.WaitGroup
+	ready := make(chan struct{}, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/guest/api/complete", nil)
+			req.Header.Set("x-invite-code", "CODE")
+			req.RemoteAddr = host
+			body, _ := json.Marshal(map[string]string{"flow_id": flowID, "callback_url": callback})
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			ready <- struct{}{} // 报到
+			<-start             // 等发令
+			h.handleComplete(rec, req)
+			codes[idx] = rec.Code
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		<-ready
+	}
+	close(start)
+	wg.Wait()
+
+	// 核心断言：无论并发多少，上游只能被调用一次
+	if got := atomic.LoadInt32(&upstreamCalls); got != 1 {
+		t.Fatalf("上游应只被调用 1 次，实际 %d 次（状态码 %v）", got, codes)
+	}
+
+	// 只有第一个能进入兑换（其状态码由上游决定，非 404）；其余必须是 404
+	notFound := 0
+	others := 0
+	for _, c := range codes {
+		if c == http.StatusNotFound {
+			notFound++
+		} else {
+			others++
+		}
+	}
+	if others != 1 {
+		t.Fatalf("应恰好一个请求拿到会话，实际 %d 个（状态码 %v）", others, codes)
+	}
+	if notFound != n-1 {
+		t.Fatalf("其余应全部 404，实际 %d/%d（状态码 %v）", notFound, n-1, codes)
 	}
 }

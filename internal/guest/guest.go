@@ -231,8 +231,16 @@ func (h *Handler) handleComplete(w http.ResponseWriter, r *http.Request) {
 	callbackURL := strings.TrimSpace(strOf(payload["callback_url"]))
 
 	h.cleanupFlows()
+	// 取出即移除：并发的两个 complete 请求若都拿到同一个会话，会各自向上游
+	// 兑换一次（会话在下方才被删，检查已经通过）。改成在锁内一次完成「取出 +
+	// 移除」，只有一个请求能拿到会话，另一个得到 404。
+	//
+	// 代价是「格式错误/state 不匹配」的重试也要重新 start（会再扣一次配额）。
+	// 这是有意的取舍：那些错误在本地就能判定，而放行并发兑换意味着一次授权
+	// 可以换来任意次上游往返。
 	h.mu.Lock()
 	gf := h.flows[flowID]
+	delete(h.flows, flowID)
 	h.mu.Unlock()
 	if gf == nil {
 		writeDetail(w, http.StatusNotFound, "登录会话不存在或已过期")
@@ -258,14 +266,6 @@ func (h *Handler) handleComplete(w http.ResponseWriter, r *http.Request) {
 		writeDetail(w, http.StatusBadRequest, "回调地址与当前登录会话不匹配")
 		return
 	}
-
-	// 兑换前就消费掉会话：ExchangeCode 无论成败都已经向上游发出了一次真实
-	// 请求，保留会话等于允许在 10 分钟 TTL 内无限重放同一个 flow_id，把本机
-	// 变成对上游 token 端点的请求放大器（配额只在 start 扣一次，而「换链接」
-	// 按设计不扣）。失败后重新走一次 start 即可——那才会计入配额。
-	h.mu.Lock()
-	delete(h.flows, flowID)
-	h.mu.Unlock()
 
 	// 配额已在 start 阶段扣减（一次授权 = 一次配额），此处不再重复扣。
 	result, err := gf.flow.ExchangeCode(code, state)

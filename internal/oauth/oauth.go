@@ -19,10 +19,31 @@ import (
 
 const (
 	authorizeURL          = "https://chat.z.ai/api/oauth/authorize"
-	tokenURL              = "https://zcode.z.ai/api/v1/oauth/token"
+	defaultTokenURL       = "https://zcode.z.ai/api/v1/oauth/token"
 	clientID              = "client_P8X5CMWmlaRO9gyO-KSqtg"
 	registeredRedirectURI = "https://zcode.z.ai/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback"
 )
+
+// tokenURLOverride 仅供测试替换兑换端点。
+//
+// 生产路径永远是 defaultTokenURL；测试需要一个可观测的上游（断言兑换被调用
+// 几次、返回什么），而真实端点不可注入。用包级变量而非参数：调用方遍布
+// gateway/adminapi/guest，改签名会牵动一大片。
+var tokenURLOverride string
+
+func tokenURL() string {
+	if tokenURLOverride != "" {
+		return tokenURLOverride
+	}
+	return defaultTokenURL
+}
+
+// SetTokenURLForTest 替换兑换端点并返回还原函数；仅供测试使用。
+func SetTokenURLForTest(url string) func() {
+	prev := tokenURLOverride
+	tokenURLOverride = url
+	return func() { tokenURLOverride = prev }
+}
 
 // extractTimeout HTTP 请求超时（对齐 Python httpx timeout=30）。
 const exchangeTimeout = 30 * time.Second
@@ -159,7 +180,7 @@ func (f *Flow) ExchangeCode(code, state string) (*ExchangeResult, error) {
 		"redirect_uri": f.RedirectURI,
 		"state":        state,
 	}
-	body, err := postJSON(tokenURL, payload)
+	body, err := postJSON(tokenURL(), payload)
 	if err != nil {
 		return nil, err
 	}
