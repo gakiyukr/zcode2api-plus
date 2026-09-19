@@ -50,6 +50,12 @@ type ticket struct {
 	cancel    context.CancelFunc // 中止后台任务（释放票务时调用）
 }
 
+// maxErrorBodyBytes 异常响应的读取上限。
+//
+// 正常路径是流式转发（边读边发），只有错误分支与「200 但为 JSON」的异常
+// 分支要整段读进内存做分类，而上游或代理异常时可能回一个任意大的 body。
+const maxErrorBodyBytes = 64 << 10
+
 // Pool Async 空闲池：票务存储 + 入口路由 + 后台处理。
 type Pool struct {
 	Store   *store.Store
@@ -428,7 +434,9 @@ func (p *Pool) attemptUpstream(
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		text, readErr := io.ReadAll(resp.Body)
+		// 限长：错误体要整段读进内存做分类，上游或代理异常时可能回一个
+		// 任意大的 body。正常路径是流式转发，不受此限。
+		text, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		if readErr != nil {
 			return false, readErr
 		}
@@ -499,7 +507,8 @@ func (p *Pool) attemptUpstream(
 	// 分类与 engine.handleUpstreamJSON 对齐——同一响应在两条路径下必须
 	// 标出相同的账号状态，否则 async 请求会把额度耗尽的账号一直留在池里。
 	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
-		buffered, readErr := io.ReadAll(resp.Body)
+		// 同样限长：这是「200 但为 JSON」的异常分支，不是正常流式响应。
+		buffered, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		if readErr != nil {
 			return false, readErr
 		}
