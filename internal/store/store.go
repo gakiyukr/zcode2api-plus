@@ -35,8 +35,9 @@ const (
 	accountsTable = "accounts"
 )
 
-// Providers 支持的提供商（与 Python 版 PROVIDERS 一致）。
-var Providers = []string{model.ProviderZai}
+// Providers 支持的提供商。zai 与 Python 版 PROVIDERS 一致；bigmodel 为
+// Go 版新增（智谱 BigModel 登录，仅 JWT 模式）。
+var Providers = []string{model.ProviderZai, model.ProviderBigModel}
 
 // ErrNotFound 代理配置等条目不存在。
 var ErrNotFound = errors.New("条目不存在")
@@ -73,8 +74,11 @@ func New() (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		db:       db,
-		accounts: map[string][]*model.Account{model.ProviderZai: {}},
+		db: db,
+		accounts: map[string][]*model.Account{
+			model.ProviderZai:      {},
+			model.ProviderBigModel: {},
+		},
 		settings: map[string]string{},
 		rotation: map[string]int{},
 	}
@@ -220,7 +224,10 @@ func (s *Store) load() error {
 	s.settings = settings
 	s.publishSettings()
 
-	accounts := map[string][]*model.Account{model.ProviderZai: {}}
+	accounts := map[string][]*model.Account{
+		model.ProviderZai:      {},
+		model.ProviderBigModel: {},
+	}
 	rows, err = s.db.Query(fmt.Sprintf(
 		"SELECT data FROM %s ORDER BY created_at ASC", accountsTable))
 	if err != nil {
@@ -637,6 +644,9 @@ func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error
 		return nil, fmt.Errorf("不支持的 provider: %s", provider)
 	}
 	acc := model.Create(provider, name, secret)
+	if acc.Mode == "apiKey" && !model.SupportsAPIKeyMode(provider) {
+		return nil, fmt.Errorf("provider %s 仅支持 Coding Plan JWT（两个点的令牌），不支持 API Key", provider)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, a := range s.accounts[provider] {
@@ -827,6 +837,17 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 	acc := pool[idx]
 	s.rotation[key] = (idx + 1) % len(pool)
 	return acc.Clone()
+}
+
+// SelectAny 跨全部 provider 选号：按 Providers 顺序逐池轮询，返回首个可用
+// 账号（各池内部仍按 Select 的优惠优先 + 轮询语义）。
+func (s *Store) SelectAny(skipIDs map[string]bool, modelName string) *model.Account {
+	for _, provider := range Providers {
+		if acc := s.Select(provider, skipIDs, modelName); acc != nil {
+			return acc
+		}
+	}
+	return nil
 }
 
 func orStar(modelName string) string {

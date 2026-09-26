@@ -36,6 +36,11 @@ func ZcodeSystemBlocks() []any {
 	return zcodeBlocks
 }
 
+// isKnownProvider 是否为已注册的账号 provider。
+func isKnownProvider(provider string) bool {
+	return provider == model.ProviderZai || provider == model.ProviderBigModel
+}
+
 // dropHeaders 透传客户端 header 时需要剔除的字段（对齐 agent.py _DROP_HEADERS）。
 var dropHeaders = map[string]bool{
 	"host":                           true,
@@ -59,21 +64,23 @@ type Request struct {
 
 // BuildRequest 对应 Python 版 build_request：
 // JWT 账号走 zcode.z.ai 主端点（Bearer），API Key 账号走 api.z.ai 回退端点（x-api-key）。
+// zai 与 bigmodel 的 JWT 同源（均为 zcode.z.ai 签发的 Coding Plan Token），
+// 上游管道共用；apiKey 回退通道仅 zai 实现兑换链路。
 // verifyParam/verifyRegion 为验证码令牌（仅 JWT 账号）；incomingHeaders 为客户端透传头。
 func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incomingHeaders map[string]string) (Request, error) {
 	var targetURL, authHeader, authValue string
-	if acc.Provider == model.ProviderZai {
-		if acc.Mode == "jwt" && acc.JWTToken != nil {
-			targetURL = config.UpstreamZai
-			authHeader, authValue = "Authorization", "Bearer "+*acc.JWTToken
-		} else if acc.APIKey != nil {
-			targetURL = config.UpstreamZaiFallback
-			authHeader, authValue = "x-api-key", *acc.APIKey
-		} else {
-			return Request{}, errors.New("账号缺少有效凭证")
+	switch {
+	case acc.Mode == "jwt" && acc.JWTToken != nil:
+		targetURL = config.UpstreamZai
+		authHeader, authValue = "Authorization", "Bearer "+*acc.JWTToken
+	case acc.APIKey != nil && model.SupportsAPIKeyMode(acc.Provider):
+		targetURL = config.UpstreamZaiFallback
+		authHeader, authValue = "x-api-key", *acc.APIKey
+	default:
+		if !isKnownProvider(acc.Provider) {
+			return Request{}, fmt.Errorf("未知提供商: %s", acc.Provider)
 		}
-	} else {
-		return Request{}, fmt.Errorf("未知提供商: %s", acc.Provider)
+		return Request{}, errors.New("账号缺少有效凭证")
 	}
 
 	// 固定头一律用 Go 的规范化形式（textproto canonical），与客户端头的 key

@@ -1,10 +1,10 @@
 # zcode2api
 
-Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主線**）。
+Z.AI ZCode Coding Plan / 智譜 BigModel → OpenAI/Anthropic 兼容網關（**Go 版，現為主線**）。
 
-把 Z.AI Coding Plan 賬號池包裝成標準 API：多賬號輪詢（優惠額度優先）、驗證碼全自動求解、
-額度與套餐到期監控、OAuth 登錄、賬號級出站代理、活動套餐自動領取、賬號歸檔，
-單二進制交付（前端已內嵌，無外部運行時）。
+把 Coding Plan 賬號池包裝成標準 API：雙 provider（`zai` / `bigmodel`）、多賬號輪詢（優惠額度優先）、
+驗證碼全自動求解、額度與套餐到期監控、OAuth 登錄、賬號級出站代理、活動套餐自動領取、賬號歸檔，
+單二進制交付（前端已內嵌，後台支持簡體/繁體/English 三語）。
 
 > 📦 歷史沿革：本項目原為 Python 實現，現已由 Go 重寫版取代成為主線。
 > Python 舊版保留在 [`python-legacy`](../../tree/python-legacy) 分支（僅歸檔維護，不再更新）。
@@ -44,15 +44,21 @@ ZCODE_CAPTCHA_BROWSER=true ./zcode2api serve
 
 ```
 zcode2api serve [--port 3000]        啟動網關 + 後台 UI
-zcode2api login zai [--no-browser]   OAuth 登錄 Z.AI 並入池（自動領取活動套餐）
-zcode2api add-account zai <name> <jwt|key>
-zcode2api accounts [zai]             查看賬號列表
+zcode2api login <zai|bigmodel> [--no-browser]
+                                     OAuth 登錄並入池（自動領取活動套餐）；
+                                     zai=Z.AI（國際站），bigmodel=智譜（國內站，僅 JWT）
+zcode2api add-account <provider> <name> <jwt|key>
+zcode2api accounts [provider]        查看賬號列表
 zcode2api remove-account <provider> <id|name>
 zcode2api quota                      查看各賬號實時額度
 zcode2api status                     配置概覽
 zcode2api set-admin-key <key>        設置後台密碼
 zcode2api export [file] / import <file>   賬號導出/導入（與 python-legacy 互通）
 ```
+
+> **雙 provider 說明**：`zai` 與 `bigmodel` 的 JWT 同源（均為 zcode.z.ai 簽發的
+> Coding Plan Token），上游管道、額度刷新與套餐領取共用；差異在 OAuth 授權入口
+> （chat.z.ai vs bigmodel.cn 登錄頁）。`bigmodel` 暫不支持 apiKey 模式與訪客提交頁。
 
 ## 部署（Linux）
 

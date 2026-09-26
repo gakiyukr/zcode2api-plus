@@ -1,7 +1,11 @@
 // oauth 包单测：回调解析、邮箱提取、state 校验（网络链路不在单测范围）。
 package oauth
 
-import "testing"
+import (
+	"testing"
+
+	"zcode2api/internal/model"
+)
 
 func TestParseCallbackURL(t *testing.T) {
 	validZcode := "zcode://oauth/callback?code=abc123&state=st1"
@@ -58,7 +62,7 @@ func indexOf(s, sub string) int {
 }
 
 func TestMatchesState(t *testing.T) {
-	f := NewFlow()
+	f := NewFlow(model.ProviderZai)
 	f.State = "abc"
 	if !f.MatchesState("abc") {
 		t.Fatal("相同 state 应匹配")

@@ -10,6 +10,7 @@ import (
 
 	"zcode2api/internal/claim"
 	"zcode2api/internal/model"
+	"zcode2api/internal/store"
 	"zcode2api/internal/web"
 )
 
@@ -23,16 +24,18 @@ func (h *Handler) jwtAccounts(ids []string) []*model.Account {
 		wanted[id] = true
 	}
 	var out []*model.Account
-	for _, acc := range h.Store.ListAccounts(model.ProviderZai) {
-		if len(wanted) > 0 && !wanted[acc.ID] {
-			continue
-		}
-		// 已归档账号不参与批量领取（显式指定单个账号时仍允许，便于排查）
-		if acc.ArchivedAt != nil && len(wanted) == 0 {
-			continue
-		}
-		if acc.Mode == "jwt" && acc.JWTToken != nil && *acc.JWTToken != "" {
-			out = append(out, acc)
+	for _, provider := range store.Providers {
+		for _, acc := range h.Store.ListAccounts(provider) {
+			if len(wanted) > 0 && !wanted[acc.ID] {
+				continue
+			}
+			// 已归档账号不参与批量领取（显式指定单个账号时仍允许，便于排查）
+			if acc.ArchivedAt != nil && len(wanted) == 0 {
+				continue
+			}
+			if acc.Mode == "jwt" && acc.JWTToken != nil && *acc.JWTToken != "" {
+				out = append(out, acc)
+			}
 		}
 	}
 	return out

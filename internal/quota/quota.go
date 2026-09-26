@@ -568,12 +568,14 @@ func (m *Monitor) refreshOnce() {
 		return
 	}
 	var targets []*model.Account
-	for _, a := range m.svc.Store.ListAccounts(model.ProviderZai) {
-		if a.ArchivedAt != nil {
-			continue // 已归档账号不再刷新额度
-		}
-		if a.Mode == "jwt" && a.Status != model.StatusDisabled {
-			targets = append(targets, a)
+	for _, provider := range store.Providers {
+		for _, a := range m.svc.Store.ListAccounts(provider) {
+			if a.ArchivedAt != nil {
+				continue // 已归档账号不再刷新额度
+			}
+			if a.Mode == "jwt" && a.Status != model.StatusDisabled {
+				targets = append(targets, a)
+			}
 		}
 	}
 	if len(targets) > 0 {

@@ -13,7 +13,22 @@ import (
 	"zcode2api/internal/util"
 )
 
-const ProviderZai = "zai"
+const (
+	ProviderZai      = "zai"
+	ProviderBigModel = "bigmodel"
+)
+
+// IsJWTProvider 支持 JWT 模式（Coding Plan Token）的 provider。
+// 两家的 JWT 都由 zcode.z.ai 签发，凭「两个点」判 JWT 的规则一致。
+func IsJWTProvider(provider string) bool {
+	return provider == ProviderZai || provider == ProviderBigModel
+}
+
+// SupportsAPIKeyMode 支持 apiKey 模式回退通道的 provider。
+// apiKey 兑换链路（api.z.ai 机构/项目/API Key）仅 zai 实现。
+func SupportsAPIKeyMode(provider string) bool {
+	return provider == ProviderZai
+}
 
 // 账号运行状态（取值与 Python 版 Status 常量一致）。
 const (
@@ -82,7 +97,7 @@ type Account struct {
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。
 func Create(provider, name, secret string) *Account {
 	secret = strings.TrimSpace(secret)
-	isJWT := strings.Count(secret, ".") == 2 && provider == ProviderZai
+	isJWT := strings.Count(secret, ".") == 2 && IsJWTProvider(provider)
 	if name == "" {
 		name = provider + "-account"
 	}

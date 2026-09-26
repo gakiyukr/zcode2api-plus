@@ -162,7 +162,7 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	flow := oauth.NewFlow()
+	flow := oauth.NewFlow(model.ProviderZai)
 	flowID, authorizeURL, err := flow.Init()
 	if err != nil {
 		gateway.WriteJSON(w, http.StatusBadGateway, map[string]any{"detail": "授权初始化失败"})

@@ -262,7 +262,7 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 	if secret := firstTruthy(payload["token"], payload["secret"]); truthy(secret) {
 		s := strings.TrimSpace(strOf(secret))
 		cred := &model.Account{}
-		if strings.Count(s, ".") == 2 && acc.Provider == model.ProviderZai {
+		if strings.Count(s, ".") == 2 && model.IsJWTProvider(acc.Provider) {
 			cred.Mode = "jwt"
 			cred.JWTToken = &s
 		} else {
@@ -425,9 +425,11 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 	// handleBillingResponse 把归档账号的状态写回 active，与归档语义冲突。
 	var targets []*model.Account
 	if truthy(payload["all"]) {
-		for _, a := range h.Store.ListAccounts(model.ProviderZai) {
-			if a.Mode == "jwt" && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
-				targets = append(targets, a)
+		for _, provider := range store.Providers {
+			for _, a := range h.Store.ListAccounts(provider) {
+				if a.Mode == "jwt" && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
+					targets = append(targets, a)
+				}
 			}
 		}
 	} else {

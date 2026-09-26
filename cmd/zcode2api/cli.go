@@ -30,9 +30,11 @@ const cliUsage = `ZCode2api (Go)
 
 用法:
   zcode2api serve [--port 3000]        启动网关 + 后台 UI
-  zcode2api login zai [--no-browser]   通过 OAuth 登录 Z.AI 并自动加入账号池
-  zcode2api add-account zai <name> <jwt|key>   添加轮询账号
-  zcode2api accounts [zai]             查看账号列表
+  zcode2api login <zai|bigmodel> [--no-browser]
+                                       通过 OAuth 登录并自动加入账号池
+                                       （zai=Z.AI，bigmodel=智谱 BigModel）
+  zcode2api add-account <provider> <name> <jwt|key>   添加轮询账号
+  zcode2api accounts [provider]        查看账号列表
   zcode2api remove-account <provider> <id|name>
   zcode2api quota                      查看各账号实时额度
   zcode2api status                     查看配置概览
@@ -152,11 +154,12 @@ func printGeneratedKeys(st *store.Store) {
 // ── login ───────────────────────────────────────────────────────────────────
 
 func cmdLogin(args []string) {
-	if len(args) == 0 || args[0] != "zai" {
-		fmt.Println(web.Red + "目前仅支持: zcode2api login zai" + web.Reset)
+	if len(args) == 0 || !oauth.IsSupportedProvider(args[0]) {
+		fmt.Println(web.Red + "目前仅支持: zcode2api login zai | zcode2api login bigmodel" + web.Reset)
 		return
 	}
-	flow := oauth.NewFlow()
+	provider := args[0]
+	flow := oauth.NewFlow(provider)
 	flowID, authorizeURL, err := flow.Init()
 	if err != nil {
 		fmt.Println(web.Red + "❌ 登录初始化失败: " + err.Error() + web.Reset)
@@ -198,7 +201,7 @@ func cmdLogin(args []string) {
 	st := openStore()
 	defer func() { _ = st.Close() }()
 	if result.Token != "" {
-		acc, err := st.AddAccount(model.ProviderZai, "oauth-login", result.Token)
+		acc, err := st.AddAccount(provider, "oauth-login", result.Token)
 		if err != nil {
 			fmt.Println(web.Red + "❌ 保存 JWT 账号失败: " + err.Error() + web.Reset)
 			return
@@ -238,7 +241,7 @@ func cmdLogin(args []string) {
 		}
 		_ = cm.Close()
 	}
-	if result.AccessToken != "" {
+	if result.AccessToken != "" && model.SupportsAPIKeyMode(provider) {
 		if key, err := oauth.ExchangeAPIKey(result.AccessToken); err == nil {
 			if _, err := st.AddAccount(model.ProviderZai, "oauth-apikey", key); err == nil {
 				fmt.Println(web.Green + "✔ 已兑换并保存 API Key: " + key[:min(8, len(key))] + "..." + web.Reset)
@@ -260,7 +263,7 @@ func min(a, b int) int {
 
 func cmdAddAccount(args []string) {
 	if len(args) < 3 {
-		fmt.Println(web.Red + "格式: zcode2api add-account <zai> <name> <jwt|key>" + web.Reset)
+		fmt.Println(web.Red + "格式: zcode2api add-account <zai|bigmodel> <name> <jwt|key>" + web.Reset)
 		return
 	}
 	st := openStore()
@@ -275,8 +278,12 @@ func cmdAddAccount(args []string) {
 
 func cmdAccounts(args []string) {
 	provider := ""
-	if len(args) > 0 && args[0] == model.ProviderZai {
+	if len(args) > 0 {
 		provider = args[0]
+		if !oauth.IsSupportedProvider(provider) {
+			fmt.Println(web.Red + "未知 provider: " + provider + "（支持: " + strings.Join(store.Providers, ", ") + "）" + web.Reset)
+			return
+		}
 	}
 	st := openStore()
 	defer func() { _ = st.Close() }()
@@ -376,25 +383,28 @@ func cmdStatus() {
 		fmt.Println(web.Yellow + "网关 API Key: 未设置（网关将拒绝请求）" + web.Reset)
 	}
 	now := time.Now()
-	accounts := st.ListAccounts(model.ProviderZai)
-	active := 0
-	for _, a := range accounts {
-		if a.IsSelectable(now) {
-			active++
+	for _, provider := range store.Providers {
+		accounts := st.ListAccounts(provider)
+		active := 0
+		for _, a := range accounts {
+			if a.IsSelectable(now) {
+				active++
+			}
 		}
+		fmt.Printf("%-10s: %d 个账号，%d 个可用\n", provider, len(accounts), active)
 	}
-	fmt.Printf("zai        : %d 个账号，%d 个可用\n", len(accounts), active)
 }
 
 func cmdQuota() {
 	st := openStore()
 	defer func() { _ = st.Close() }()
-	accounts := st.ListAccounts(model.ProviderZai)
 	now := time.Now()
 	var jwtAccounts []*model.Account
-	for _, a := range accounts {
-		if a.Mode == "jwt" {
-			jwtAccounts = append(jwtAccounts, a)
+	for _, provider := range store.Providers {
+		for _, a := range st.ListAccounts(provider) {
+			if a.Mode == "jwt" {
+				jwtAccounts = append(jwtAccounts, a)
+			}
 		}
 	}
 	if len(jwtAccounts) == 0 {
@@ -407,7 +417,7 @@ func cmdQuota() {
 		qs.FetchQuota(a)
 		// FetchQuota 只把结果经 Store.Update 写回 Store 内部对象，调用方手上的
 		// 副本不会被更新——必须重新取快照才能看到刚拉到的额度。
-		a = st.Find(model.ProviderZai, a.ID)
+		a = st.Find(a.Provider, a.ID)
 		if a == nil {
 			continue
 		}

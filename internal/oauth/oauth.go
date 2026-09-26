@@ -1,6 +1,7 @@
-// Package oauth 移植 Python 版 app/oauth.py 的 Z.AI 浏览器 OAuth 登录链。
-// 流程：后台生成授权链接 → 用户在官方页授权后粘贴回调地址 → 解析 code/state
-// → 兑换 Coding Plan JWT →（可选）用 access_token 兑换 API Key 回退通道。
+// Package oauth 移植 Python 版 app/oauth.py 的 Z.AI 浏览器 OAuth 登录链，
+// 并扩展 Zhipu BigModel（智谱国内站）登录。流程：后台生成授权链接 → 用户在
+// 官方页授权后粘贴回调地址 → 解析 code/state → 兑换 Coding Plan JWT
+// →（仅 zai）可选用 access_token 兑换 API Key 回退通道。
 package oauth
 
 import (
@@ -14,6 +15,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"zcode2api/internal/config"
+	"zcode2api/internal/model"
 	"zcode2api/internal/util"
 )
 
@@ -48,8 +51,10 @@ func SetTokenURLForTest(url string) func() {
 // extractTimeout HTTP 请求超时（对齐 Python httpx timeout=30）。
 const exchangeTimeout = 30 * time.Second
 
-// Flow 一次登录会话（对应 Python ZaiAuthFlow）。
+// Flow 一次登录会话（对应 Python ZaiAuthFlow）。Provider 决定授权链接拼装
+// 与兑换请求体；state 格式两种 provider 通用（上游原样回传）。
 type Flow struct {
+	Provider    string
 	RedirectURI string
 	FlowID      string
 	Nonce       string
@@ -58,13 +63,27 @@ type Flow struct {
 }
 
 // NewFlow 创建会话；token_urlsafe(24) 等价 32 字节 base64url 无填充。
-func NewFlow() *Flow {
-	return &Flow{
-		RedirectURI: registeredRedirectURI,
-		FlowID:      util.RandomTokenURLSafe(24),
-		Nonce:       util.RandomTokenURLSafe(24),
-		CreatedAt:   time.Now(),
+// 不支持的 provider 返回 nil（调用方在入口处已做白名单校验，此处兜底）。
+func NewFlow(provider string) *Flow {
+	f := &Flow{
+		Provider: provider,
+		FlowID:   util.RandomTokenURLSafe(24),
+		Nonce:    util.RandomTokenURLSafe(24),
+		CreatedAt: time.Now(),
 	}
+	switch provider {
+	case model.ProviderBigModel:
+		// 对齐桌面端 buildDesktopOAuthRedirectUriFromEnv：官方登录中转页
+		// 落回 zcode://oauth/callback，并携带 app_version。
+		page := "https://zcode.z.ai/app/oauth/login"
+		query := url.Values{}
+		query.Set("redirect", "zcode://oauth/callback")
+		query.Set("app_version", config.ZcodeClientVersion)
+		f.RedirectURI = page + "?" + query.Encode()
+	default:
+		f.RedirectURI = registeredRedirectURI
+	}
+	return f
 }
 
 // tokenURLSafe 生成 n 字节随机数据的 base64url 字符串（无填充）。
@@ -82,12 +101,27 @@ func (f *Flow) Init() (string, string, error) {
 		return "", "", err
 	}
 	f.State = base64.RawURLEncoding.EncodeToString(raw)
+	return f.FlowID, f.buildAuthorizeURL(), nil
+}
+
+// buildAuthorizeURL 按 provider 拼授权页地址（形态取自 ZCode 桌面端）：
+// zai 走标准 OAuth authorize 端点；bigmodel 走 bigmodel.cn 登录页，
+// 由官方前端把 redirect/appId/state 带进登录流程。
+func (f *Flow) buildAuthorizeURL() string {
 	query := url.Values{}
-	query.Set("redirect_uri", f.RedirectURI)
-	query.Set("response_type", "code")
-	query.Set("client_id", clientID)
-	query.Set("state", f.State)
-	return f.FlowID, authorizeURL + "?" + query.Encode(), nil
+	switch f.Provider {
+	case model.ProviderBigModel:
+		query.Set("redirect", f.RedirectURI)
+		query.Set("appId", bigModelAppID)
+		query.Set("state", f.State)
+		return bigModelAuthorizeURL + "?" + query.Encode()
+	default:
+		query.Set("redirect_uri", f.RedirectURI)
+		query.Set("response_type", "code")
+		query.Set("client_id", clientID)
+		query.Set("state", f.State)
+		return authorizeURL + "?" + query.Encode()
+	}
 }
 
 // MatchesState 常数时间比较 state（对齐 secrets.compare_digest）。
@@ -158,13 +192,23 @@ func firstQuery(v url.Values, keys ...string) string {
 	return ""
 }
 
-// exchangeResult 对应 Python exchange_code 的返回形态。
+// exchangeResult 对应 Python exchange_code 的返回形态；BigModel 为 Go 版
+// 扩展（data.bigmodel 携带智谱业务 access_token / refresh_token）。
 type ExchangeResult struct {
 	Token       string         `json:"token"`
 	Zai         map[string]any `json:"zai"`
+	BigModel    map[string]any `json:"bigmodel"`
 	User        map[string]any `json:"user"`
 	Email       *string        `json:"email"`
 	AccessToken string         `json:"-"`
+}
+
+// DisplayName 返回面向用户的 provider 名称（错误文案用）。
+func (f *Flow) DisplayName() string {
+	if f.Provider == model.ProviderBigModel {
+		return "BigModel"
+	}
+	return "Z.AI"
 }
 
 // ExchangeCode 用回调 code 兑换 Coding Plan JWT 等凭证。
@@ -180,6 +224,11 @@ func (f *Flow) ExchangeCode(code, state string) (*ExchangeResult, error) {
 		"redirect_uri": f.RedirectURI,
 		"state":        state,
 	}
+	if f.Provider == model.ProviderBigModel {
+		// zcode.z.ai 兑换端点两族共用，靠 provider 字段区分（对齐桌面端
+		// exchangeZcodeJwtToken）。
+		payload["provider"] = model.ProviderBigModel
+	}
 	body, err := postJSON(tokenURL(), payload)
 	if err != nil {
 		return nil, err
@@ -188,38 +237,72 @@ func (f *Flow) ExchangeCode(code, state string) (*ExchangeResult, error) {
 		Code any    `json:"code"`
 		Msg  string `json:"msg"`
 		Data struct {
-			Token string         `json:"token"`
-			Zai   map[string]any `json:"zai"`
-			User  map[string]any `json:"user"`
+			Token       string         `json:"token"`
+			AccessToken string         `json:"access_token"`
+			Zai         map[string]any `json:"zai"`
+			BigModel    map[string]any `json:"bigmodel"`
+			User        map[string]any `json:"user"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, errors.New("Z.AI 凭证交换返回了无效 JSON")
+		return nil, errors.New("凭证交换返回了无效 JSON")
 	}
 	if !codeIsZero(parsed.Code) {
 		msg := strings.TrimSpace(parsed.Msg)
 		if msg == "" {
-			msg = "Z.AI 凭证交换失败"
+			msg = f.DisplayName() + " 凭证交换失败"
 		}
 		return nil, errors.New(msg)
 	}
 	jwt := strings.TrimSpace(parsed.Data.Token)
 	if jwt == "" {
-		return nil, errors.New("Z.AI 凭证响应中不含 Coding Plan Token")
+		return nil, errors.New(f.DisplayName() + " 凭证响应中不含 Coding Plan Token")
 	}
 	access := ""
-	if parsed.Data.Zai != nil {
-		if v, ok := parsed.Data.Zai["access_token"].(string); ok {
-			access = strings.TrimSpace(v)
+	zai := map[string]any{}
+	bigModel := map[string]any{}
+	if f.Provider == model.ProviderBigModel {
+		// data.bigmodel.access_token（兼容 camelCase），回退顶层 data.access_token
+		// （对齐桌面端 resolveBigModelBusinessAccessToken）；refresh_token 为
+		// bigmodel 独有，随 ExchangeResult 带出备用。
+		bm := parsed.Data.BigModel
+		trimmed := func(key string) string {
+			if bm == nil {
+				return ""
+			}
+			s, _ := bm[key].(string)
+			return strings.TrimSpace(s)
+		}
+		access = trimmed("access_token")
+		if access == "" {
+			access = trimmed("accessToken")
+		}
+		if access == "" {
+			access = strings.TrimSpace(parsed.Data.AccessToken)
+		}
+		if access != "" {
+			bigModel["access_token"] = access
+		}
+		rt := trimmed("refresh_token")
+		if rt == "" {
+			rt = trimmed("refreshToken")
+		}
+		if rt != "" {
+			bigModel["refresh_token"] = rt
+		}
+	} else {
+		if parsed.Data.Zai != nil {
+			if v, ok := parsed.Data.Zai["access_token"].(string); ok {
+				access = strings.TrimSpace(v)
+			}
+		}
+		if access != "" {
+			zai["access_token"] = access
 		}
 	}
 	email := ExtractUserEmail(parsed.Data.User)
 	if email == nil {
 		email = ExtractJWTEmail(jwt)
-	}
-	zai := map[string]any{}
-	if access != "" {
-		zai["access_token"] = access
 	}
 	user := parsed.Data.User
 	if user == nil {
@@ -228,6 +311,7 @@ func (f *Flow) ExchangeCode(code, state string) (*ExchangeResult, error) {
 	return &ExchangeResult{
 		Token:       jwt,
 		Zai:         zai,
+		BigModel:    bigModel,
 		User:        user,
 		Email:       email,
 		AccessToken: access,

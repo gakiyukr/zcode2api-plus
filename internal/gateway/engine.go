@@ -123,7 +123,7 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 
 	tried := map[string]bool{}
 	for range MaxAccountAttempts {
-		acc := e.Store.Select(model.ProviderZai, tried, modelName)
+		acc := e.Store.SelectAny(tried, modelName)
 		if acc == nil {
 			break
 		}
@@ -646,11 +646,12 @@ func (e *Engine) bumpFail(acc *model.Account) {
 const maxErrorBodyBytes = 64 << 10
 
 // fireRefresh 触发额度刷新（M3 接入 quota 包；仅 JWT 账号，对齐 _safe_refresh）。
+// JWT 是唯一的 Coding Plan 凭证形态，两族 provider 的账单端点共用。
 func (e *Engine) fireRefresh(acc *model.Account) {
 	if e.OnQuotaRefresh == nil {
 		return
 	}
-	if acc.Provider != model.ProviderZai || acc.Mode != "jwt" {
+	if acc.Mode != "jwt" {
 		return
 	}
 	go e.OnQuotaRefresh(acc)

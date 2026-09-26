@@ -3,7 +3,10 @@
 package adminapi
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -39,7 +42,24 @@ func errUpstream(msg string) *apiError { return &apiError{http.StatusBadGateway,
 
 func (h *Handler) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	cleanupLoginFlows()
-	flow := oauth.NewFlow()
+	// 旧客户端 start 可能不带请求体，这里容忍空 body（与 complete 的严格
+	// decodeBody 不同）。
+	payload := map[string]any{}
+	if body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)); err == nil && len(bytes.TrimSpace(body)) > 0 {
+		if err := json.Unmarshal(body, &payload); err != nil {
+			writeAPIError(w, errBadRequest("请求体不是合法 JSON"))
+			return
+		}
+	}
+	provider := strings.TrimSpace(strOf(payload["provider"]))
+	if provider == "" {
+		provider = model.ProviderZai // 缺省 zai：兼容旧前端请求体
+	}
+	if !oauth.IsSupportedProvider(provider) {
+		writeAPIError(w, errBadRequest(fmt.Sprintf("不支持的登录 provider: %s", provider)))
+		return
+	}
+	flow := oauth.NewFlow(provider)
 	flowID, authorizeURL, err := flow.Init()
 	if err != nil {
 		writeAPIError(w, errUpstream(fmt.Sprintf("登录初始化失败: %v", err)))
@@ -74,7 +94,7 @@ func (h *Handler) handleLoginComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err == nil && oauthErr != "" {
-		writeAPIError(w, errBadRequest(fmt.Sprintf("Z.AI 拒绝授权: %s", oauthErr)))
+		writeAPIError(w, errBadRequest(fmt.Sprintf("%s 拒绝授权: %s", flow.DisplayName(), oauthErr)))
 		return
 	}
 	if !flow.MatchesState(state) {
@@ -87,7 +107,7 @@ func (h *Handler) handleLoginComplete(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errBadRequest(err.Error()))
 		return
 	}
-	account, apiErr := h.saveOAuthAccount(result)
+	account, apiErr := h.saveOAuthAccount(flow, result)
 	if apiErr != nil {
 		writeAPIError(w, apiErr)
 		return
@@ -98,9 +118,10 @@ func (h *Handler) handleLoginComplete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "account": account.PublicView(time.Now())})
 }
 
-// saveOAuthAccount 落库登录凭证：JWT 入池（邮箱命名）→ 兑换 API Key 回填同账号
-// → 刷新额度。兑换/刷新失败不影响 JWT 已入池（对齐 Python _save_oauth_account）。
-func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult) (*model.Account, *apiError) {
+// saveOAuthAccount 落库登录凭证：JWT 入池（邮箱命名）→（仅 zai）兑换 API Key
+// 回填同账号 → 刷新额度。兑换/刷新失败不影响 JWT 已入池（对齐 Python _save_oauth_account）。
+func (h *Handler) saveOAuthAccount(flow *oauth.Flow, result *oauth.ExchangeResult) (*model.Account, *apiError) {
+	provider := flow.Provider
 	email := ""
 	if result.Email != nil {
 		email = strings.TrimSpace(*result.Email)
@@ -109,7 +130,7 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult) (*model.Account
 	if name == "" {
 		name = "oauth-login"
 	}
-	account, err := h.Store.AddAccount(model.ProviderZai, name, result.Token)
+	account, err := h.Store.AddAccount(provider, name, result.Token)
 	if err != nil {
 		return nil, errUpstream(fmt.Sprintf("凭证入池失败: %v", err))
 	}
@@ -123,7 +144,7 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult) (*model.Account
 			return nil, errUpstream(fmt.Sprintf("账号信息落库失败: %v", err))
 		}
 	}
-	if result.AccessToken != "" {
+	if result.AccessToken != "" && model.SupportsAPIKeyMode(provider) {
 		if apiKey, err := oauth.ExchangeAPIKey(result.AccessToken); err == nil && apiKey != "" {
 			if err := h.Store.Update(account.Provider, account.ID, func(a *model.Account) {
 				a.APIKey = &apiKey
