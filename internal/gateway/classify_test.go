@@ -83,3 +83,33 @@ func TestModelAllowed(t *testing.T) {
 		}
 	}
 }
+
+func TestZcodeRestricted405(t *testing.T) {
+	// 3012 业务 JSON（直打上游的原样形态）
+	body := `{"code":3012,"logid":"x","msg":"request has been blocked due to unusual activity."}`
+	if !IsZcodeRestricted(http.StatusMethodNotAllowed, body) {
+		t.Fatal("405+3012 应判为账号级风控")
+	}
+	if IsZcodeEdgeBlocked(http.StatusMethodNotAllowed, body) {
+		t.Fatal("业务 JSON 不是边缘拦截页")
+	}
+	// 裸 405（无 body）也按账号级处理：边缘页必带 HTML 特征
+	if !IsZcodeRestricted(http.StatusMethodNotAllowed, "") {
+		t.Fatal("裸 405 应判为账号级风控")
+	}
+}
+
+func TestEdgeBlocked405(t *testing.T) {
+	page := `<html><body>errors.aliyun.com</body></html>`
+	if !IsZcodeEdgeBlocked(http.StatusMethodNotAllowed, page) {
+		t.Fatal("HTML 拦截页应判为边缘封锁")
+	}
+	if IsZcodeRestricted(http.StatusMethodNotAllowed, page) {
+		t.Fatal("拦截页不是账号级风控")
+	}
+	// 非 405 的其他状态码不触发两分类
+	rest := `{"code":3012}`
+	if IsZcodeEdgeBlocked(http.StatusForbidden, page) || IsZcodeRestricted(http.StatusForbidden, rest) {
+		t.Fatal("仅 405 参与风控分类")
+	}
+}

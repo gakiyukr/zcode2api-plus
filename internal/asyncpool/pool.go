@@ -105,6 +105,15 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 	// 与「模型白名单与 /v1/messages 一致」的注释承诺不符。
 	gateway.NormalizeBody(body, false)
 
+	// 边缘熔断期与 /v1/messages 一致：入口直接拒绝，不建票不碰上游
+	if gateway.EdgeHeld(time.Now()) {
+		web.Warn("async", "边缘熔断期，拒绝请求 zcode.z.ai")
+		gateway.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]any{"message": "上游边缘防火墙已封锁本机出口，稍后自动恢复", "type": "upstream_edge_blocked"},
+		})
+		return
+	}
+
 	// 模型白名單與 /v1/messages 一致：僅開放清單內模型，其餘在建票前一律拒絕
 	if !gateway.ModelAllowed(body["model"]) {
 		modelName := gateway.AnyToString(body["model"])
@@ -448,6 +457,27 @@ func (p *Pool) attemptUpstream(
 			// 验证码被拒：令牌作废，由调用方在内层循环内换令牌重试
 			p.Captcha.Invalidate()
 			return false, errCaptchaRejected
+		}
+
+		// 405：先区分边缘拦截页（网络级，全局熔断）与账号级风控（3012，长冷却）
+		if gateway.IsZcodeEdgeBlocked(resp.StatusCode, bodyText) {
+			gateway.HoldEdge(time.Duration(config.EdgeHoldSeconds)*time.Second, time.Now())
+			p.bumpFail(acc)
+			web.Warn(ticketID, fmt.Sprintf("上游边缘防火墙拦截本机出口，全局熔断 %d s", config.EdgeHoldSeconds))
+			p.emit(ctx, ticketID, ticketEvent{
+				Type: "error",
+				Data: map[string]any{"error": map[string]any{
+					"message": "上游边缘防火墙已封锁本机出口，稍后自动恢复", "type": "upstream_edge_blocked"}},
+			})
+			return false, errDelivered
+		}
+		if gateway.IsZcodeRestricted(resp.StatusCode, bodyText) {
+			p.bumpFail(acc)
+			gateway.MarkAccountCooling(p.Store, acc.Provider, acc.ID,
+				"上游风控 3012 拒绝（HTTP 405）",
+				time.Duration(config.RestrictedCooldownSeconds)*time.Second, time.Now())
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 被上游风控限制（3012），冷却 %d s 后重试", acc.Name, config.RestrictedCooldownSeconds))
+			return false, errNetwork{bodyText}
 		}
 
 		// 401/403 → 账号失效，换号

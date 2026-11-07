@@ -9,10 +9,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 )
+
+// osRelease 缓存 OsRelease() 的平台探测结果（探测只做一次）。
+var osRelease string
 
 func env(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -121,15 +125,85 @@ var (
 	// ZCode 计费 / 额度查询端点（不可配置，与官方客户端一致）。
 	ZcodeBillingBase = "https://zcode.z.ai/api/v1/zcode-plan"
 
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.7.7")
-	// 与 Python 版保持一致的客户端平台标识；旧的 win32 参数已失效。
-	ZcodeClientPlatform = env("ZCODE_CLIENT_PLATFORM", "win32-x64")
+	// ZcodeClientVersion 对齐 ZCode 3.17.2 官方客户端：上游自 2026-11-03 起
+	// 对 Start Plan 请求做版本级校验，版本头与请求形态不匹配会以 405/3012 拒绝。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.17.2")
+	// ai-sdk/anthropic 是官方 CLI 请求 UA 的固定后缀（ZCode/3.17.2 ai-sdk/anthropic/3.0.81）。
+	ZcodeSDKVersion = env("ZCODE_SDK_VERSION", "3.0.81")
+	// ZcodeClientPlatform 对齐官方 X-Platform（Node 的 process.platform-arch）。
+	ZcodeClientPlatform = env("ZCODE_CLIENT_PLATFORM", ClientPlatform())
 
-	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
+	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion+" ai-sdk/anthropic/"+ZcodeSDKVersion)
+
+	// ClientLanguage / ClientTimezone 官方客户端取本机 locale 与时区；
+	// 服务器进程没有用户 locale，默认 unknown（magpie 同款回退值，已验证可通过）。
+	ClientLanguage = env("ZCODE_CLIENT_LANGUAGE", "unknown")
+	ClientTimezone = env("ZCODE_CLIENT_TIMEZONE", "unknown")
+	// OsVersionOverride 覆盖 X-Os-Version（X-Os-Release）；留空时按平台自动探测。
+	OsVersionOverride = env("ZCODE_OS_VERSION", "")
+
+	// EdgeHoldSeconds 本机出口被上游边缘防火墙（405 拦截页）封锁后的全局熔断时长。
+	// 熔断期内所有账号停止请求 zcode.z.ai——继续请求只会让计数中的防火墙更确定。
+	EdgeHoldSeconds = envInt("ZCODE_EDGE_HOLD_SECONDS", 180)
+	// RestrictedCooldownSeconds 上游风控 3012 拒绝后的账号冷却时长（账号级限制，
+	// 官方 App 同样被拒；magpie 观察为持续性限制，30 分钟后重试探测）。
+	RestrictedCooldownSeconds = envInt("ZCODE_RESTRICTED_COOLDOWN", 1800)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
 	AppVersion = "2.0.9-go"
 )
+
+// PlatformName 对齐官方客户端的 process.platform 取值（win32/darwin/linux）。
+func PlatformName() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "win32"
+	case "darwin":
+		return "darwin"
+	default:
+		return runtime.GOOS
+	}
+}
+
+// ArchName 对齐 process.arch（x64/arm64）。
+func ArchName() string {
+	if runtime.GOARCH == "amd64" {
+		return "x64"
+	}
+	return runtime.GOARCH
+}
+
+// ClientPlatform 官方客户端的 X-Platform 形态：linux-x64 / win32-x64 / darwin-arm64。
+func ClientPlatform() string {
+	return PlatformName() + "-" + ArchName()
+}
+
+// OsCategory 官方客户端的 X-Os-Category：windows / macos / linux。
+func OsCategory() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "windows"
+	case "darwin":
+		return "macos"
+	default:
+		return "linux"
+	}
+}
+
+var osReleaseOnce sync.Once
+
+// OsRelease 官方客户端的 X-Os-Version（Node os.release()）：linux 为内核版本，
+// windows 为 NT 版本号（10.0.26300）。环境变量 ZCODE_OS_VERSION 优先；
+// 探测失败返回空串，调用方应跳过该头而非发送空值。
+func OsRelease() string {
+	if OsVersionOverride != "" {
+		return OsVersionOverride
+	}
+	osReleaseOnce.Do(func() { osRelease = probeOsRelease() })
+	return osRelease
+}
+
+// osReleaseProbe 按平台探测系统版本；实现在 os_release_*.go（构建标签分档）。
 
 // ── 设备身份 ────────────────────────────────────────────────────────────────
 var (

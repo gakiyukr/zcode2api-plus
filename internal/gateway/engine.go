@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"zcode2api/internal/captcha"
@@ -25,6 +26,24 @@ import (
 	"zcode2api/internal/util"
 	"zcode2api/internal/web"
 )
+
+// edgeHoldUntil 本机出口被上游边缘防火墙（405 拦截页）封锁后的全局熔断
+// 截止时间（unix nano，0 = 未熔断）。进程级而非账号级：出口地址是全体
+// 账号共用的，熔断期内继续请求只会让计数中的防火墙更确定（magpie
+// plugins#649：两账号三会话齐敲，连官方 App 都被拖下水；封锁一般数分钟自解）。
+var edgeHoldUntil atomic.Int64
+
+// HoldEdge 开启全局熔断：duration 内所有发往 zcode.z.ai 的 messages 请求
+// 在入口直接拒绝，不再触碰上游。engine 与 asyncpool 共用。
+func HoldEdge(duration time.Duration, now time.Time) {
+	edgeHoldUntil.Store(now.Add(duration).UnixNano())
+}
+
+// EdgeHeld 当前是否处于边缘熔断期。
+func EdgeHeld(now time.Time) bool {
+	until := edgeHoldUntil.Load()
+	return until > 0 && now.UnixNano() < until
+}
 
 // Delivery 上游 200 响应的交付物；Body 已被 usage 收集器包装（流式）或已缓冲。
 type Delivery struct {
@@ -120,6 +139,13 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	stream := bodyBool(body, "stream")
 	reqID := util.RandomHex(3)
 	web.Req(reqID, orDash(modelName), stream)
+
+	// 边缘熔断期：本出口正被上游防火墙计数，入口直接拒绝，一个账号都不碰
+	if EdgeHeld(e.now()) {
+		web.Warn(reqID, "边缘熔断期，拒绝请求 zcode.z.ai")
+		return errResult(http.StatusServiceUnavailable, "upstream_edge_blocked",
+			"上游边缘防火墙已封锁本机出口，稍后自动恢复（可在后台更换出口代理）")
+	}
 
 	tried := map[string]bool{}
 	for range MaxAccountAttempts {
@@ -369,6 +395,26 @@ func (e *Engine) handleUpstreamError(
 		return attemptResult{retryCaptcha: true}
 	}
 
+	// 1.5) 上游风控（405）：先区分边缘拦截页与账号级拒绝——两者共用同一句
+	// "request has been blocked" 文案，处置完全不同。
+	if IsZcodeEdgeBlocked(resp.StatusCode, text) {
+		// 边缘拦截页 = 本机出口被封（网络级）：全局熔断，本请求终止。
+		// 账号状态不动（账号是好的，换 IP 即恢复），也不换号——换号结果相同。
+		HoldEdge(time.Duration(config.EdgeHoldSeconds)*time.Second, e.now())
+		e.bumpFail(acc)
+		web.Warn(reqID, fmt.Sprintf("上游边缘防火墙拦截本机出口，全局熔断 %d s", config.EdgeHoldSeconds))
+		return attemptResult{final: errResult(http.StatusServiceUnavailable, "upstream_edge_blocked",
+			"上游边缘防火墙已封锁本机出口，稍后自动恢复（可在后台更换出口代理）")}
+	}
+	if IsZcodeRestricted(resp.StatusCode, text) {
+		// 3012 = 账号被风控限制（官方 App 同样被拒）：长冷却休息，换号。
+		e.bumpFail(acc)
+		MarkAccountCooling(e.Store, acc.Provider, acc.ID,
+			fmt.Sprintf("上游风控 3012 拒绝（HTTP 405）"), time.Duration(config.RestrictedCooldownSeconds)*time.Second, e.now())
+		web.Warn(reqID, fmt.Sprintf("账号 %s 被上游风控限制（3012），冷却 %d s 后重试", acc.Name, config.RestrictedCooldownSeconds))
+		return attemptResult{switchAccount: true}
+	}
+
 	// 2) 鉴权失败是强信号（JWT 上游为裸 401 空 body；api.z.ai 为 type=1000/1001/1003）
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		e.mark(acc, model.StatusInvalid, fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
@@ -543,6 +589,18 @@ func MarkAccount(st *store.Store, provider, id, status, errMsg string, now time.
 			until := float64(now.Add(time.Duration(config.CoolingSeconds)*time.Second).UnixNano()) / 1e9
 			acc.CoolingUntil = &until
 		}
+	})
+}
+
+// MarkAccountCooling 以自定义冷却时长标记账号 cooling（区别于配置的默认
+// 冷却）：上游风控 3012 的限制远比瞬时限流持久，用默认 5 分钟冷却会让
+// 被封账号反复回池空耗请求。engine 与 asyncpool 共用。
+func MarkAccountCooling(st *store.Store, provider, id, errMsg string, cooldown time.Duration, now time.Time) {
+	st.Update(provider, id, func(acc *model.Account) {
+		acc.Status = model.StatusCooling
+		until := float64(now.Add(cooldown).UnixNano()) / 1e9
+		acc.CoolingUntil = &until
+		acc.LastError = &errMsg
 	})
 }
 

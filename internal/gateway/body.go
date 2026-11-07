@@ -8,13 +8,14 @@ import (
 	"zcode2api/internal/upstream"
 )
 
-// NormalizeBody 对请求体做三件事（与 Python 版一致）：
+// NormalizeBody 对请求体做三件事（注入语义对齐 ZCode 3.17.2 官方客户端，
+// 移植自 magpie 的 dress）：
 //  1. 模型名去 "provider/" 前缀，并按 MODEL_NAME_MAP 做大小写映射（幂等）；
 //  2. 字符串 content 桥接为 [{type:"text"}]（不改写原始消息 map，幂等）；
-//  3. needsZcodeSystem（JWT 账号）时把 zcode_system.json 注入顶层 system
-//     —— 否则上游返回 405。
+//  3. needsZcodeSystem（JWT 账号）时重建 system 为官方三块形态并补齐
+//     日期前缀 / cache_control / metadata——否则上游返回 405。
 //
-// 注意：system 注入**不幂等**（重复调用会重复拼接 blocks），调用方须保证
+// 注意：system 重建**不幂等**（重复调用会重复追加日期前缀），调用方须保证
 // 对同一个 body 只注入一次（Python 版同样是入口一次 + 账号副本一次）。
 func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 	if raw, ok := body["model"].(string); ok {
@@ -50,24 +51,9 @@ func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 	}
 
 	if needsZcodeSystem {
-		blocks := upstream.ZcodeSystemBlocks()
-		switch existing := body["system"].(type) {
-		case nil:
-			// 键不存在或为 null（对应 Python existing_system is None）
-			body["system"] = blocks
-		case string:
-			merged := make([]any, 0, len(blocks)+1)
-			merged = append(merged, blocks...)
-			merged = append(merged, map[string]any{"type": "text", "text": existing})
-			body["system"] = merged
-		case []any:
-			merged := make([]any, 0, len(blocks)+len(existing))
-			merged = append(merged, blocks...)
-			merged = append(merged, existing...)
-			body["system"] = merged
-		default:
-			// 其余类型保持原样（对齐 Python 版的 elif 链）
-		}
+		// 官方形态重建：三块 system + 日期前缀 + cache_control + metadata.user_id。
+		// 上游按官方客户端的形态逐项校验，外部 agent 的 system 文本并入第三块。
+		upstream.DressSystem(body)
 	}
 	return body
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -131,4 +132,23 @@ func IsModelConcurrencyLimit(statusCode int, text string) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(text), "model admission concurrency limit")
+}
+
+// edgePageRe 上游边缘防火墙（阿里云 ESA/CDN）拦截页的特征：错误重定向域
+// 或整页 HTML。这是本机出口地址被封，不是账号问题。
+var edgePageRe = regexp.MustCompile(`(?i)errors\.aliyun\.com|<html`)
+
+// IsZcodeEdgeBlocked 判断 405 是否为边缘防火墙的拦截页（本机出口被封）。
+// 拦截页是网络级的：所有账号共用同一出口时全部会撞上，继续请求只会加重。
+func IsZcodeEdgeBlocked(statusCode int, text string) bool {
+	return statusCode == http.StatusMethodNotAllowed && edgePageRe.MatchString(text)
+}
+
+// IsZcodeRestricted 判断 405 是否为上游风控的账号级拒绝（code 3012）。
+// 官方客户端在同账号上同样被拒（风控封的是账号）；与拦截页区分：
+// 同一句 "request has been blocked" 文案两种形态都会出现。
+// 405 本身即拒绝信号（magpie startRefused：405 状态码足矣，文本仅辅助识别）。
+func IsZcodeRestricted(statusCode int, text string) bool {
+	return statusCode == http.StatusMethodNotAllowed &&
+		!edgePageRe.MatchString(text)
 }

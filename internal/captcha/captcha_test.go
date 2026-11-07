@@ -24,7 +24,7 @@ func setCaptchaServer(t *testing.T, handler http.HandlerFunc) {
 
 func TestFetchConfigFromUpstream(t *testing.T) {
 	setCaptchaServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("app_version") != "3.7.7" || r.URL.Query().Get("platform") != "win32-x64" {
+		if r.URL.Query().Get("app_version") != config.ZcodeClientVersion || r.URL.Query().Get("platform") != config.ZcodeClientPlatform {
 			t.Errorf("应携带客户端版本与平台参数: %v", r.URL.Query())
 		}
 		_, _ = w.Write([]byte(`{"code":0,"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc"}}}}`))
