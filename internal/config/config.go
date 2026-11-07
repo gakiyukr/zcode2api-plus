@@ -150,7 +150,7 @@ var (
 	RestrictedCooldownSeconds = envInt("ZCODE_RESTRICTED_COOLDOWN", 1800)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.0.9-go"
+	AppVersion = "2.1.0-go"
 )
 
 // PlatformName 对齐官方客户端的 process.platform 取值（win32/darwin/linux）。
