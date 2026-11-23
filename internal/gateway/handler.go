@@ -57,10 +57,13 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		WriteAuthError(w, e)
 		return
 	}
+	// 模型清单来自全部账号额度快照（上游 billing/balance 的真实模型）；
+	// 无账号或快照为空时回退静态清单（CollectModels）。
+	ids := h.Engine.CollectModels()
 	// 双兼容超集（M4）：每项同时带 Anthropic 侧 id/display_name/type 与
 	// OpenAI 侧 object/created/owned_by，顶层 object:list
-	data := make([]map[string]any, 0, len(AvailableModels))
-	for _, id := range AvailableModels {
+	data := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
 		data = append(data, map[string]any{
 			"id":           id,
 			"type":         "model",

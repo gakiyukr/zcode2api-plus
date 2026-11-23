@@ -13,6 +13,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -172,6 +173,30 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	web.ReqErr(reqID, "无可用账号 / 额度均已耗尽")
 	return errResult(http.StatusServiceUnavailable, "no_available_account",
 		"所有账号均不可用或额度已用完，请在后台检查账号状态")
+}
+
+// CollectModels 聚合全部账号额度快照中的模型清单（去重、字典序）。
+// 上游没有公开的模型列表端点；billing/balance 的 balances[].model 即上游
+// 为该账号提供的实际模型，额度刷新（quota.Service）会持续同步进快照。
+// 无账号或快照为空时回退 AvailableModels 静态清单，保证端点永远可用。
+func (e *Engine) CollectModels() []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, acc := range e.Store.ListAccounts(model.ProviderZai) {
+		for _, entry := range acc.Quota {
+			name, _ := entry["model"].(string)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	if len(out) == 0 {
+		return append([]string{}, AvailableModels...)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // TestAccountResult 定向测试单个账号的结果。
