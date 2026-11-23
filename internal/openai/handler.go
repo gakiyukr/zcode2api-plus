@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"strings"
 
 	"zcode2api/internal/auth"
 	"zcode2api/internal/gateway"
@@ -45,14 +44,6 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	anthropicReq, err := ConvertRequest(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
-		return
-	}
-
-	// 模型白名单校验（与 /v1/messages 一致；模型名映射由引擎 NormalizeBody 完成）
-	if !gateway.ModelAllowed(anthropicReq["model"]) {
-		writeError(w, http.StatusBadRequest,
-			"模型 "+gateway.AnyToString(anthropicReq["model"])+" 不在可用清單內，僅支持 "+
-				strings.Join(gateway.AvailableModels, ", "), "invalid_request_error")
 		return
 	}
 

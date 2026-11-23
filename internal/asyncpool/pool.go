@@ -101,8 +101,6 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 入口整形一次，与 /v1/messages 一致（去掉 provider/ 前缀、套用名称映射）。
-	// 缺了它，`anthropic/GLM-5.3` 这类写法在前者能过、在这里 400，
-	// 与「模型白名单与 /v1/messages 一致」的注释承诺不符。
 	gateway.NormalizeBody(body, false)
 
 	// 边缘熔断期与 /v1/messages 一致：入口直接拒绝，不建票不碰上游
@@ -110,19 +108,6 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 		web.Warn("async", "边缘熔断期，拒绝请求 zcode.z.ai")
 		gateway.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": map[string]any{"message": "上游边缘防火墙已封锁本机出口，稍后自动恢复", "type": "upstream_edge_blocked"},
-		})
-		return
-	}
-
-	// 模型白名單與 /v1/messages 一致：僅開放清單內模型，其餘在建票前一律拒絕
-	if !gateway.ModelAllowed(body["model"]) {
-		modelName := gateway.AnyToString(body["model"])
-		web.Warn("async", fmt.Sprintf("模型 %s 不在開放清單內，拒絕建票", modelName))
-		gateway.WriteJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]any{
-				"message": fmt.Sprintf("模型 %s 不在可用清單內，僅支持 %s", modelName, strings.Join(gateway.AvailableModels, ", ")),
-				"type":    "model_not_allowed",
-			},
 		})
 		return
 	}

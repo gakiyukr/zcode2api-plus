@@ -240,20 +240,21 @@ func TestStreamPassthroughAndUsage(t *testing.T) {
 	}
 }
 
-func TestModelNotAllowed(t *testing.T) {
+func TestModelPassthroughNoWhitelist(t *testing.T) {
+	// 白名单已移除：任何模型名都直接转发上游，由上游裁决准入。
 	f := newFixture(t)
-	f.respond = func(int, *http.Request) (int, http.Header, string) {
-		t.Fatal("白名单外模型不应触达上游")
-		return 200, nil, ""
+	f.respond = jsonResp(200, "ok")
+	if _, err := f.st.AddAccount(model.ProviderZai, "k", "sk-abc"); err != nil {
+		t.Fatal(err)
 	}
 	body := msgBody()
 	body["model"] = "glm-5.2"
 	status, raw := f.post(t, body, "sk-test")
-	if status != 400 || !strings.Contains(raw, "model_not_allowed") {
-		t.Fatalf("应 400 model_not_allowed: %d %s", status, raw)
+	if status != 200 {
+		t.Fatalf("白名单移除后应放行上游: %d %s", status, raw)
 	}
-	if f.callCount() != 0 {
-		t.Fatal("上游不应被调用")
+	if f.callCount() != 1 {
+		t.Fatalf("上游应被调用一次: %d", f.callCount())
 	}
 }
 
@@ -708,11 +709,62 @@ func TestModelsEndpoint(t *testing.T) {
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		t.Fatal(err)
 	}
+	// 无账号：回退 AvailableModels 静态清单，保证端点永远可用
 	if payload.Object != "list" || len(payload.Data) != 2 {
 		t.Fatalf("模型清单不符: %s", raw)
 	}
 	if payload.Data[0].Type != "model" || payload.Data[0].DisplayName != payload.Data[0].ID {
 		t.Fatalf("模型条目不符: %+v", payload.Data[0])
+	}
+}
+
+func TestModelsEndpointFromQuotaSnapshot(t *testing.T) {
+	// 有账号且额度快照非空：/v1/models 应聚合快照中的上游真实模型（去重排序），
+	// 不再展示静态清单
+	f := newFixture(t)
+	acc, err := f.st.AddAccount(model.ProviderZai, "acc", "sk-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.Quota = map[string]map[string]any{
+			"GLM-5.4": {"model": "GLM-5.4", "remaining": float64(10)},
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(10)},
+			"glm-5.3-flash": {"model": "glm-5.3-flash", "remaining": float64(10)},
+			// 同名多订阅列（不同 key、相同 model）应去重
+			"GLM-5.3 · 活动套餐": {"model": "GLM-5.3", "remaining": float64(5)},
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, f.srv.URL+"/v1/models", nil)
+	req.Header.Set("x-api-key", "sk-test")
+	resp, err := f.srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(payload.Data))
+	for _, d := range payload.Data {
+		got = append(got, d.ID)
+	}
+	want := []string{"GLM-5.3", "GLM-5.4", "glm-5.3-flash"}
+	if len(got) != len(want) {
+		t.Fatalf("模型清单应去重为 %v: %v", want, got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("模型清单应排序为 %v: %v", want, got)
+		}
 	}
 }
 

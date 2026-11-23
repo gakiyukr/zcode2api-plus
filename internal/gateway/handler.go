@@ -43,17 +43,6 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// 入口整形一次（不含 system 注入；每账号副本内注入，见 engine.tryAccount）
 	NormalizeBody(body, false)
 
-	if !ModelAllowed(body["model"]) {
-		modelName := AnyToString(body["model"])
-		WriteJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]any{
-				"message": fmt.Sprintf("模型 %s 不在可用清單內，僅支持 %s", modelName, strings.Join(AvailableModels, ", ")),
-				"type":    "model_not_allowed",
-			},
-		})
-		return
-	}
-
 	result := h.Engine.RunMessages(r.Context(), body, IncomingHeaders(r), func(d Delivery) error {
 		return passthroughDeliver(w, d)
 	})

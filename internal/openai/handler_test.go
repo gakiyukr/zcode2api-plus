@@ -294,16 +294,11 @@ func TestChatCompletionsAuthAndWhitelist(t *testing.T) {
 		t.Fatalf("错密钥应 403: %d", code)
 	}
 
-	// 白名单外模型 400（OpenAI 错误形态）
+	// 白名单已移除：任意模型名直接转发上游（fixture 默认 respond 为 502，
+	// 只验证请求确实出站、不再本地 400）
 	code, body := f.postChat(t, "sk-test", `{"model":"gpt-4o","messages":[]}`)
-	if code != http.StatusBadRequest {
-		t.Fatalf("白名单外应 400: %d", code)
-	}
-	var payload map[string]any
-	_ = json.Unmarshal([]byte(body), &payload)
-	errObj, _ := payload["error"].(map[string]any)
-	if errObj == nil || errObj["type"] != "invalid_request_error" {
-		t.Fatalf("错误形态不符: %v", payload)
+	if code != http.StatusBadGateway {
+		t.Fatalf("白名单移除后应转发上游: %d %s", code, body)
 	}
 
 	// 非法 JSON 400

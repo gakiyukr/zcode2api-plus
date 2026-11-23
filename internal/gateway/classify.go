@@ -10,8 +10,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	"zcode2api/internal/model"
 )
 
 const (
@@ -25,27 +23,14 @@ const (
 // 账号仍然可用，不能把模型准入限制写成账号 cooling。
 var startPlanBusyRetryDelays = []time.Duration{time.Second, 2 * time.Second}
 
-// ModelNameMap Z.AI 上游模型名大小写敏感；仅映射开放清单内的模型，
-// 其余写法本就会被白名单拒绝，无需维护映射。
+// ModelNameMap Z.AI 上游模型名大小写敏感；映射已知写法（幂等，NormalizeBody
+// 应用），未命中时原样放行——模型准入交由上游裁决，本地不再设白名单。
 var ModelNameMap = map[string]string{
 	"glm-5.3": "GLM-5.3",
 }
 
-// AvailableModels 对外公布的可用模型（/v1/models 与请求白名单）。
+// AvailableModels /v1/models 端点对外展示的默认模型（仅供参考，不参与请求校验）。
 var AvailableModels = []string{"glm-5.3-flash", "GLM-5.3"}
-
-var allowedModels = func() map[string]bool {
-	set := map[string]bool{}
-	for _, name := range AvailableModels {
-		set[model.NormalizeModelName(name)] = true
-	}
-	return set
-}()
-
-// ModelAllowed 请求模型必须在对外清单内才允许转发上游。
-func ModelAllowed(m any) bool {
-	return allowedModels[model.NormalizeModelName(m)]
-}
 
 // quotaExhaustedCodes Z.AI 官方 429 业务码中的额度/用量上限族（docs.z.ai 错误码表）：
 // 1113 欠费；1308 用量上限；1309 套餐过期；1310 周/月上限；1311 套餐不含此模型；

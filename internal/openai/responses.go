@@ -359,12 +359,6 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
-	if !gateway.ModelAllowed(anthropicReq["model"]) {
-		writeError(w, http.StatusBadRequest,
-			"模型 "+gateway.AnyToString(anthropicReq["model"])+" 不在可用清單內，僅支持 "+
-				strings.Join(gateway.AvailableModels, ", "), "invalid_request_error")
-		return
-	}
 	gateway.NormalizeBody(anthropicReq, false)
 
 	stream, _ := body["stream"].(bool)

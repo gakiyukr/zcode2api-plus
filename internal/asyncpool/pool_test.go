@@ -316,11 +316,13 @@ func TestAsyncDisabledReturns503(t *testing.T) {
 	}
 }
 
-func TestMessagesRejectsModelOutsideWhitelist(t *testing.T) {
-	// 入口端點必須在建票前擋下白名單外的模型，不得轉發上游。
-	p, st, _, _ := newTestPool(t)
+func TestMessagesAcceptsAnyModelName(t *testing.T) {
+	// 白名单已移除：任意模型名均建票，准入由上游裁决。
+	p, st, _, solver := newTestPool(t)
+	addJWTAccount(t, st, "async-acc") // 无账号会先报 no_account，需提供可用账号
 	srv := newTestMux(t, p)
 	_ = st.SetSetting("gateway_key", "sk-test")
+	solver.err = errors.New("browser down") // 后台任务走 captcha_required 失败路径
 
 	oldEnabled := config.AsyncEnabled
 	config.AsyncEnabled = true
@@ -334,20 +336,15 @@ func TestMessagesRejectsModelOutsideWhitelist(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("白名单外应 400: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("白名单移除后应建票 200: %d", resp.StatusCode)
 	}
-	var payload map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&payload)
-	errObj := payload["error"].(map[string]any)
-	if errObj["type"] != "model_not_allowed" {
-		t.Fatalf("错误类型应为 model_not_allowed: %v", payload)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
 	}
-	p.mu.Lock()
-	remaining := len(p.tickets)
-	p.mu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("不应建票: %d", remaining)
+	if !strings.HasPrefix(string(raw), "event: ticket\ndata: ") {
+		t.Fatalf("首事件应为 ticket: %q", string(raw))
 	}
 }
 
