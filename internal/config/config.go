@@ -125,10 +125,13 @@ var (
 	// ZCode 计费 / 额度查询端点（不可配置，与官方客户端一致）。
 	ZcodeBillingBase = "https://zcode.z.ai/api/v1/zcode-plan"
 
-	// ZcodeClientVersion 对齐 ZCode 3.17.2 官方客户端：上游自 2026-11-03 起
-	// 对 Start Plan 请求做版本级校验，版本头与请求形态不匹配会以 405/3012 拒绝。
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.17.2")
-	// ai-sdk/anthropic 是官方 CLI 请求 UA 的固定后缀（ZCode/3.17.2 ai-sdk/anthropic/3.0.81）。
+	// ZcodeClientVersion 對齊 ZCode 4.0.0 官方客戶端：上游對 Start Plan 請求
+	// 做版本級校驗，版本頭與請求形態不匹配會以 405/3012 拒絕。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "4.0.0")
+	// ZcodeBillingVersion 計費／額度／領取鏈使用的客戶端版本號，預設與
+	// ZcodeClientVersion 一致，必要時可獨立覆蓋。
+	ZcodeBillingVersion = env("ZCODE_BILLING_VERSION", ZcodeClientVersion)
+	// ai-sdk/anthropic 是官方 CLI 請求 UA 的固定後綴（ZCode/4.0.0 ai-sdk/anthropic/3.0.81）。
 	ZcodeSDKVersion = env("ZCODE_SDK_VERSION", "3.0.81")
 	// ZcodeClientPlatform 对齐官方 X-Platform（Node 的 process.platform-arch）。
 	ZcodeClientPlatform = env("ZCODE_CLIENT_PLATFORM", ClientPlatform())
@@ -148,6 +151,15 @@ var (
 	// RestrictedCooldownSeconds 上游风控 3012 拒绝后的账号冷却时长（账号级限制，
 	// 官方 App 同样被拒；magpie 观察为持续性限制，30 分钟后重试探测）。
 	RestrictedCooldownSeconds = envInt("ZCODE_RESTRICTED_COOLDOWN", 1800)
+
+	// Start Plan 併發閘門與預防性忙線熔斷（對齊 magpie zcode 0.1.56~0.1.71）。
+	StartPlanAccountConcurrency = max(1, envInt("ZCODE_START_ACCOUNT_CONCURRENCY", 3))
+	StartPlanAddressConcurrency = max(1, envInt("ZCODE_START_ADDRESS_CONCURRENCY", 6))
+	StartPlanGateWaitSeconds    = max(5, envInt("ZCODE_START_GATE_WAIT_SECONDS", 120))
+	StartPlanBusyHoldSeconds    = max(10, envInt("ZCODE_START_BUSY_HOLD_SECONDS", 180))
+
+	// ClaimRefreshInterval 背景套餐補領輪詢間隔（秒，預設 30 分鐘；0 表示關閉）。
+	ClaimRefreshInterval = max(0, envInt("ZCODE_CLAIM_REFRESH_INTERVAL", 1800))
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
 	AppVersion = "2.2.0-go"
@@ -240,4 +252,3 @@ func DeviceMid() string {
 }
 
 // newUUID 生成 UUIDv4（不引入第三方依赖）。
-
