@@ -18,10 +18,12 @@ import (
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/claim"
 	"zcode2api/internal/config"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/model"
 	"zcode2api/internal/oauth"
 	"zcode2api/internal/quota"
 	"zcode2api/internal/store"
+	"zcode2api/internal/util"
 	"zcode2api/internal/web"
 )
 
@@ -38,6 +40,7 @@ const cliUsage = `ZCode2api (Go)
   zcode2api status                     查看配置概览
   zcode2api prefetch-browser           预下载验证码用的补丁 Chromium（约 200MB）
   zcode2api set-admin-key <key>        设置后台密码
+  zcode2api fingerprint-salt <account> [salt]  旋转账号设备指纹（缺省随机）
   zcode2api export [file]              导出账号
   zcode2api import <file>              导入账号
 `
@@ -70,6 +73,8 @@ func runCLI(cmd string, rest []string, serveFn func() error) int {
 		return cmdRemoveAccount(rest)
 	case "set-admin-key":
 		return cmdSetAdminKey(rest)
+	case "fingerprint-salt":
+		return cmdFingerprintSalt(rest)
 	case "status":
 		return cmdStatus()
 	case "prefetch-browser":
@@ -124,6 +129,7 @@ func openStore() *store.Store {
 		web.Err("cli", "存储初始化失败: "+err.Error())
 		os.Exit(1)
 	}
+	fingerprint.SetSaltResolver(st.FingerprintSalt)
 	printGeneratedKeys(st)
 	return st
 }
@@ -312,6 +318,34 @@ func cmdRemoveAccount(args []string) int {
 	}
 	fmt.Println(web.Yellow + "⚠️ 未找到指定账号" + web.Reset)
 	return 1
+}
+
+func cmdFingerprintSalt(args []string) int {
+	if len(args) == 0 {
+		fmt.Println(web.Red + "格式: zcode2api fingerprint-salt <account> [salt]" + web.Reset)
+		return 1
+	}
+	st := openStore()
+	defer func() { _ = st.Close() }()
+	acc := st.FindAny(args[0])
+	if acc == nil {
+		fmt.Println(web.Red + "❌ 账号不存在: " + args[0] + web.Reset)
+		return 1
+	}
+	salt := ""
+	if len(args) > 1 {
+		salt = strings.TrimSpace(args[1])
+	}
+	if salt == "" {
+		salt = util.RandomHex(8)
+	}
+	if err := st.SetSetting("fingerprint_salt:"+acc.ID, salt); err != nil {
+		fmt.Println(web.Red + "❌ 更新失败: " + err.Error() + web.Reset)
+		return 1
+	}
+	fmt.Printf("%s✔ 帳號 %s 的設備指紋已旋轉（salt=%s）；重新啟動 serve 後生效%s\n",
+		web.Green, acc.Name, salt, web.Reset)
+	return 0
 }
 
 func cmdSetAdminKey(args []string) int {
