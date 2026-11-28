@@ -1021,7 +1021,7 @@ func TestAsyncPoolRetriesConcurrencyLimit(t *testing.T) {
 	}
 
 	// 透過額外佔用 acc1 與 acc2 各 1 條槽位（令兩者最小在飛數相等以按輪詢先選 acc1），
-	// 並於短暫延遲後釋放 acc1 槽位，驗證第二次 3008 會觸發收窄並隊首重排成功
+	// 並於短暫延遲後釋放 acc1 槽位，驗證第二次 3008 收窄後會換到下一個帳號成功
 	extraLease, err := p.Gate.Acquire(context.Background(), acc1.ID, "direct", false)
 	if err != nil {
 		t.Fatal(err)
@@ -1036,7 +1036,7 @@ func TestAsyncPoolRetriesConcurrencyLimit(t *testing.T) {
 		extraLease.Release()
 	}()
 
-	// 前兩次（首發 + 1s 同號重試）皆回 429+3008，收窄至 1 後歸還槽位並於隊首重排成功
+	// 前兩次（首發 + 同號重試）皆回 429+3008，收窄後換到第二個帳號成功
 	up := &scriptedUpstream{specs: []upstreamSpec{
 		{status: http.StatusTooManyRequests, body: `{"code":3008,"msg":"concurrency limit"}`},
 		{status: http.StatusTooManyRequests, body: `{"code":3008,"msg":"concurrency limit"}`},
@@ -1058,10 +1058,10 @@ func TestAsyncPoolRetriesConcurrencyLimit(t *testing.T) {
 		}
 	}
 	if !hasDone {
-		t.Fatalf("第二次 3008 觸發收窄重排後應成功完成: %+v", events)
+		t.Fatalf("第二次 3008 收窄後換號應成功完成: %+v", events)
 	}
 	if up.callCount() != 3 {
-		t.Fatalf("應呼叫上游 3 次（首發 + 同號重試 + 隊首重排），實際: %d", up.callCount())
+		t.Fatalf("應呼叫上游 3 次（首發 + 同號重試 + 換號），實際: %d", up.callCount())
 	}
 	// acc1 在途 2 條遇 retryAttempt=1 → 閘門上限必須收窄至 1
 	if gotCap := p.Gate.AccountCap(acc1.ID); gotCap != 1 {
@@ -1069,37 +1069,30 @@ func TestAsyncPoolRetriesConcurrencyLimit(t *testing.T) {
 	}
 }
 
-func TestProcessTicket_GateRequeue(t *testing.T) {
-	// 單帳號池情境：觸發 3008 收窄時應在同帳號歸還租約並隊首重排，不得標記 tried 誤報 no_account
+func TestProcessTicket_ConcurrencyLimitSwitchesAccount(t *testing.T) {
+	// 單帳號併發拒答不得停掉整個流程；有第二個帳號時應換號成功。
 	p, st, _, _ := newTestPool(t)
 	p.BusyRetryDelay = time.Millisecond
 	config.AsyncMaxRetries = 0
-	acc, err := st.AddAccount(model.ProviderZai, "solo-acc", "h1.p1.s1")
-	if err != nil {
+	if _, err := st.AddAccount(model.ProviderZai, "switch-1", "h1.p1.s1"); err != nil {
 		t.Fatal(err)
 	}
-
-	extraLease, err := p.Gate.Acquire(context.Background(), acc.ID, "direct", false)
-	if err != nil {
+	if _, err := st.AddAccount(model.ProviderZai, "switch-2", "h2.p2.s2"); err != nil {
 		t.Fatal(err)
 	}
-	go func() {
-		time.Sleep(30 * time.Millisecond)
-		extraLease.Release()
-	}()
 
 	up := &scriptedUpstream{specs: []upstreamSpec{
 		{status: http.StatusTooManyRequests, body: `{"code":3008,"msg":"concurrency limit"}`},
 		{status: http.StatusTooManyRequests, body: `{"code":3008,"msg":"concurrency limit"}`},
-		{status: http.StatusOK, lines: []string{`data: {"id":"solo-ok"}`, `data: [DONE]`}},
+		{status: http.StatusOK, lines: []string{`data: {"id":"switch-ok"}`, `data: [DONE]`}},
 	}}
 	config.UpstreamZai = up.start(t).URL
 
-	tk := insertTicket(p, "ticket-solo-requeue", map[string]any{
+	tk := insertTicket(p, "ticket-switch", map[string]any{
 		"model":    "GLM-5.4",
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	})
-	p.processTicket(context.Background(), "ticket-solo-requeue")
+	p.processTicket(context.Background(), "ticket-switch")
 
 	events := drainEvents(tk)
 	hasDone := false
@@ -1109,7 +1102,7 @@ func TestProcessTicket_GateRequeue(t *testing.T) {
 		}
 	}
 	if !hasDone {
-		t.Fatalf("單帳號池收窄隊首重排應成功而非誤報 no_account，實際事件: %+v", events)
+		t.Fatalf("第二個帳號應成功交付: %+v", events)
 	}
 	if up.callCount() != 3 {
 		t.Fatalf("應呼叫上游 3 次，實際: %d", up.callCount())

@@ -318,6 +318,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 	announcedReady := false
 	tried := map[string]bool{}
 	edgeBlocked := false
+	concurrencyRefused := false
 	bare429Count := 0
 	var firstBare429Acc *model.Account
 
@@ -341,9 +342,6 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 					return false
 				}
 				if p.Gate != nil {
-					if held, _ := p.Gate.BusyHeld(ak); held {
-						return false
-					}
 					if p.Gate.AccountInFlight(cand.ID) >= p.Gate.AccountCap(cand.ID) {
 						return false
 					}
@@ -352,9 +350,12 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 			},
 		})
 		if acc == nil {
-			if edgeBlocked {
+			switch {
+			case edgeBlocked:
 				p.emitError(ctx, ticketID, "上游邊緣防火牆已封鎖目前出口，稍後自動恢復", "upstream_edge_blocked")
-			} else {
+			case concurrencyRefused:
+				p.emitError(ctx, ticketID, "所有可用帳號目前均遭遇上游併發限制，請稍後重試", "upstream_rate_limit")
+			default:
 				p.emitError(ctx, ticketID, "无可用 OAuth 账号", "no_account")
 			}
 			return
@@ -372,22 +373,17 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 
 		networkRetry := false
 		immediateSwitch := false
+		concurrencySwitch := false
 		lastNetworkError := ""
 
-		// 單帳號外層處理 Start Plan 閘門與自適應收窄隊首重排（對齊 engine.tryAccount），
-		// 避免單帳號池收窄時直接換號誤報 no_account。
-		for requeueCount := 0; requeueCount <= gateway.MaxGateRequeue; requeueCount++ {
+		// 單帳號外層處理 Start Plan 閘門；併發拒答只收窄上限，不再同帳號隊首重排。
+		for range 1 {
 			var lease *gateway.GateLease
 			if p.Gate != nil {
 				var err error
-				lease, err = p.Gate.Acquire(ctx, acc.ID, addrKey, requeueCount > 0)
+				lease, err = p.Gate.Acquire(ctx, acc.ID, addrKey, false)
 				if err != nil {
 					if ctx.Err() != nil {
-						return
-					}
-					var holdErr *gateway.BusyHoldError
-					if errors.As(err, &holdErr) {
-						p.emitError(ctx, ticketID, holdErr.Error(), "start_plan_busy_hold")
 						return
 					}
 					p.emitError(ctx, ticketID, err.Error(), "rate_limit_error")
@@ -395,7 +391,6 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				}
 			}
 
-			requeueGate := false
 			captchaAttempt := 0
 			busyAttempt := 0
 			forceCaptcha := false
@@ -462,7 +457,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 					announcedReady = true
 				}
 
-				midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, addrKey, modelName, busyAttempt, requeueCount, toolSearchRenamed, skippedCaptcha, req, payload)
+				midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, addrKey, modelName, busyAttempt, toolSearchRenamed, skippedCaptcha, req, payload)
 				if midStream {
 					if lease != nil {
 						lease.Release()
@@ -486,12 +481,13 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 					forceCaptcha = true
 					continue
 				}
-				// 觸發自適應收窄：歸還槽位並排回同帳號隊首重試，不消耗換號次數
-				if errors.Is(streamErr, errGateRequeue) {
-					requeueGate = true
+				// 同號重試後仍被併發拒絕：換下一個帳號，只有全池輪完才回 429
+				if errors.Is(streamErr, errConcurrencyExhausted) {
+					concurrencyRefused = true
+					concurrencySwitch = true
 					break
 				}
-				// 上游拒絕併發准入（3008/3009/3010）：睡眠前主動歸還閘門槽位，醒來隊首重取，避免佔槽
+				// 上游拒絕併發准入（3008/3009/3010）：睡眠前主動歸還閘門槽位，醒來同號重試，避免佔槽
 				if errors.Is(streamErr, errConcurrencyRetry) {
 					delay := p.BusyRetryDelay
 					if delay <= 0 {
@@ -508,20 +504,10 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 					case <-time.After(delay):
 					}
 					if p.Gate != nil {
-						if held, rem := p.Gate.BusyHeld(addrKey); held {
-							holdErr := &gateway.BusyHoldError{Remaining: rem}
-							p.emitError(ctx, ticketID, holdErr.Error(), "start_plan_busy_hold")
-							return
-						}
 						var acqErr error
 						lease, acqErr = p.Gate.Acquire(ctx, acc.ID, addrKey, true)
 						if acqErr != nil {
 							if ctx.Err() != nil {
-								return
-							}
-							var holdErr *gateway.BusyHoldError
-							if errors.As(acqErr, &holdErr) {
-								p.emitError(ctx, ticketID, holdErr.Error(), "start_plan_busy_hold")
 								return
 							}
 							p.emitError(ctx, ticketID, acqErr.Error(), "rate_limit_error")
@@ -616,13 +602,12 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 			if lease != nil {
 				lease.Release()
 			}
-			if requeueGate && requeueCount < gateway.MaxGateRequeue {
-				web.Warn(ticketID, fmt.Sprintf("帳號 %s 併發上限已自適應收窄，歸還槽位並排回隊首重試（第 %d 次）", acc.Name, requeueCount+1))
-				continue
-			}
 			break
 		}
 
+		if concurrencySwitch {
+			continue
+		}
 		if immediateSwitch {
 			continue
 		}
@@ -672,7 +657,6 @@ func (p *Pool) attemptUpstream(
 	addrKey string,
 	modelName string,
 	attempt int,
-	requeueCount int,
 	restoreToolSearch bool,
 	skippedCaptcha bool,
 	req upstream.Request,
@@ -786,25 +770,16 @@ func (p *Pool) attemptUpstream(
 		}
 
 		// 429 且 code∈{3008,3009,3010}：併發准入限制，帳號仍可用；首次同號延遲重試，
-		// 二次仍被拒時以 retryAttempt=1 回報閘門觸發收窄隊首重排或忙線熔斷。
+		// 二次仍被拒時以 retryAttempt=1 回報閘門觸發收窄隊首重排。
 		if gateway.IsModelConcurrencyLimit(resp.StatusCode, bodyText) {
 			if attempt == 0 {
 				return false, errConcurrencyRetry
 			}
 			if p.Gate != nil {
-				requeue, holdTriggered := p.Gate.RecordConcurrencyRefusal(acc.ID, addrKey, 1)
-				if holdTriggered {
-					_, rem := p.Gate.BusyHeld(addrKey)
-					holdErr := &gateway.BusyHoldError{Remaining: rem}
-					p.emitError(ctx, ticketID, holdErr.Error(), "start_plan_busy_hold")
-					return false, errDelivered
-				}
-				if requeue && requeueCount < gateway.MaxGateRequeue {
-					return false, errGateRequeue
-				}
+				p.Gate.RecordConcurrencyRefusal(acc.ID, addrKey, 1)
 			}
 			web.Warn(ticketID, fmt.Sprintf("帳號 %s 模型併發准入持續受限，保留帳號狀態並換號", acc.Name))
-			return false, errNetwork{bodyText}
+			return false, errConcurrencyExhausted
 		}
 
 		// 429：額度上限碼族 → 該模型耗盡；裸 429 → 交外層防雪崩止損；其餘瞬時限流 → 冷卻
@@ -941,8 +916,8 @@ func (e errBare429) Error() string { return e.body }
 // errConcurrencyRetry 上游併發准入受限（3008/3009/3010）：首次同號延遲重試。
 var errConcurrencyRetry = errors.New("上游併發准入受限重試")
 
-// errGateRequeue 閘門觸發自適應收窄，歸還槽位並排回同帳號隊首重試。
-var errGateRequeue = errors.New("閘門隊首重排重試")
+// errConcurrencyExhausted 同號重試後仍被併發拒絕：換下一個帳號，不暫停出口。
+var errConcurrencyExhausted = errors.New("上游併發准入持續受限，換號")
 
 // errDelivered 非 200 错误体已作为 error 事件投递给客户端，任务直接结束。
 var errDelivered = errors.New("已投递错误事件")
