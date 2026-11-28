@@ -51,6 +51,7 @@ zcode2api remove-account <provider> <id|name>
 zcode2api quota                      查看各賬號實時額度
 zcode2api status                     配置概覽
 zcode2api set-admin-key <key>        設置後台密碼
+zcode2api fingerprint-salt <account> [salt]  旋轉賬號設備指紋（缺省隨機）
 zcode2api export [file] / import <file>   賬號導出/導入（與 python-legacy 互通）
 ```
 
@@ -101,6 +102,9 @@ sudo ./deploy/manage.sh docker-install         # Docker（未驗證）
 | `ZCODE_CAPTCHA_BROWSER` | false | 啟用 rod 瀏覽器池自動求解 |
 | `ZCODE_CAPTCHA_BROWSER_BIN` | 自動發現 | Chromium 二進制路徑 |
 | `ZCODE_ASYNC_ENABLED` | true | 掛載 /async/v1/messages 空閒池 |
+| `ZCODE_DUAL_CREDENTIAL_DEGRADE` | false | 雙憑證賬號 Start Plan 忙線時降級 Coding Plan |
+| `ZCODE_EGRESS_PROBE_INTERVAL` | 600 | 匿名出口巡檢間隔（秒，0=關閉） |
+| `ZCODE_EGRESS_PROBE_WORKERS` | 4 | 出口巡檢併發上限 |
 
 訪客提交的邀請碼存於數據庫（後台「設置」頁可改），不走環境變量。
 
