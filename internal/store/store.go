@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,6 +65,17 @@ type Store struct {
 	// 供启动横幅提示管理者（环境变量配置时不记录）。
 	GeneratedAdminKey   string
 	GeneratedGatewayKey string
+
+	// dirty 保存「只有統計欄位變更、尚未落庫」的帳號 ID。热路径（use_count、
+	// token、fail_count）只改内存并标脏，由 flushLoop 合并成单事务；status、
+	// quota、exhausted_models 等关键状态仍走 Update 立即落库。
+	dirty map[string]struct{}
+
+	flushStop     chan struct{}
+	flushDone     chan struct{}
+	flushOnce     sync.Once
+	closeOnce     sync.Once
+	flushInterval time.Duration
 }
 
 // New 打开（必要时创建）数据库并加载快照。
@@ -73,20 +85,38 @@ func New() (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		db:       db,
-		accounts: map[string][]*model.Account{model.ProviderZai: {}},
-		settings: map[string]string{},
-		rotation: map[string]int{},
+		db:            db,
+		accounts:      map[string][]*model.Account{model.ProviderZai: {}},
+		settings:      map[string]string{},
+		rotation:      map[string]int{},
+		dirty:         map[string]struct{}{},
+		flushStop:     make(chan struct{}),
+		flushDone:     make(chan struct{}),
+		flushInterval: 2 * time.Second,
 	}
 	if err := s.init(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	go s.flushLoop()
 	return s, nil
 }
 
-// Close 关闭数据库连接。
-func (s *Store) Close() error { return s.db.Close() }
+// Close 停止批量统计落库、强制 flush 后关闭数据库。可重复调用。
+func (s *Store) Close() error {
+	var closeErr error
+	s.closeOnce.Do(func() {
+		s.flushOnce.Do(func() { close(s.flushStop) })
+		<-s.flushDone
+		if err := s.FlushStats(); err != nil {
+			closeErr = err
+		}
+		if err := s.db.Close(); err != nil {
+			closeErr = errors.Join(closeErr, err)
+		}
+	})
+	return closeErr
+}
 
 func openDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -265,7 +295,13 @@ func persistAccountExec(ex sqlExecer, acc *model.Account) error {
 }
 
 func (s *Store) persistAccountLocked(acc *model.Account) error {
-	return persistAccountExec(s.db, acc)
+	err := persistAccountExec(s.db, acc)
+	if err == nil {
+		// 完整快照已落库，旧的 dirty 标记不再需要（避免 flush 用陈旧的
+		// 内存状态覆盖刚写入的状态字段）。
+		delete(s.dirty, acc.ID)
+	}
+	return err
 }
 
 func (s *Store) deleteAccountLocked(id string) error {
@@ -372,6 +408,12 @@ func (s *Store) AdminKey() string {
 
 func (s *Store) GatewayKey() string {
 	v, _ := s.GetSetting("gateway_key")
+	return v
+}
+
+// FingerprintSalt 返回帳號的指紋旋轉 salt（meta 表可選鍵）；空字串表示未旋轉。
+func (s *Store) FingerprintSalt(accountID string) string {
+	v, _ := s.GetSetting("fingerprint_salt:" + accountID)
 	return v
 }
 
@@ -686,6 +728,47 @@ func (s *Store) ListAccounts(provider string) []*model.Account {
 	return out
 }
 
+// CollectModelNames 在锁内聚合额度快照中的模型名（去重、字典序）。
+// 不复制整个账号池；/v1/models 虽非热路径，账号池大时也能避免一次 GC 尖峰。
+func (s *Store) CollectModelNames() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := map[string]bool{}
+	out := []string{}
+	for _, acc := range s.accounts[model.ProviderZai] {
+		for _, entry := range acc.Quota {
+			name, _ := entry["model"].(string)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ResolveFlagshipAvailability 在锁内判断原模型与别名是否各自至少有一个可選账号
+// 标记 available。hasOrig 找到即提前结束，保留原 ResolveModel 的短路语义。
+func (s *Store) ResolveFlagshipAvailability(modelName, alias string, now time.Time) (hasOrig, hasAlias bool) {
+	now = now.Round(0)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.accounts[model.ProviderZai] {
+		if !a.IsSelectable(now) {
+			continue
+		}
+		if a.ModelAvailability(modelName) == "available" {
+			return true, hasAlias
+		}
+		if a.ModelAvailability(alias) == "available" {
+			hasAlias = true
+		}
+	}
+	return false, hasAlias
+}
+
 // Find 按 provider + id/名称 查找账号，返回深拷贝（nil 表示不存在）。
 func (s *Store) Find(provider, idOrName string) *model.Account {
 	s.mu.Lock()
@@ -713,6 +796,18 @@ func (s *Store) findAnyLocked(idOrName string) *model.Account {
 	for _, p := range Providers {
 		for _, a := range s.accounts[p] {
 			if a.ID == idOrName {
+				return a
+			}
+		}
+	}
+	return nil
+}
+
+// findByIDLocked 只按账号 ID 查找，避免名称恰好等于另一个 ID 时误命中。
+func (s *Store) findByIDLocked(id string) *model.Account {
+	for _, p := range Providers {
+		for _, a := range s.accounts[p] {
+			if a.ID == id {
 				return a
 			}
 		}
@@ -787,7 +882,98 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 		}
 	}
 	s.accounts[provider] = remaining
+	delete(s.dirty, target.ID)
 	return true, nil
+}
+
+// UpdateStats 在锁内执行一次仅统计字段的修改，并标记为待批量落库。
+//
+// fn 返回 true 表示本次修改含关键状态（如 cooling/exhausted → active），
+// 必须立即落库；返回 false 时只改内存，由 flushLoop 合并进单事务。
+// 调用方不得在 fn 内修改 status、quota、exhausted_models 等关键字段却返回 false。
+func (s *Store) UpdateStats(provider, id string, fn func(acc *model.Account) bool) error {
+	var failed error
+	ok := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		acc := s.findLocked(provider, id)
+		if acc == nil {
+			return false
+		}
+		persistNow := fn(acc)
+		if persistNow {
+			failed = s.persistAccountLocked(acc)
+			return true
+		}
+		s.dirty[acc.ID] = struct{}{}
+		return true
+	}()
+
+	if !ok {
+		return ErrNotFound
+	}
+	if failed != nil {
+		logPersistFailure("stats", provider+"/"+id, failed)
+	}
+	return failed
+}
+
+// FlushStats 把当前 dirty 集合合并进单个 SQLite 事务。
+// 锁序固定为 s.mu → 数据库连接；每次最多处理 128 个账号，避免持锁过久。
+func (s *Store) FlushStats() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.dirty) == 0 {
+		return nil
+	}
+
+	ids := make([]string, 0, min(len(s.dirty), 128))
+	for id := range s.dirty {
+		ids = append(ids, id)
+		if len(ids) >= 128 {
+			break
+		}
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		acc := s.findByIDLocked(id)
+		if acc == nil {
+			// 账号已被并发删除；直接丢弃脏标记，绝不能复活。
+			continue
+		}
+		if err := persistAccountExec(tx, acc); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		delete(s.dirty, id)
+	}
+	return nil
+}
+
+// flushLoop 周期性把统计变更合并落库；Close 会先停循环再做最终 flush。
+func (s *Store) flushLoop() {
+	ticker := time.NewTicker(s.flushInterval)
+	defer ticker.Stop()
+	defer close(s.flushDone)
+	for {
+		select {
+		case <-s.flushStop:
+			return
+		case <-ticker.C:
+			if err := s.FlushStats(); err != nil {
+				logPersistFailure("stats", "batch", err)
+			}
+		}
+	}
 }
 
 // Update 在锁内对指定账号执行修改并持久化。

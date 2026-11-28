@@ -780,3 +780,153 @@ func TestSelectSmart_LeastInflightAndUrgentPromo(t *testing.T) {
 		t.Fatalf("CanStick=false 滿載時應自動溢出至最優候選 urgent，實際: %+v", got)
 	}
 }
+
+func TestUpdateStatsBatchesAndPersists(t *testing.T) {
+	s := openAt(t, filepath.Join(t.TempDir(), "stats.db"))
+	acc, err := s.AddAccount(model.ProviderZai, "stats", "sk-stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := s.UpdateStats(acc.Provider, acc.ID, func(a *model.Account) bool {
+			a.UseCount++
+			a.TotalInputTokens += 10
+			return false
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(s.dirty) != 1 {
+		t.Fatalf("統計更新應合併為一個 dirty 條目: %v", s.dirty)
+	}
+	if err := s.FlushStats(); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.dirty) != 0 {
+		t.Fatalf("flush 後 dirty 應清空: %v", s.dirty)
+	}
+
+	// 直接重開同一個 DB，確認統計確實落盤而非只存在記憶體。
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got := reopened.Find(model.ProviderZai, acc.ID)
+	if got == nil {
+		t.Fatal("重開後找不到帳號")
+	}
+	if got.UseCount != 3 || got.TotalInputTokens != 30 {
+		t.Fatalf("統計未持久化: use=%d tokens=%d", got.UseCount, got.TotalInputTokens)
+	}
+}
+
+func TestCloseFlushesPendingStats(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "close-stats.db")
+	s := openAt(t, path)
+	acc, err := s.AddAccount(model.ProviderZai, "close-stats", "sk-close")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateStats(acc.Provider, acc.ID, func(a *model.Account) bool {
+		a.UseCount = 7
+		a.TotalOutputTokens = 70
+		return false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := openAt(t, path)
+	got := reopened.Find(model.ProviderZai, acc.ID)
+	if got == nil {
+		t.Fatal("重開後找不到帳號")
+	}
+	if got.UseCount != 7 || got.TotalOutputTokens != 70 {
+		t.Fatalf("Close 未 flush 統計: use=%d tokens=%d", got.UseCount, got.TotalOutputTokens)
+	}
+}
+
+func TestStatusUpdateClearsDirty(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "dirty", "sk-dirty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateStats(acc.Provider, acc.ID, func(a *model.Account) bool {
+		a.FailCount++
+		return false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.dirty) != 1 {
+		t.Fatalf("應有 dirty 標記: %v", s.dirty)
+	}
+	if err := s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.Status = model.StatusCooling
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.dirty) != 0 {
+		t.Fatalf("完整快照落庫後應清除 dirty: %v", s.dirty)
+	}
+}
+
+func TestCollectModelNamesAndFlagshipAvailability(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "models", "sk-models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.Quota = map[string]map[string]any{
+			"glm":   {"model": "GLM-5.3", "remaining": float64(10)},
+			"flash": {"model": "GLM-5.3-Flash", "remaining": float64(5)},
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	names := s.CollectModelNames()
+	if len(names) != 2 || names[0] != "GLM-5.3" || names[1] != "GLM-5.3-Flash" {
+		t.Fatalf("模型清單不符: %v", names)
+	}
+	hasOrig, hasAlias := s.ResolveFlagshipAvailability("GLM-5.3", "GLM-5.4", time.Now())
+	if !hasOrig || hasAlias {
+		t.Fatalf("應只有原模型可用: orig=%v alias=%v", hasOrig, hasAlias)
+	}
+}
+
+func TestUpdateStatsConcurrent(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "concurrent-stats", "sk-concurrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				_ = s.UpdateStats(acc.Provider, acc.ID, func(a *model.Account) bool {
+					a.UseCount++
+					return false
+				})
+			}
+		}()
+	}
+	wg.Wait()
+	if err := s.FlushStats(); err != nil {
+		t.Fatal(err)
+	}
+	got := s.Find(model.ProviderZai, acc.ID)
+	if got.UseCount != 800 {
+		t.Fatalf("併發統計遺失: %d", got.UseCount)
+	}
+}
