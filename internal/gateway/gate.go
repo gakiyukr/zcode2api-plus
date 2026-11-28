@@ -13,11 +13,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/egress"
 	"zcode2api/internal/model"
 )
 
@@ -138,12 +138,7 @@ var DefaultStartGate = NewStartPlanGate()
 
 // AddressKeyFor 取得帳號對應的出口地址鍵：有設定 proxy_url 則以代理為分桶，否則歸入 "direct"。
 func AddressKeyFor(acc *model.Account) string {
-	if acc != nil && acc.ProxyURL != nil {
-		if u := strings.TrimSpace(*acc.ProxyURL); u != "" {
-			return u
-		}
-	}
-	return "direct"
+	return egress.AccountKey(acc)
 }
 
 // GateLease 代表一次已取得的雙層槽位租約；使用完畢後必須呼叫 Release。
