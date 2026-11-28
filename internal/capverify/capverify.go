@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -87,13 +88,14 @@ func (c *Client) Verify(ctx context.Context, cfg Config, token string) error {
 	if !cfg.Enabled() {
 		return ErrNotConfigured
 	}
-	if strings.TrimSpace(token) == "" {
+	token = strings.TrimSpace(token)
+	if token == "" {
 		return ErrInvalidToken
 	}
 
 	url := strings.TrimSuffix(cfg.Endpoint(), "/") + "/siteverify"
 	body, err := json.Marshal(map[string]string{
-		"secret":   cfg.Secret,
+		"secret":   strings.TrimSpace(cfg.Secret),
 		"response": token,
 	})
 	if err != nil {
@@ -122,7 +124,7 @@ func (c *Client) Verify(ctx context.Context, cfg Config, token string) error {
 	var out struct {
 		Success bool `json:"success"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&out); err != nil {
 		return fmt.Errorf("解析校验结果失败: %w", err)
 	}
 	if !out.Success {

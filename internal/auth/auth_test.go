@@ -284,3 +284,79 @@ func TestGuestCountsSweepDropsStaleDays(t *testing.T) {
 		t.Fatalf("过期条目应被清理，实际剩 %d 条", remaining)
 	}
 }
+
+func TestAuth_SweepTTL(t *testing.T) {
+	svc := New(openStore(t))
+	now := time.Now()
+	expired := now.Add(-2 * time.Hour)
+
+	svc.mu.Lock()
+	for i := 0; i < 100; i++ {
+		svc.failures[fmt.Sprintf("192.0.2.%d", i)] = []time.Time{expired}
+		svc.guestFailures[fmt.Sprintf("198.51.100.%d", i)] = []time.Time{expired}
+		svc.guestCounts[fmt.Sprintf("203.0.113.%d", i)] = guestCount{day: "2000-01-01", used: 1}
+	}
+	for i := 0; i < 10; i++ {
+		svc.failures[fmt.Sprintf("10.0.0.%d", i)] = []time.Time{now}
+		svc.guestFailures[fmt.Sprintf("10.0.1.%d", i)] = []time.Time{now}
+		svc.guestCounts[fmt.Sprintf("10.0.2.%d", i)] = guestCount{day: now.Format("2006-01-02"), used: 1}
+	}
+	svc.sweepAllLocked(now, now.Format("2006-01-02"))
+	fLen := len(svc.failures)
+	gfLen := len(svc.guestFailures)
+	gcLen := len(svc.guestCounts)
+	svc.mu.Unlock()
+
+	if fLen != 10 || gfLen != 10 || gcLen != 10 {
+		t.Fatalf("過期條目應被全數清理僅剩 10 條，實際 failures=%d guestFailures=%d guestCounts=%d", fLen, gfLen, gcLen)
+	}
+}
+
+func TestAuth_HardCapOnTrackedHosts(t *testing.T) {
+	st := openStore(t)
+	svc := New(st)
+	if err := svc.SetInviteCode("secret-invite"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 透過真實 HTTP 公開入口發送 maxTrackedHosts+100 個不同 IPv6 錯誤憑證請求
+	for i := 0; i < maxTrackedHosts+100; i++ {
+		addr := fmt.Sprintf("[2001:db8::%x]:1234", i)
+		ar := adminReq("wrong-admin")
+		ar.RemoteAddr = addr
+		if e := svc.VerifyAdminKey(ar); e == nil || e.Status != http.StatusUnauthorized {
+			t.Fatalf("第 %d 次錯誤 admin 請求應回 401，實際: %+v", i, e)
+		}
+
+		gr := guestReq("wrong-invite", addr)
+		if e := svc.VerifyInvite(gr); e == nil || e.Status != http.StatusForbidden {
+			t.Fatalf("第 %d 次錯誤邀請碼請求應回 403，實際: %+v", i, e)
+		}
+	}
+
+	svc.mu.Lock()
+	fLen := len(svc.failures)
+	gfLen := len(svc.guestFailures)
+	svc.mu.Unlock()
+	if fLen > maxTrackedHosts {
+		t.Fatalf("failures 應受硬上限 %d 封頂，實際: %d", maxTrackedHosts, fLen)
+	}
+	if gfLen > maxTrackedHosts {
+		t.Fatalf("guestFailures 應受硬上限 %d 封頂，實際: %d", maxTrackedHosts, gfLen)
+	}
+
+	// 表滿後新攻擊 IP 仍必須被計次並於第 maxFailures+1 次觸發 429，防止無限爆破
+	attacker := "[2001:db8:ffff::1]:1234"
+	for i := 0; i < maxFailures; i++ {
+		r := adminReq("wrong-admin")
+		r.RemoteAddr = attacker
+		if e := svc.VerifyAdminKey(r); e == nil || e.Status != http.StatusUnauthorized {
+			t.Fatalf("攻擊者第 %d 次應回 401，實際: %+v", i+1, e)
+		}
+	}
+	r := adminReq("wrong-admin")
+	r.RemoteAddr = attacker
+	if e := svc.VerifyAdminKey(r); e == nil || e.Status != http.StatusTooManyRequests {
+		t.Fatalf("表滿後新攻擊 IP 第 %d 次仍應觸發 429，實際: %+v", maxFailures+1, e)
+	}
+}

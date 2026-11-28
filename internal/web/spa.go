@@ -44,6 +44,10 @@ func (s *SPA) Register(mux *http.ServeMux) {
 
 // handleIndex 返回 SPA 入口页；no-store 确保发版后立即取到新 index.html。
 func (s *SPA) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if s.dist == nil {
+		http.Error(w, "管理後台尚未建置：缺少 frontend/dist，請先執行 npm run build", http.StatusNotFound)
+		return
+	}
 	data, err := fs.ReadFile(s.dist, "index.html")
 	if err != nil {
 		http.Error(w, "管理後台尚未建置：缺少 frontend/dist，請先執行 npm run build", http.StatusNotFound)

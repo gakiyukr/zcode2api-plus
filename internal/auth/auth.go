@@ -34,8 +34,9 @@ const (
 type Service struct {
 	Store *store.Store
 
-	mu       sync.Mutex
-	failures map[string][]time.Time
+	mu        sync.Mutex
+	failures  map[string][]time.Time
+	lastSweep time.Time
 
 	// guestFailures 邀请码试错的滑动窗；guestCounts 每日提交配额。
 	guestFailures map[string][]time.Time
@@ -77,42 +78,47 @@ func (s *Service) VerifyGatewayKey(r *http.Request) *AuthError {
 func (s *Service) VerifyAdminKey(r *http.Request) *AuthError {
 	host := ClientHost(r)
 	now := time.Now()
+	key := s.Store.AdminKey()
+	token := bearerToken(r)
 
+	// 在單一臨界區內原子完成「限速檢查 → 憑證比對 → 記錄/清除失敗」，消除併發 check-then-act 窗口
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	attempts := s.pruneLocked(host, now)
 	if len(attempts) >= maxFailures {
-		s.mu.Unlock()
 		return &AuthError{Status: http.StatusTooManyRequests, Message: "失败次数过多，请稍后再试"}
 	}
-	s.mu.Unlock()
-
-	key := s.Store.AdminKey()
 	if key == "" {
 		return &AuthError{Status: http.StatusUnauthorized, Message: "未配置后台密钥"}
 	}
-	token := bearerToken(r)
 	if token == "" {
-		s.recordFailure(host, now)
+		s.recordFailureLocked(host, now)
 		return &AuthError{Status: http.StatusUnauthorized, Message: "缺少鉴权凭证"}
 	}
 	if !hmac.Equal([]byte(token), []byte(key)) {
-		s.recordFailure(host, now)
+		s.recordFailureLocked(host, now)
 		return &AuthError{Status: http.StatusUnauthorized, Message: "鉴权凭证无效"}
 	}
 
-	s.mu.Lock()
 	delete(s.failures, host)
-	s.mu.Unlock()
 	return nil
 }
 
 func (s *Service) pruneLocked(host string, now time.Time) []time.Time {
-	attempts := s.failures[host]
+	attempts, ok := s.failures[host]
+	if !ok {
+		return nil
+	}
 	kept := attempts[:0]
 	for _, t := range attempts {
 		if now.Sub(t) <= failureWindow {
 			kept = append(kept, t)
 		}
+	}
+	if len(kept) == 0 {
+		delete(s.failures, host)
+		return nil
 	}
 	s.failures[host] = kept
 	return kept
@@ -139,9 +145,14 @@ func (s *Service) sweepLocked(now time.Time) {
 	}
 }
 
-// failureSweepThreshold 触发全表清理的条目数阈值。
-// 限速窗口内正常客户端数量远低于此值。
-const failureSweepThreshold = 4096
+// failureSweepThreshold 觸發全表清理的條目數閾值；maxTrackedHosts 為防 OOM 的來源數硬上限；
+// minSweepInterval 限制全表掃描最低間隔，防止高併發下每請求重複 O(N) 掃描。
+const (
+	failureSweepThreshold = 1024
+	sweepInterval         = 10 * time.Minute
+	maxTrackedHosts       = 4096
+	minSweepInterval      = 10 * time.Second
+)
 
 // ── 访客提交（/guest/*）─────────────────────────────────────────────────────
 //
@@ -156,7 +167,7 @@ const (
 	// guestDailyLimit 每个来源 IP 每日可提交的账号数。
 	guestDailyLimit = 3
 	// guestSweepThreshold 触发全表清理的条目数阈值。
-	guestSweepThreshold = 4096
+	guestSweepThreshold = 1024
 )
 
 // InviteCode 当前邀请码（空表示访客入口关闭）。
@@ -210,28 +221,26 @@ func (s *Service) VerifyInvite(r *http.Request) *AuthError {
 	}
 	host := ClientHost(r)
 	now := time.Now()
+	token := strings.TrimSpace(r.Header.Get("x-invite-code"))
 
+	// 在單一臨界區內原子完成「限速檢查 → 邀請碼比對 → 記錄/清除失敗」，消除併發 check-then-act 窗口
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	attempts := s.pruneGuestLocked(host, now)
 	if len(attempts) >= maxGuestFailures {
-		s.mu.Unlock()
 		return &AuthError{Status: http.StatusTooManyRequests, Message: "尝试次数过多，请稍后再试"}
 	}
-	s.mu.Unlock()
-
-	token := strings.TrimSpace(r.Header.Get("x-invite-code"))
 	if token == "" {
-		s.recordGuestFailure(host, now)
+		s.recordGuestFailureLocked(host, now)
 		return &AuthError{Status: http.StatusUnauthorized, Message: "缺少邀请码"}
 	}
 	if !hmac.Equal([]byte(token), []byte(code)) {
-		s.recordGuestFailure(host, now)
+		s.recordGuestFailureLocked(host, now)
 		return &AuthError{Status: http.StatusForbidden, Message: "邀请码无效"}
 	}
 
-	s.mu.Lock()
 	delete(s.guestFailures, host)
-	s.mu.Unlock()
 	return nil
 }
 
@@ -245,10 +254,18 @@ func (s *Service) AllowGuestSubmission(r *http.Request) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.guestCounts) >= guestSweepThreshold {
-		s.sweepGuestCountsLocked(day)
+	needSweep := len(s.guestCounts) >= guestSweepThreshold || now.Sub(s.lastSweep) > sweepInterval
+	if needSweep && now.Sub(s.lastSweep) >= minSweepInterval {
+		s.sweepAllLocked(now, day)
 	}
-	entry := s.guestCounts[host]
+	entry, exists := s.guestCounts[host]
+	if !exists && len(s.guestCounts) >= maxTrackedHosts {
+		// 達硬上限且無過期可清時，先淘汰一筆舊鍵封頂容量，避免單 IP 請求被誤拒或表無界成長
+		for k := range s.guestCounts {
+			delete(s.guestCounts, k)
+			break
+		}
+	}
 	if entry.day != day {
 		entry = guestCount{day: day}
 	}
@@ -268,24 +285,48 @@ type guestCount struct {
 }
 
 func (s *Service) pruneGuestLocked(host string, now time.Time) []time.Time {
-	attempts := s.guestFailures[host]
+	attempts, ok := s.guestFailures[host]
+	if !ok {
+		return nil
+	}
 	kept := attempts[:0]
 	for _, t := range attempts {
 		if now.Sub(t) <= failureWindow {
 			kept = append(kept, t)
 		}
 	}
+	if len(kept) == 0 {
+		delete(s.guestFailures, host)
+		return nil
+	}
 	s.guestFailures[host] = kept
 	return kept
 }
 
-func (s *Service) recordGuestFailure(host string, now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.guestFailures) >= failureSweepThreshold {
-		s.sweepGuestFailuresLocked(now)
+func (s *Service) recordGuestFailureLocked(host string, now time.Time) {
+	needSweep := len(s.guestFailures) >= guestSweepThreshold || now.Sub(s.lastSweep) > sweepInterval
+	if needSweep && now.Sub(s.lastSweep) >= minSweepInterval {
+		s.sweepAllLocked(now, now.Format("2006-01-02"))
 	}
-	s.guestFailures[host] = append(s.pruneGuestLocked(host, now), now)
+	kept := s.pruneGuestLocked(host, now)
+	if len(kept) == 0 && len(s.guestFailures) >= maxTrackedHosts {
+		// 表滿時優先淘汰一筆過期鍵，無過期鍵則淘汰一筆既有鍵，既封頂容量亦不放行新攻擊 IP
+		evicted := false
+		for k, ts := range s.guestFailures {
+			if len(ts) == 0 || now.Sub(ts[len(ts)-1]) > failureWindow {
+				delete(s.guestFailures, k)
+				evicted = true
+				break
+			}
+		}
+		if !evicted {
+			for k := range s.guestFailures {
+				delete(s.guestFailures, k)
+				break
+			}
+		}
+	}
+	s.guestFailures[host] = append(kept, now)
 }
 
 func (s *Service) sweepGuestFailuresLocked(now time.Time) {
@@ -313,13 +354,44 @@ func (s *Service) sweepGuestCountsLocked(today string) {
 	}
 }
 
+// sweepAllLocked 一次清理全部三張限速／配額表的過期條目，防止低流量下長期累積。
+func (s *Service) sweepAllLocked(now time.Time, today string) {
+	s.sweepLocked(now)
+	s.sweepGuestFailuresLocked(now)
+	s.sweepGuestCountsLocked(today)
+	s.lastSweep = now
+}
+
 func (s *Service) recordFailure(host string, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.failures) >= failureSweepThreshold {
-		s.sweepLocked(now)
+	s.recordFailureLocked(host, now)
+}
+
+func (s *Service) recordFailureLocked(host string, now time.Time) {
+	needSweep := len(s.failures) >= failureSweepThreshold || now.Sub(s.lastSweep) > sweepInterval
+	if needSweep && now.Sub(s.lastSweep) >= minSweepInterval {
+		s.sweepAllLocked(now, now.Format("2006-01-02"))
 	}
-	s.failures[host] = append(s.pruneLocked(host, now), now)
+	kept := s.pruneLocked(host, now)
+	if len(kept) == 0 && len(s.failures) >= maxTrackedHosts {
+		// 表滿時優先淘汰一筆過期鍵，無過期鍵則淘汰一筆既有鍵，既封頂容量亦不放行新攻擊 IP
+		evicted := false
+		for k, ts := range s.failures {
+			if len(ts) == 0 || now.Sub(ts[len(ts)-1]) > failureWindow {
+				delete(s.failures, k)
+				evicted = true
+				break
+			}
+		}
+		if !evicted {
+			for k := range s.failures {
+				delete(s.failures, k)
+				break
+			}
+		}
+	}
+	s.failures[host] = append(kept, now)
 }
 
 // bearerToken 提取 Authorization: Bearer <token>；非 Bearer 或缺失返回空。

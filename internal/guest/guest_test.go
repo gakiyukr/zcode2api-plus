@@ -649,3 +649,41 @@ func TestConcurrentCompleteOnlyOneWins(t *testing.T) {
 		t.Fatalf("其余应全部 404，实际 %d/%d（状态码 %v）", notFound, n-1, codes)
 	}
 }
+
+func TestGuestStartFlow_NoConcurrentDuplicate(t *testing.T) {
+	h, _, _ := newTestHandler(t, http.StatusOK, `{}`)
+	if err := h.Auth.SetInviteCode("CODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	const host = "198.51.100.88:4321"
+	const workers = 50
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/guest/api/start", nil)
+			req.Header.Set("x-invite-code", "CODE")
+			req.RemoteAddr = host
+			<-start
+			h.handleStart(rec, req)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	h.mu.Lock()
+	count := 0
+	for _, gf := range h.flows {
+		if gf.host == "198.51.100.88" {
+			count++
+		}
+	}
+	h.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("50 併發對同一 host 呼叫 handleStart 後至多只能保留 1 個活躍 flow，實際: %d", count)
+	}
+}
