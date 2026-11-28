@@ -161,6 +161,15 @@ var (
 	// ClaimRefreshInterval 背景套餐補領輪詢間隔（秒，預設 30 分鐘；0 表示關閉）。
 	ClaimRefreshInterval = max(0, envInt("ZCODE_CLAIM_REFRESH_INTERVAL", 1800))
 
+	// EgressProbeInterval 匿名出口健康巡檢間隔（秒，0=關閉）；Workers 併發上限。
+	EgressProbeInterval = max(0, envInt("ZCODE_EGRESS_PROBE_INTERVAL", 600))
+	EgressProbeWorkers  = max(1, envInt("ZCODE_EGRESS_PROBE_WORKERS", 4))
+
+	// DualCredentialDegrade 允許同時具備 JWT（Start Plan）與 API Key（Coding Plan）
+	// 的帳號在 Start Plan 忙線熔斷／併發拒絕時，以同號 API Key 通道完成本次請求。
+	// 預設關閉：兩條通道的額度與錯誤碼族不同，需管理者明確開啟。
+	DualCredentialDegrade = envBool("ZCODE_DUAL_CREDENTIAL_DEGRADE", false)
+
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
 	AppVersion = "2.2.0-go"
 )
