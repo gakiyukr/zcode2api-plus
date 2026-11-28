@@ -320,7 +320,9 @@ func (p *Pool) Solve(ctx context.Context) (string, error) {
 
 	// 派发：空闲槽位必然阻塞在 reqCh 接收上，发送即完成交接；
 	// 派发后该槽位归本次请求独占，直至求解完成自行归队。
-	solveCtx, cancel := context.WithTimeout(ctx, p.requestTimeout)
+	// 超時統一由下方 reqTimer 觸發，避免雙計時器競態使 worker 以 DeadlineExceeded
+	// 提早返回而逃過 condemned 替換。
+	solveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	req := &solveReq{ctx: solveCtx, done: make(chan solveResult, 1)}
 	select {
@@ -361,7 +363,8 @@ func (p *Pool) Solve(ctx context.Context) (string, error) {
 			return res.param, nil
 		default:
 		}
-		// 判死槽位：迟到的结果由槽位丢弃，worker 由槽位关闭重建
+		// 判死槽位：先取消 solveCtx 讓 worker 儘快返回，遲到的結果由槽位丟棄並重建 worker
+		cancel()
 		req.condemned.Store(true)
 		p.abandon(req)
 		p.countTimeout()
@@ -401,10 +404,19 @@ func (p *Pool) slotLoop(g *generation, id int) {
 		default:
 		}
 
-		// worker 创建（等价 Python 的 spawn + READY 阶段）；每次尝试限时
-		fctx, fcancel := context.WithTimeout(context.Background(), p.startupTimeout)
+		// worker 建立（等價 Python 的 spawn + READY 階段）；連動 g.done 使停機時立即取消啟動／下載
+		baseCtx, baseCancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-g.done:
+				baseCancel()
+			case <-baseCtx.Done():
+			}
+		}()
+		fctx, fcancel := context.WithTimeout(baseCtx, p.startupTimeout)
 		w, err := p.factory(fctx)
 		fcancel()
+		baseCancel()
 		if err != nil {
 			if !p.factoryFailed(g, id, err) {
 				return

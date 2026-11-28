@@ -238,6 +238,17 @@ func ensureVersion(ctx context.Context, version, archiveName string) (string, er
 		_ = os.RemoveAll(tmp)
 		return "", fmt.Errorf("压缩包内未找到 %s", executableName())
 	}
+	// 若目標目錄殘留上次中斷的不完整目錄（非軟連結），先清理再原子改名
+	if info, err := os.Lstat(dir); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			_ = os.RemoveAll(tmp)
+			return "", fmt.Errorf("瀏覽器安裝目錄為軟連結，拒絕覆蓋: %s", dir)
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			_ = os.RemoveAll(tmp)
+			return "", fmt.Errorf("清理殘留瀏覽器目錄失敗: %w", err)
+		}
+	}
 	if err := os.Rename(tmp, dir); err != nil {
 		_ = os.RemoveAll(tmp)
 		return "", fmt.Errorf("安装失败: %w", err)
@@ -332,14 +343,19 @@ func extractTarGz(archive []byte, dest string) error {
 				return err
 			}
 		case tar.TypeSymlink:
-			// macOS 的 Chromium.app bundle 以符号链接组织 Framework；
-			// 丢弃它们会解出不可用的安装。链接目标须留在解包目录内。
+			// macOS 的 Chromium.app bundle 以相對符號連結組織 Framework（含合法 ../）；
+			// 允許解包目錄內的相對路徑，僅禁止絕對路徑或解析後逃逸出 dest 的連結。
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			link := filepath.Clean(hdr.Linkname)
-			if filepath.IsAbs(link) || strings.HasPrefix(link, "..") {
-				return fmt.Errorf("压缩包含非法符号链接: %s -> %s", hdr.Name, hdr.Linkname)
+			if filepath.IsAbs(hdr.Linkname) {
+				return fmt.Errorf("壓縮包含非法符號連結: %s -> %s", hdr.Name, hdr.Linkname)
+			}
+			cleanDest := filepath.Clean(dest)
+			resolved := filepath.Clean(filepath.Join(filepath.Dir(target), hdr.Linkname))
+			rel, relErr := filepath.Rel(cleanDest, resolved)
+			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("壓縮包含逃逸符號連結: %s -> %s", hdr.Name, hdr.Linkname)
 			}
 			_ = os.Remove(target) // 覆盖既有条目（重复解包时）
 			if err := os.Symlink(hdr.Linkname, target); err != nil {

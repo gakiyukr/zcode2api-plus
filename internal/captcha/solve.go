@@ -209,7 +209,7 @@ const sdkLoadTimeout = 20 * time.Second
 //
 // 这个探针只是区分「浏览器进程没了」与「页面级失败」，本身应当毫秒级返回。
 // 给 3 秒：假死的浏览器在这里被判为死亡，槽位得以重建，而不是永久卡住。
-const probeTimeout = 3 * time.Second
+var probeTimeout = 3 * time.Second
 
 // RodWorker 单个 rod 浏览器会话的求解 worker。
 // 页面内只保存求解结果，token 不落盘、不进日志。
@@ -263,16 +263,17 @@ func newRodWorker(ctx context.Context, bin string, cfg Config) (*RodWorker, erro
 		closeLauncher(l)
 		return nil, fmt.Errorf("浏览器连接失败: %w", err)
 	}
+	// 立即綁定可取消的 ctx 到 browser：確保 loadSDKPage 失敗清理或假死時 b.Close() 不會永久阻塞
+	browserCtx, browserCancel := context.WithCancel(context.Background())
+	b = b.Context(browserCtx)
+
 	page, err := loadSDKPage(ctx, b, cfg)
 	if err != nil {
+		browserCancel()
 		_ = b.Close()
 		closeLauncher(l)
 		return nil, fmt.Errorf("页面初始化失败: %w", err)
 	}
-	// 绑定一个可取消的 ctx 到 browser：Browser.Context 返回克隆，故必须
-	// 在此处替换，之后 w.browser 的所有 CDP 调用都受它约束。
-	browserCtx, browserCancel := context.WithCancel(context.Background())
-	b = b.Context(browserCtx)
 	page = page.Context(browserCtx)
 
 	return &RodWorker{
@@ -321,7 +322,9 @@ func loadSDKPage(ctx context.Context, b *rod.Browser, cfg Config) (*rod.Page, er
 func (w *RodWorker) Solve(ctx context.Context) (string, error) {
 	if w.pageDirty {
 		if err := w.reload(ctx); err != nil {
-			return "", err
+			// reload 失敗必須經 classify 判定：Chromium 崩潰時回報 ErrWorkerDead，
+			// 讓池替換死 worker，而非將其放回 idle 導致永久癱瘓
+			return "", w.classify(ctx, err)
 		}
 		w.pageDirty = false
 	}
@@ -390,13 +393,14 @@ func (w *RodWorker) classify(ctx context.Context, err error) error {
 // reload 关闭旧页面并重新加载 SDK 页面（对齐 worker_main 失败后的页面重载）。
 func (w *RodWorker) reload(ctx context.Context) error {
 	if w.page != nil {
-		_ = w.page.Close()
+		// 關閉舊頁面加有界超時：Chromium 假死時 Close 會永久阻塞
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), probeTimeout)
+		_ = w.page.Context(closeCtx).Close()
+		closeCancel()
 		w.page = nil
 	}
 	page, err := loadSDKPage(ctx, w.browser, w.cfg)
 	if err != nil {
-		// 重载失败：下一次 Solve 再试（worker 保持健康，等价 Python 的
-		// FAILED 页面重载失败后继续服务）
 		return err
 	}
 	w.page = page

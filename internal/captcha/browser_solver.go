@@ -120,8 +120,8 @@ func (s *BrowserSolver) acquirePool(ctx context.Context, cfg Config, key string)
 			s.mu.Unlock()
 			return pool, s.releaseFunc(), nil
 		}
-		// 他人正在启动同一配置：等它结束（可被 ctx 取消）后重试
-		if s.starting != nil && s.startingKey == key {
+		// 他人正在啟動池（無論同鍵或異鍵）：等它結束後重檢，避免異鍵併發覆蓋 starting 造成洩漏
+		if s.starting != nil {
 			wait := s.startDone
 			s.mu.Unlock()
 			select {
@@ -131,8 +131,8 @@ func (s *BrowserSolver) acquirePool(ctx context.Context, cfg Config, key string)
 				return nil, nil, ctx.Err()
 			}
 		}
-		// 本调用者负责启动：先在锁内完成旧池淘汰与新池登记，再出锁 Start
-		pool, err := s.preparePoolLocked(cfg, key)
+		// 本调用者负责启动：先在锁内完成旧池淘汰与新池登记，再出锁停止舊池並啟動新池
+		pool, toStop, err := s.preparePoolLocked(cfg, key)
 		if err != nil {
 			s.mu.Unlock()
 			return nil, nil, err
@@ -140,6 +140,11 @@ func (s *BrowserSolver) acquirePool(ctx context.Context, cfg Config, key string)
 		s.starting, s.startingKey, s.startDone = pool, key, make(chan struct{})
 		done := s.startDone
 		s.mu.Unlock()
+
+		// 鎖外停止舊池（Stop 最長阻塞至 shutdownTimeout）
+		for _, old := range toStop {
+			old.Stop()
+		}
 
 		// 锁外启动：最长 CaptchaBrowserStartupTimeout，期间不阻塞其他调用者
 		startErr := pool.Start()
@@ -166,34 +171,62 @@ func (s *BrowserSolver) acquirePool(ctx context.Context, cfg Config, key string)
 // releaseFunc 返回一次在途使用的归还函数。
 func (s *BrowserSolver) releaseFunc() func() {
 	return func() {
+		var retired *Pool
 		s.mu.Lock()
-		defer s.mu.Unlock()
 		s.inFlight--
-		// 最后一个归还者关闭已被淘汰的旧池
+		// 最后一个归还者取出已淘汰的旧池，鎖外關閉避免阻塞其他求解請求
 		if s.inFlight == 0 && s.retired != nil {
-			s.retired.Stop()
+			retired = s.retired
 			s.retired = nil
+		}
+		s.mu.Unlock()
+		if retired != nil {
+			retired.Stop()
 		}
 	}
 }
 
-// preparePoolLocked 在锁内淘汰旧池并为新配置建池（不启动）；调用方持锁。
-func (s *BrowserSolver) preparePoolLocked(cfg Config, key string) (*Pool, error) {
+// preparePoolLocked 在鎖內淘汰舊池並為新配置建池（不啟動）；待停止的舊池回傳給呼叫方於鎖外關閉。
+func (s *BrowserSolver) preparePoolLocked(cfg Config, key string) (*Pool, []*Pool, error) {
+	var toStop []*Pool
 	if s.pool != nil {
 		// 配置变更：有在途求解时延迟关闭（标记 retired，由最后一个归还者 Stop），
-		// 否则立即关闭（对齐 _stop_browser_pool）。
+		// 否则交由呼叫方在鎖外立即关闭（对齐 _stop_browser_pool）。
 		if s.inFlight > 0 {
 			if s.retired != nil {
-				s.retired.Stop()
+				toStop = append(toStop, s.retired)
 			}
 			s.retired = s.pool
 		} else {
-			s.pool.Stop()
+			toStop = append(toStop, s.pool)
 		}
 		s.pool = nil
 		s.poolKey = ""
 	}
-	return s.newPool(cfg), nil
+	return s.newPool(cfg), toStop, nil
+}
+
+// HibernateIfIdle 在無在途求解且非啟動中時停止閒置瀏覽器池並釋放 Chromium 進程。
+// 下次有真實需驗請求到來時，acquirePool 會自動惰性重建。
+func (s *BrowserSolver) HibernateIfIdle() bool {
+	s.mu.Lock()
+	if s.inFlight > 0 || s.starting != nil || s.pool == nil {
+		s.mu.Unlock()
+		return false
+	}
+	pool := s.pool
+	retired := s.retired
+	s.pool = nil
+	s.poolKey = ""
+	s.retired = nil
+	s.mu.Unlock()
+
+	pool.Stop()
+	if retired != nil {
+		retired.Stop()
+	}
+	web.Ok("captcha", "驗證碼瀏覽器池閒置逾時，已進入深度休眠並釋放資源")
+	return true
 }
 
 // Close 关闭浏览器池（Manager.Close 转发）。

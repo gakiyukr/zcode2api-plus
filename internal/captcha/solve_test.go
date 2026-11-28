@@ -3,12 +3,18 @@ package captcha
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/cdp"
+	"github.com/go-rod/rod/lib/proto"
 )
 
 // buildFakeBrowser 编译一个「印出 DevTools URL 后立即退出」的假浏览器。
@@ -90,5 +96,127 @@ func TestNewRodWorkerConnectFailureDoesNotPanic(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "连接失败") {
 		t.Fatalf("错误应指明连接失败: %v", err)
+	}
+}
+
+// mockCDPClient 模擬 go-rod 的底層 CDP 通道，用於不啟動真實瀏覽器的單元測試。
+type mockCDPClient struct {
+	events chan *cdp.Event
+	callFn func(ctx context.Context, sessionID, method string, params any) ([]byte, error)
+}
+
+func (m *mockCDPClient) Event() <-chan *cdp.Event { return m.events }
+
+func (m *mockCDPClient) Call(ctx context.Context, sessionID, method string, params any) ([]byte, error) {
+	return m.callFn(ctx, sessionID, method, params)
+}
+
+func TestReloadFailureReturnsErrWorkerDead(t *testing.T) {
+	origProbe := probeTimeout
+	probeTimeout = 100 * time.Millisecond
+	defer func() { probeTimeout = origProbe }()
+
+	// 模擬 Chromium 啟動連線成功後，在執行期崩潰：後續 Target.createTarget 與 Browser.getVersion 皆失敗
+	dead := false
+	mock := &mockCDPClient{
+		events: make(chan *cdp.Event),
+		callFn: func(ctx context.Context, sessionID, method string, params any) ([]byte, error) {
+			if dead {
+				return nil, errors.New("use of closed network connection")
+			}
+			return []byte(`{}`), nil
+		},
+	}
+	b := rod.New().Client(mock).NoDefaultDevice()
+	if err := b.Connect(); err != nil {
+		t.Fatalf("mock browser connect 失敗: %v", err)
+	}
+	dead = true
+
+	w := &RodWorker{
+		browser:      b,
+		pageDirty:    true,
+		solveTimeout: time.Second,
+		sdkLoadTTL:   time.Second,
+	}
+
+	_, err := w.Solve(context.Background())
+	if !errors.Is(err, ErrWorkerDead) {
+		t.Fatalf("reload 失敗且瀏覽器已死亡時應回傳 ErrWorkerDead，實際: %v", err)
+	}
+
+	// 驗證 Pool.serveLoop 收到 ErrWorkerDead 後會觸發重啟並以新 worker 完成後續請求
+	created := 0
+	p := newTestPool(t, func(ctx context.Context) (Worker, error) {
+		created++
+		if created == 1 {
+			return w, nil
+		}
+		return &scriptWorker{id: created, steps: []stepFunc{tokenStep("recovered-token")}}, nil
+	}, 1)
+	if err := p.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Solve(context.Background()); !errors.Is(err, ErrWorkerDead) {
+		t.Fatalf("首次 Solve 應回傳 ErrWorkerDead，實際: %v", err)
+	}
+	tok, err := p.Solve(context.Background())
+	if err != nil || tok != "recovered-token" {
+		t.Fatalf("替換後新 worker 應成功求解，實際: tok=%q err=%v", tok, err)
+	}
+	if st := p.StatsSnapshot(); st.WorkerRestarts < 1 {
+		t.Fatalf("Pool 應觸發 worker 重啟計數，實際: %+v", st)
+	}
+}
+
+func TestReloadPageCloseTimeout(t *testing.T) {
+	origProbe := probeTimeout
+	probeTimeout = 80 * time.Millisecond
+	defer func() { probeTimeout = origProbe }()
+
+	// 模擬假死瀏覽器：先建立一個合法頁面，之後所有關閉/重建呼叫在未取消前永久阻塞
+	pageCreated := false
+	mock := &mockCDPClient{
+		events: make(chan *cdp.Event),
+		callFn: func(ctx context.Context, sessionID, method string, params any) ([]byte, error) {
+			switch method {
+			case "Target.createTarget":
+				if !pageCreated {
+					pageCreated = true
+					return []byte(`{"targetId":"t1"}`), nil
+				}
+				return nil, errors.New("browser hung")
+			case "Target.attachToTarget":
+				return []byte(`{"sessionId":"s1"}`), nil
+			case "Page.close", "Target.closeTarget":
+				// 模擬 Chromium 假死不回應，直到 closeCtx 超時取消才返回
+				<-ctx.Done()
+				return nil, ctx.Err()
+			default:
+				return []byte(`{}`), nil
+			}
+		},
+	}
+	b := rod.New().Client(mock).NoDefaultDevice()
+	if err := b.Connect(); err != nil {
+		t.Fatalf("mock browser connect 失敗: %v", err)
+	}
+	page, err := b.Page(proto.TargetCreateTarget{})
+	if err != nil {
+		t.Fatalf("建立初始 mock page 失敗: %v", err)
+	}
+	w := &RodWorker{
+		browser: b,
+		page:    page,
+	}
+
+	start := time.Now()
+	_ = w.reload(context.Background())
+	elapsed := time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Fatalf("reload 關閉假死頁面應在 probeTimeout 內返回，實際耗時 %s", elapsed)
+	}
+	if w.page != nil {
+		t.Fatal("reload 關閉舊頁後在載入失敗時 w.page 應已清空為 nil")
 	}
 }

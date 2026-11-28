@@ -415,3 +415,64 @@ func TestBrowserSolverStartDoesNotHoldLock(t *testing.T) {
 	close(release)
 	<-first
 }
+
+func TestBrowserSolverDifferentKeyWaitsForStarting(t *testing.T) {
+	setBrowserEnabled(t, true)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var mu sync.Mutex
+	var createdRegions []string
+
+	s := NewBrowserSolver()
+	s.SetPoolFactory(func(cfg Config) *Pool {
+		mu.Lock()
+		createdRegions = append(createdRegions, cfg.Region)
+		mu.Unlock()
+		f := &scriptFactory{}
+		if cfg.Region == "cn" {
+			f.make = func(int) ([]stepFunc, error) {
+				close(firstStarted)
+				<-releaseFirst
+				return []stepFunc{tokenStep("tok-cn")}, nil
+			}
+		} else {
+			f.make = func(int) ([]stepFunc, error) {
+				return []stepFunc{tokenStep("tok-sg")}, nil
+			}
+		}
+		return newTestPool(t, f.create, 1)
+	})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := s.Solve(context.Background(), solveCfg("cn"))
+		firstDone <- err
+	}()
+	<-firstStarted
+
+	// 不同 key 的併發請求必須等待前一個啟動完成，不得在啟動中建立第二個池造成孤兒洩漏
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := s.Solve(context.Background(), solveCfg("sg"))
+		secondDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	duringCount := len(createdRegions)
+	mu.Unlock()
+	if duringCount != 1 {
+		t.Fatalf("前一個池尚未啟動完成時，異鍵請求不得併發建新池，實際建立數: %d", duringCount)
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("第一個請求應成功: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("第二個請求應在等待後完成重建並成功: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

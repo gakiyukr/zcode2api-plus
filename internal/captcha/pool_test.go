@@ -624,3 +624,71 @@ func TestPoolSlotSurvivesDispatchPhaseCancel(t *testing.T) {
 		t.Fatal("应返回非空求解结果")
 	}
 }
+
+func TestPoolSolveTimeoutTriggersCondemned(t *testing.T) {
+	// worker 遵循 solveCtx 取消：消除雙計時器競態後，超時必須由 reqTimer 統一觸發並判死替換 worker，
+	// 絕不能因 solveCtx 先於 reqTimer 到期而以 ErrSolverFailure 誤判 worker 仍健康。
+	f := &scriptFactory{make: func(n int) ([]stepFunc, error) {
+		if n == 0 {
+			return []stepFunc{slowStep(5*time.Second, "never")}, nil
+		}
+		return []stepFunc{tokenStep("fresh-after-timeout")}, nil
+	}}
+	p := newTestPool(t, f.create, 1)
+	p.requestTimeout = 80 * time.Millisecond
+	if err := p.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := p.Solve(context.Background())
+	if !errors.Is(err, ErrSolveTimeout) {
+		t.Fatalf("超時必須回報 ErrSolveTimeout，實際: %v", err)
+	}
+	tok, err := p.Solve(context.Background())
+	if err != nil || tok != "fresh-after-timeout" {
+		t.Fatalf("超時後應替換為新 worker 並求解成功: tok=%q err=%v", tok, err)
+	}
+	st := p.StatsSnapshot()
+	if st.Timeouts != 1 || st.WorkerRestarts < 1 {
+		t.Fatalf("超時必須觸發 condemned 與重啟計數，實際: %+v", st)
+	}
+}
+
+func TestSlotLoopCancelsOnPoolStop(t *testing.T) {
+	// factory 阻塞等待 fctx 取消：呼叫 Pool.Stop() 時 g.done 關閉應立刻取消啟動中的 factory
+	factoryStarted := make(chan struct{})
+	factoryCanceled := make(chan struct{})
+	var startOnce sync.Once
+	p := newTestPool(t, func(ctx context.Context) (Worker, error) {
+		startOnce.Do(func() { close(factoryStarted) })
+		<-ctx.Done()
+		select {
+		case <-factoryCanceled:
+		default:
+			close(factoryCanceled)
+		}
+		return nil, ctx.Err()
+	}, 1)
+	p.startupTimeout = 30 * time.Second
+	p.shutdownTimeout = 2 * time.Second
+
+	startErrCh := make(chan error, 1)
+	go func() {
+		startErrCh <- p.Start()
+	}()
+
+	select {
+	case <-factoryStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("factory 未啟動")
+	}
+
+	p.Stop()
+
+	select {
+	case <-factoryCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Pool.Stop 應取消正在啟動中的 factory context")
+	}
+	<-startErrCh
+}
