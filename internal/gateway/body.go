@@ -5,6 +5,7 @@ import (
 	"maps"
 	"strings"
 
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/upstream"
 )
 
@@ -22,6 +23,12 @@ func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 // NormalizeBodyFor 同 NormalizeBody，並支援傳入帳號專屬 device 與會話 ID，
 // 使 metadata.user_id 與上游 x-session-id 一致。
 func NormalizeBodyFor(body map[string]any, needsZcodeSystem bool, device, session string) map[string]any {
+	return NormalizeBodyForSKU(body, needsZcodeSystem, device, session, fingerprint.For(nil))
+}
+
+// NormalizeBodyForSKU 與 NormalizeBodyFor 相同，但使用呼叫方提供的帳號 SKU，
+// 確保 system environment 段與上游請求頭描述同一台桌面設備。
+func NormalizeBodyForSKU(body map[string]any, needsZcodeSystem bool, device, session string, sku fingerprint.SKU) map[string]any {
 	if raw, ok := body["model"].(string); ok {
 		m := raw
 		if strings.Contains(m, "/") {
@@ -33,6 +40,8 @@ func NormalizeBodyFor(body map[string]any, needsZcodeSystem bool, device, sessio
 		}
 		body["model"] = m
 	}
+
+	normalizeThinking(body)
 
 	if messages, ok := body["messages"].([]any); ok {
 		bridged := make([]any, 0, len(messages))
@@ -57,7 +66,7 @@ func NormalizeBodyFor(body map[string]any, needsZcodeSystem bool, device, sessio
 	if needsZcodeSystem {
 		// 官方形態重建：三塊 system + 日期前綴 + cache_control + metadata.user_id。
 		// 上游按官方客戶端的形態逐項校驗，外部 agent 的 system 文本併入第三塊。
-		upstream.DressSystemFor(body, device, session)
+		upstream.DressSystemForSKU(body, device, session, sku)
 	} else if strings.TrimSpace(device) != "" {
 		// API Key（Coding Plan）路徑不改動 system，僅於未帶 metadata.user_id 時補齊裝置與會話識別
 		if strings.TrimSpace(session) == "" {
@@ -74,4 +83,37 @@ func NormalizeBodyFor(body map[string]any, needsZcodeSystem bool, device, sessio
 		}
 	}
 	return body
+}
+
+// normalizeThinking 把 Anthropic/OpenAI 客戶端送來的思考參數歸一到上游接受的形態。
+// 只調整已存在的參數，不主動為一般請求注入思考；Flash 模型關閉思考會讓上游 400，
+// 因此把 thinking.type=disabled 改寫為最低檔 output_config.effort=low。
+func normalizeThinking(body map[string]any) {
+	modelName, _ := body["model"].(string)
+	if output, ok := body["output_config"].(map[string]any); ok {
+		if effort, ok := output["effort"].(string); ok {
+			if normalized := NormalizeEffort(modelName, effort); normalized != effort {
+				output["effort"] = normalized
+			}
+		}
+	}
+	if !IsFlashModel(modelName) {
+		return
+	}
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok {
+		return
+	}
+	if typ, _ := thinking["type"].(string); strings.EqualFold(typ, "disabled") {
+		delete(body, "thinking")
+		setOutputEffort(body, "low")
+	}
+}
+
+func setOutputEffort(body map[string]any, effort string) {
+	if output, ok := body["output_config"].(map[string]any); ok {
+		output["effort"] = effort
+		return
+	}
+	body["output_config"] = map[string]any{"effort": effort}
 }

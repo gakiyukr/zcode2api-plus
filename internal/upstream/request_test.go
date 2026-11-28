@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/model"
 )
 
@@ -16,10 +17,12 @@ func keyAccount() *model.Account  { return model.Create(model.ProviderZai, "t", 
 func bareAccount() *model.Account { return &model.Account{Provider: model.ProviderZai, Mode: "jwt"} }
 
 func TestBuildRequestJWT(t *testing.T) {
-	req, err := BuildRequest(jwtAccount(), "server-token", "sgp", nil)
+	acc := jwtAccount()
+	req, err := BuildRequest(acc, "server-token", "sgp", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	sku := fingerprint.For(acc)
 	if req.URL != config.UpstreamZai {
 		t.Fatalf("JWT 应走主端点: %s", req.URL)
 	}
@@ -37,9 +40,11 @@ func TestBuildRequestJWT(t *testing.T) {
 	if _, ok := h["X-Device-Mid"]; ok {
 		t.Fatal("messages 请求不应携带 X-Device-Mid")
 	}
-	// 官方新增的客户端特征头
-	if h["X-Platform"] != config.ClientPlatform() || h["X-Os-Category"] != config.OsCategory() {
-		t.Fatalf("平台头不符: %v", h)
+	// 官方新增的客户端特征头：必须与账号 SKU 同源，而非部署宿主
+	if h["X-Platform"] != sku.Platform || h["X-Os-Category"] != sku.OsCategory ||
+		h["X-Os-Version"] != sku.OsVersion || h["X-Client-Language"] != sku.Language ||
+		h["X-Client-Timezone"] != sku.Timezone {
+		t.Fatalf("平台头与账号 SKU 不符: %v vs %+v", h, sku)
 	}
 	if h["X-Title"] != "Z Code@electron" || h["X-Release-Channel"] != "production" {
 		t.Fatalf("客户端标识头不符: %v", h)
@@ -145,8 +150,8 @@ func TestClientHeadersFiltered(t *testing.T) {
 	if h["Anthropic-Version"] != "2023-06-01" {
 		t.Fatalf("客户端不得覆盖 Anthropic-Version: %q", h["Anthropic-Version"])
 	}
-	if h["X-Custom-Trace"] != "keep-me" {
-		t.Fatalf("普通透传头应保留: %v", h)
+	if _, ok := h["X-Custom-Trace"]; ok {
+		t.Fatalf("未知私有头不得透传（严格白名单）: %v", h)
 	}
 }
 
@@ -305,8 +310,8 @@ func TestDropHeadersIncludesReverseProxyHeaders(t *testing.T) {
 			t.Fatalf("反代/瀏覽器/偽造標頭 %s 應被剔除", blocked)
 		}
 	}
-	if req.Headers["X-Custom-Allowed"] != "ok" {
-		t.Fatalf("一般自訂標頭應保留: %v", req.Headers)
+	if _, ok := req.Headers["X-Custom-Allowed"]; ok {
+		t.Fatalf("未知自訂標頭不得透傳: %v", req.Headers)
 	}
 
 	// SetQueryID 應清理大小寫變體並統一寫入小寫 x-query-id
@@ -397,6 +402,60 @@ func TestAccountSessionID_SameAccountStableCrossAccountIsolated(t *testing.T) {
 	}
 	if r1.Headers["x-session-id"] == r2.Headers["x-session-id"] {
 		t.Fatalf("不同帳號的 x-session-id 應互相隔離: %q", r1.Headers["x-session-id"])
+	}
+}
+
+func TestUpstreamQueryIsStripped(t *testing.T) {
+	old := config.UpstreamZai
+	config.UpstreamZai = old + "?beta=true&trace=1"
+	t.Cleanup(func() { config.UpstreamZai = old })
+
+	req, err := BuildRequest(jwtAccount(), "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(req.URL, "?") {
+		t.Fatalf("messages 端點不應保留 query: %s", req.URL)
+	}
+}
+
+func TestDressSystemSanitizesCallerBillingLines(t *testing.T) {
+	acc := jwtAccount()
+	body := map[string]any{
+		"model": "GLM-5.4",
+		"system": "x-anthropic-billing-header: secret\n" +
+			"cc_version=9.9.9\n" +
+			"keep this business instruction",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	DressSystemForSKU(body, acc.DeviceMid(), "11111111-2222-3333-4444-555555555555", fingerprint.For(acc))
+	system := body["system"].([]any)
+	text := system[2].(map[string]any)["text"].(string)
+	if strings.Contains(text, "billing-header") || strings.Contains(text, "cc_version=") {
+		t.Fatalf("第三方計費特徵行未清洗: %q", text)
+	}
+	if !strings.Contains(text, "keep this business instruction") {
+		t.Fatalf("正常呼叫方文本被誤刪: %q", text)
+	}
+}
+
+func TestRequestAndSystemShareSKU(t *testing.T) {
+	acc := jwtAccount()
+	sku := fingerprint.For(acc)
+	req, err := BuildRequest(acc, "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Headers["X-Platform"] != sku.Platform || req.Headers["X-Os-Version"] != sku.OsVersion {
+		t.Fatalf("請求頭與 SKU 不一致: %v vs %+v", req.Headers, sku)
+	}
+
+	body := map[string]any{"model": "GLM-5.4", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}
+	DressSystemForSKU(body, acc.DeviceMid(), "11111111-2222-3333-4444-555555555555", sku)
+	system := body["system"].([]any)
+	text := system[2].(map[string]any)["text"].(string)
+	if !strings.Contains(text, sku.PlatformName+" "+sku.OsVersion+" "+sku.Arch) {
+		t.Fatalf("system environment 與請求頭 SKU 不一致: %q", text)
 	}
 }
 

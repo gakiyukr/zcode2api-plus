@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/model"
 	"zcode2api/internal/util"
 )
@@ -72,53 +73,6 @@ func ZcodePrompts() *zcodePrompts {
 	return zcodeText
 }
 
-// dropHeaders 透传客户端 header 时需要剔除的字段。官方客户端的 messages
-// 请求只带自己的头（magpie 0.1.22 验证：Claude Code 的 anthropic-beta、
-// x-app、x-stainless-* 等一概不发送，混入即触发风控），因此这里按黑名单
-// 加前缀双保险剔除 agent 特征头。
-var dropHeaders = map[string]bool{
-	"host":                           true,
-	"content-length":                 true,
-	"x-api-key":                      true,
-	"authorization":                  true,
-	"user-agent":                     true,
-	"http-referer":                   true,
-	"accept":                         true,
-	"accept-encoding":                true,
-	"connection":                     true,
-	"cookie":                         true,
-	"x-aliyun-captcha-verify-param":  true,
-	"x-aliyun-captcha-verify-region": true,
-	"anthropic-beta":                 true,
-	"x-app":                          true,
-	"x-request-id":                   true,
-	"x-session-id":                   true,
-	"x-conversation-id":              true,
-	// 官方客户端的 messages 请求不携带 X-Device-Mid：客户端伪造同样剔除，
-	// 设备身份经由 body 的 metadata.user_id 传递（见 DressSystem）
-	"x-device-mid": true,
-	"anthropic-dangerous-direct-browser-access": true,
-	"x-query-id":          true,
-	"x-forwarded-for":     true,
-	"x-real-ip":           true,
-	"forwarded":           true,
-	"via":                 true,
-	"cf-connecting-ip":    true,
-	"cf-ray":              true,
-	"cf-ipcountry":        true,
-	"true-client-ip":      true,
-	"origin":              true,
-	"proxy-authorization": true,
-}
-
-// dropHeaderPrefixes 按前缀剔除的 agent、反代與瀏覽器特徵頭（x-stainless-* 是官方 SDK
-// 的遙測頭族；x-claude-code-* / x-magpie-* 是 agent 網關的會話頭；
-// x-forwarded-* / sec-* / cf-* 為反向代理或瀏覽器頭）。
-var dropHeaderPrefixes = []string{
-	"x-stainless-", "x-claude-code-", "x-magpie-",
-	"x-forwarded-", "sec-", "cf-",
-}
-
 // Request 构造结果：目标 URL 与请求头。
 type Request struct {
 	URL     string
@@ -127,21 +81,40 @@ type Request struct {
 
 // BuildRequest 对应 Python 版 build_request：
 // JWT 账号走 zcode.z.ai 主端点（Bearer），API Key 账号走 api.z.ai 回退端点（x-api-key）。
-// verifyParam/verifyRegion 为验证码令牌（仅 JWT 账号）；incomingHeaders 为客户端透传头。
+// verifyParam/verifyRegion 为验证码令牌（仅 JWT 账号）；incomingHeaders 只用于
+// 提取会话键，不再透传任何客户端请求头（严格白名单）。
 //
-// 固定头对齐官方 3.17.2 客户端的 messages 请求（magpie startHeaders）：
+// 固定头对齐官方 4.0.0 客户端的 messages 请求（magpie startHeaders）：
 // 不携带 X-Device-Mid（该头只出现在官方的账号管理 API 上，messages 请求
 // 没有它）；设备身份经由 body 的 metadata.user_id 传递（见 DressSystem）。
 func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incomingHeaders map[string]string) (Request, error) {
+	return BuildRequestForCredential(acc, "", verifyParam, verifyRegion, incomingHeaders)
+}
+
+// BuildRequestForCredential 以指定憑證模式建構請求；credentialMode 為空時沿用
+// 帳號自身的 Mode。雙憑證降級只在同一次嘗試內覆寫模式，不修改持久化帳號。
+func BuildRequestForCredential(acc *model.Account, credentialMode, verifyParam, verifyRegion string, incomingHeaders map[string]string) (Request, error) {
 	var targetURL, authHeader, authValue string
 	if acc.Provider == model.ProviderZai {
-		if acc.Mode == "jwt" && acc.JWTToken != nil {
+		mode := acc.Mode
+		if credentialMode == "jwt" || credentialMode == "apiKey" {
+			mode = credentialMode
+		}
+		switch {
+		case mode == "jwt" && acc.JWTToken != nil:
 			targetURL = config.UpstreamZai
 			authHeader, authValue = "Authorization", "Bearer "+*acc.JWTToken
-		} else if acc.APIKey != nil {
+		case mode == "apiKey" && acc.APIKey != nil:
 			targetURL = config.UpstreamZaiFallback
 			authHeader, authValue = "x-api-key", *acc.APIKey
-		} else {
+		case acc.JWTToken != nil:
+			// 指定模式缺少憑證時退回帳號既有憑證，避免一次降級失敗讓請求直接中斷。
+			targetURL = config.UpstreamZai
+			authHeader, authValue = "Authorization", "Bearer "+*acc.JWTToken
+		case acc.APIKey != nil:
+			targetURL = config.UpstreamZaiFallback
+			authHeader, authValue = "x-api-key", *acc.APIKey
+		default:
 			return Request{}, errors.New("账号缺少有效凭证")
 		}
 	} else {
@@ -150,6 +123,7 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 
 	device := accountDeviceMid(acc)
 	sessionID := AccountSessionID(incomingHeaders, device)
+	sku := fingerprint.For(acc)
 
 	// 固定頭一律用 Go 的規範化形式（或明確小寫鍵），並於透傳客戶端頭之後寫回。
 	// X-Title 對齊 ZCode 桌面端（Z Code@electron，magpie 0.1.55 實證）；
@@ -164,18 +138,16 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 		"HTTP-Referer":         "https://zcode.z.ai",
 		"X-Title":              "Z Code@electron",
 		"X-Release-Channel":    "production",
-		"X-Client-Language":    config.ClientLanguage,
-		"X-Client-Timezone":    config.ClientTimezone,
-		"X-Platform":           config.ClientPlatform(),
-		"X-Os-Category":        config.OsCategory(),
+		"X-Client-Language":    sku.Language,
+		"X-Client-Timezone":    sku.Timezone,
+		"X-Platform":           sku.Platform,
+		"X-Os-Category":        sku.OsCategory,
+		"X-Os-Version":         sku.OsVersion,
 		"x-request-id":         util.NewUUID(),
 		"x-session-id":         sessionID,
 		"x-zcode-session-type": "main",
 		"x-zcode-trace-id":     util.NewUUID(),
 		"x-zcode-query-source": "main_turn",
-	}
-	if osRel := config.OsRelease(); osRel != "" {
-		fixed["X-Os-Version"] = osRel
 	}
 	if verifyParam != "" {
 		fixed["X-Aliyun-Captcha-Verify-Param"] = verifyParam
@@ -184,28 +156,15 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 		}
 	}
 
-	// 先透传客户端头（剔除 agent 特征/敏感/连接类），再强制写回固定头。
-	// 顺序不能颠倒：固定头必须在最后覆盖同名透传头。
-	headers := map[string]string{}
-	for key, value := range incomingHeaders {
-		lower := strings.ToLower(key)
-		if dropHeaders[lower] || strings.HasPrefix(lower, "x-zcode") {
-			continue
-		}
-		dropped := false
-		for _, prefix := range dropHeaderPrefixes {
-			if strings.HasPrefix(lower, prefix) {
-				dropped = true
-				break
-			}
-		}
-		if dropped {
-			continue
-		}
-		headers[key] = value
-	}
+	// 官方 messages 请求只携带固定头；未知/第三方私有头一律不透传，
+	// 避免把 agent、反代与计费特征带进上游（严格白名单）。
+	headers := make(map[string]string, len(fixed))
 	for key, value := range fixed {
 		headers[key] = value
+	}
+	if i := strings.IndexByte(targetURL, '?'); i >= 0 {
+		// messages 端点不接受额外 query；billing/quota 的必要参数在各自链路构造。
+		targetURL = targetURL[:i]
 	}
 
 	return Request{URL: targetURL, Headers: headers}, nil
@@ -215,10 +174,16 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 // 若呼叫方已有帳號與會話資訊，應優先使用 DressSystemFor。
 func DressSystem(body map[string]any) {
 	dev := config.DeviceMid()
-	DressSystemFor(body, dev, SessionID(dev))
+	DressSystemForSKU(body, dev, SessionID(dev), fingerprint.For(nil))
 }
 
-// DressSystemFor 以指定的帳號裝置指紋與會話 ID 重建請求體。
+// DressSystemFor 保留舊呼叫形狀，使用預設桌面 SKU；需要與請求頭一致的
+// 呼叫方應改用 DressSystemForSKU。
+func DressSystemFor(body map[string]any, device, session string) {
+	DressSystemForSKU(body, device, session, fingerprint.For(nil))
+}
+
+// DressSystemForSKU 以指定的帳號裝置指紋、會話 ID 與桌面 SKU 重建請求體。
 // 不冪等（重複呼叫會重複追加日期前綴），呼叫方須保證對同一 body 只呼叫一次。
 //
 // 官方形態要點（magpie dress 語義，風控按此校驗）：
@@ -229,7 +194,7 @@ func DressSystem(body map[string]any) {
 //  3. cache_control 只出現在 system 三塊與最後一條非 system 訊息的末塊上，
 //     訊息中間塊與 tools 上一律清除；
 //  4. metadata.user_id 標記裝置與會話（須與 x-session-id 一致，否則命中不了快取）。
-func DressSystemFor(body map[string]any, device, session string) {
+func DressSystemForSKU(body map[string]any, device, session string, sku fingerprint.SKU) {
 	p := ZcodePrompts()
 	if p == nil || body == nil {
 		return
@@ -246,7 +211,7 @@ func DressSystemFor(body map[string]any, device, session string) {
 	switch existing := body["system"].(type) {
 	case string:
 		if strings.TrimSpace(existing) != "" {
-			own = append(own, existing)
+			own = append(own, sanitizeCallerSystem(existing))
 		}
 	case []any:
 		for _, item := range existing {
@@ -259,7 +224,7 @@ func DressSystemFor(body map[string]any, device, session string) {
 			}
 			text, _ := block["text"].(string)
 			if strings.TrimSpace(text) != "" {
-				own = append(own, text)
+				own = append(own, sanitizeCallerSystem(text))
 			}
 		}
 	}
@@ -271,7 +236,7 @@ func DressSystemFor(body map[string]any, device, session string) {
 	if hasSkillTool(body) {
 		dynamic = append(dynamic, p.SessionGuidance)
 	}
-	dynamic = append(dynamic, environment(p))
+	dynamic = append(dynamic, environment(p, sku))
 	if modelName, _ := body["model"].(string); modelName != "" {
 		line := strings.ReplaceAll(p.PoweredBy, "{provider}", "zai-api")
 		dynamic = append(dynamic, strings.ReplaceAll(line, "{model}", modelName))
@@ -556,21 +521,39 @@ func hasSkillTool(body map[string]any) bool {
 // 保持官方的无目录分支：平台、系统版本与不可信数据提示。
 // platform/osVersion 是网关本机的值——magpie 插件同样如此（插件跑在
 // magpie 进程而非 agent 目录），已验证可通过风控。
-func environment(p *zcodePrompts) string {
+func environment(p *zcodePrompts, sku fingerprint.SKU) string {
 	e := p.Environment
-	osLine := config.OsRelease()
+	osLine := sku.OsVersion
 	if osLine == "" {
-		osLine = config.PlatformName()
+		osLine = sku.PlatformName
 	} else {
-		// 官方形态 "linux 6.1.0-13-amd64 x64"（Node: platform release arch）
-		osLine = config.PlatformName() + " " + osLine + " " + config.ArchName()
+		// 官方形態 "win32 10.0.22631 x64"（Node: platform release arch）
+		osLine = sku.PlatformName + " " + osLine + " " + sku.Arch
 	}
 	lines := []string{
 		e.Heading,
 		e.InvokedLine,
-		" - " + e.PlatformLabel + ": " + config.PlatformName(),
+		" - " + e.PlatformLabel + ": " + sku.PlatformName,
 		" - " + e.OsVersionLabel + ": " + osLine,
 		" - " + e.UntrustedNote,
 	}
 	return strings.Join(lines, "\n")
+}
+
+// sanitizeCallerSystem 只移除結構化的第三方計費／SDK 特徵行，保留正常的
+// 品牌詞與業務文本（本網關本身就在服務 Claude Code / Anthropic 協議）。
+func sanitizeCallerSystem(text string) string {
+	lines := strings.Split(text, "\n")
+	out := lines[:0]
+	for _, line := range lines {
+		trimmed := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(trimmed, "x-anthropic-billing-header:") ||
+			strings.HasPrefix(trimmed, "x-anthropic-billing-header=") ||
+			strings.HasPrefix(trimmed, "cc_version=") ||
+			strings.HasPrefix(trimmed, "x-stainless-") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
