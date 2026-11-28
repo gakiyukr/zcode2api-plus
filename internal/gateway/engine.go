@@ -66,7 +66,7 @@ type Engine struct {
 	Store   *store.Store
 	Captcha *captcha.Manager
 	Client  *http.Client
-	// Gate 管理 Start Plan（JWT）雙層併發（單號 3 + 同出口 6）、自適應收窄與預防性忙線熔斷。
+	// Gate 管理 Start Plan（JWT）雙層併發（單號 3 + 同出口 6）與自適應收窄。
 	Gate *StartPlanGate
 	// Affinity 管理三級會話親和性路由（LRU 8192，TTL 30m），提升上游 Prompt Cache 命中率。
 	Affinity *SessionAffinity
@@ -178,18 +178,19 @@ type emptyReply struct {
 
 // attemptResult 單次帳號嘗試的出路：retryCaptcha（同帳號換驗證碼令牌重試）、
 // skippedCaptchaRetry（免驗遇 3007/挑戰頭，不扣減重試次數立即補驗）、
-// retryBusy（同帳號併發准入睡前釋放槽位延遲重試）、requeueGate（觸發自適應收窄，歸還槽位排回隊首）、
+// retryBusy（同帳號併發准入睡前釋放槽位延遲重試）、
 // switchAccount（換下一個帳號）、bare429（疑似請求級裸 429）、edgeBlocked（命中出口邊緣 405）、final（終止並返回）。
 type attemptResult struct {
 	retryCaptcha        bool
 	skippedCaptchaRetry bool
 	retryBusy           bool
 	busyDelay           time.Duration
-	requeueGate         bool
 	switchAccount       bool
 	bare429             bool
 	edgeBlocked         bool
-	// retryAltCredential：Start Plan 忙線熔斷／併發拒絕時，改用同號 API Key 通道。
+	// concurrencyRefused：本次換號由 3008/3009/3010 觸發；全部帳號輪完後回 429。
+	concurrencyRefused bool
+	// retryAltCredential：Start Plan 併發拒絕時，改用同號 API Key 通道。
 	retryAltCredential bool
 	empty              *emptyReply
 	final              runResult
@@ -233,10 +234,13 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	tried := map[string]bool{}
 	var lastEmpty *emptyReply
 	edgeBlocked := false
+	concurrencyRefused := false
 	bare429Count := 0
 	var firstBare429Acc *model.Account
 
-	for range MaxAccountAttempts {
+	// 一般錯誤最多嘗試 MaxAccountAttempts 個帳號；若遇到 3008/3009/3010，
+	// 則持續換號直到全池輪完，避免單一帳號的併發拒答直接變成客戶端錯誤。
+	for attempt := 0; attempt < MaxAccountAttempts || concurrencyRefused; attempt++ {
 		now := e.wallNow()
 		var inFlightFn func(string) int
 		if e.Gate != nil {
@@ -252,9 +256,6 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 					return false
 				}
 				if cand.Mode == "jwt" && e.Gate != nil {
-					if held, _ := e.Gate.BusyHeld(ak); held {
-						return false
-					}
 					if e.Gate.AccountInFlight(cand.ID) >= e.Gate.AccountCap(cand.ID) {
 						return false
 					}
@@ -280,6 +281,9 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		}
 		if res.edgeBlocked {
 			edgeBlocked = true
+		}
+		if res.concurrencyRefused {
+			concurrencyRefused = true
 		}
 
 		// 請求級裸 429 防雪崩：第 1 號標記探測冷卻並換號探測；連續第 2 號再回裸 429 則僅平反探測冷卻並立即止損
@@ -337,6 +341,12 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		web.Warn(reqID, "目前可用出口均處於邊緣熔斷期，拒絕請求 zcode.z.ai")
 		return errResult(http.StatusServiceUnavailable, "upstream_edge_blocked",
 			"上游邊緣防火牆已封鎖目前出口，稍後自動恢復（可在後台更換出口代理）")
+	}
+
+	if concurrencyRefused {
+		web.ReqErr(reqID, "所有可用帳號均遭遇上游併發限制")
+		return errResult(http.StatusTooManyRequests, "upstream_rate_limit",
+			"所有可用帳號目前均遭遇上游併發限制，請稍後重試")
 	}
 
 	if modelName != "" {
@@ -455,7 +465,7 @@ func (e *Engine) tryDegradedCredential(
 	deliver DeliverFunc,
 ) attemptResult {
 	web.Warn(reqID, fmt.Sprintf("帳號 %s 的 Start Plan 通道不可用，改用同號 Coding Plan (API Key) 通道", acc.Name))
-	return e.tryAccountWithLease(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, false, 0, incomingHeaders, deliver, nil, "apiKey", true)
+	return e.tryAccountWithLease(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, false, incomingHeaders, deliver, nil, "apiKey", true)
 }
 
 // 內層處理驗證碼與併發准入重試（對齊 MaxCaptchaRetries）。
@@ -474,54 +484,37 @@ func (e *Engine) tryAccount(
 	addrKey := AddressKeyFor(acc)
 	altTried := false
 
-	for requeueCount := 0; requeueCount <= MaxGateRequeue; requeueCount++ {
-		var lease *GateLease
-		if needsCaptcha && e.Gate != nil {
-			var err error
-			lease, err = e.Gate.Acquire(ctx, acc.ID, addrKey, requeueCount > 0)
-			if err != nil {
-				if isCanceled(ctx, err) {
-					web.Warn(reqID, "客户端已断开，终止等待")
-					return canceledResult()
-				}
-				var holdErr *BusyHoldError
-				if errors.As(err, &holdErr) {
-					web.Warn(reqID, holdErr.Error())
-					if !altTried && e.canDegrade(acc) {
-						altTried = true
-						return e.tryDegradedCredential(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, incomingHeaders, deliver)
-					}
-					return attemptResult{final: errResult(http.StatusTooManyRequests, "start_plan_busy_hold", holdErr.Error())}
-				}
-				var waitErr *GateWaitError
-				if errors.As(err, &waitErr) {
-					web.Warn(reqID, waitErr.Error())
-					if !altTried && e.canDegrade(acc) {
-						altTried = true
-						return e.tryDegradedCredential(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, incomingHeaders, deliver)
-					}
-					return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", waitErr.Error())}
-				}
-				return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", err.Error())}
+	var lease *GateLease
+	if needsCaptcha && e.Gate != nil {
+		var err error
+		lease, err = e.Gate.Acquire(ctx, acc.ID, addrKey, false)
+		if err != nil {
+			if isCanceled(ctx, err) {
+				web.Warn(reqID, "客户端已断开，终止等待")
+				return canceledResult()
 			}
+			var waitErr *GateWaitError
+			if errors.As(err, &waitErr) {
+				web.Warn(reqID, waitErr.Error())
+				if !altTried && e.canDegrade(acc) {
+					altTried = true
+					return e.tryDegradedCredential(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, incomingHeaders, deliver)
+				}
+				return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", waitErr.Error())}
+			}
+			return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", err.Error())}
 		}
-
-		res := e.tryAccountWithLease(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, needsCaptcha, requeueCount, incomingHeaders, deliver, &lease, "", false)
-		if lease != nil {
-			lease.Release()
-			lease = nil
-		}
-		if res.retryAltCredential && !altTried && e.canDegrade(acc) {
-			altTried = true
-			return e.tryDegradedCredential(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, incomingHeaders, deliver)
-		}
-		if res.requeueGate && requeueCount < MaxGateRequeue {
-			web.Warn(reqID, fmt.Sprintf("帳號 %s 併發上限已自適應收窄，歸還槽位並排回隊首重試（第 %d 次）", acc.Name, requeueCount+1))
-			continue
-		}
-		return res
 	}
-	return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", "併發重排次數已達上限")}
+
+	res := e.tryAccountWithLease(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, needsCaptcha, incomingHeaders, deliver, &lease, "", false)
+	if lease != nil {
+		lease.Release()
+	}
+	if res.retryAltCredential && !altTried && e.canDegrade(acc) {
+		altTried = true
+		return e.tryDegradedCredential(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, incomingHeaders, deliver)
+	}
+	return res
 }
 
 // tryAccountWithLease 在已持有 Start Plan 閘門租約期間執行上游呼叫與內層重試。
@@ -536,7 +529,6 @@ func (e *Engine) tryAccountWithLease(
 	stream bool,
 	retryEmpty bool,
 	needsCaptcha bool,
-	requeueCount int,
 	incomingHeaders map[string]string,
 	deliver DeliverFunc,
 	leasePtr **GateLease,
@@ -660,7 +652,7 @@ func (e *Engine) tryAccountWithLease(
 		}
 
 		if resp.StatusCode >= 400 {
-			res := e.handleUpstreamError(ctx, reqID, acc, addrKey, modelName, needsCaptcha, skippedCaptcha, resp, captchaAttempt, busyAttempt, requeueCount, altCredential)
+			res := e.handleUpstreamError(ctx, reqID, acc, addrKey, modelName, needsCaptcha, skippedCaptcha, resp, captchaAttempt, busyAttempt, altCredential)
 			reqCleanup()
 			if res.skippedCaptchaRetry {
 				forceCaptcha = true
@@ -682,21 +674,11 @@ func (e *Engine) tryAccountWithLease(
 				case <-time.After(res.busyDelay):
 				}
 				if needsCaptcha && e.Gate != nil {
-					if held, rem := e.Gate.BusyHeld(addrKey); held {
-						holdErr := &BusyHoldError{Remaining: rem}
-						web.Warn(reqID, holdErr.Error())
-						return attemptResult{final: errResult(http.StatusTooManyRequests, "start_plan_busy_hold", holdErr.Error())}
-					}
 					newLease, acqErr := e.Gate.Acquire(ctx, acc.ID, addrKey, true)
 					if acqErr != nil {
 						if isCanceled(ctx, acqErr) {
 							web.Warn(reqID, "客户端已断开，终止等待")
 							return canceledResult()
-						}
-						var holdErr *BusyHoldError
-						if errors.As(acqErr, &holdErr) {
-							web.Warn(reqID, holdErr.Error())
-							return attemptResult{final: errResult(http.StatusTooManyRequests, "start_plan_busy_hold", holdErr.Error())}
 						}
 						var waitErr *GateWaitError
 						if errors.As(acqErr, &waitErr) {
@@ -774,7 +756,6 @@ func (e *Engine) handleUpstreamError(
 	resp *http.Response,
 	captchaAttempt int,
 	busyAttempt int,
-	requeueCount int,
 	altCredential bool,
 ) attemptResult {
 	// 错误响应体限长：正常路径是流式转发（边读边发），只有错误分支才整段读进
@@ -868,35 +849,20 @@ func (e *Engine) handleUpstreamError(
 	// 4) 429 且 code∈{3008,3009,3010}：併發准入限制，帳號仍可用，先於持槽期回報閘門再交由外層釋槽睡眠重試
 	if IsModelConcurrencyLimit(resp.StatusCode, text) {
 		if needsCaptcha && e.Gate != nil {
-			requeue, holdTriggered := e.Gate.RecordConcurrencyRefusal(acc.ID, addrKey, busyAttempt)
-			if holdTriggered {
-				if !altCredential && e.canDegrade(acc) {
-					web.Warn(reqID, "Start Plan 忙線熔斷，改用同號 Coding Plan 通道")
-					return attemptResult{retryAltCredential: true}
-				}
-				_, rem := e.Gate.BusyHeld(addrKey)
-				holdErr := &BusyHoldError{Remaining: rem}
-				web.Warn(reqID, holdErr.Error())
-				return attemptResult{final: errResult(http.StatusTooManyRequests, "start_plan_busy_hold", holdErr.Error())}
-			}
-			if requeue && requeueCount < MaxGateRequeue {
-				return attemptResult{requeueGate: true}
-			}
+			// 只記錄自適應收窄；不再把同帳號排回隊首，更不暫停整個出口。
+			e.Gate.RecordConcurrencyRefusal(acc.ID, addrKey, busyAttempt)
 		}
 		if busyAttempt < len(e.BusyRetryDelays) {
 			delay := e.BusyRetryDelays[busyAttempt]
-			web.Warn(reqID, fmt.Sprintf("模型併發准入受限，先歸還槽位並於 %g s 後隊首重取重試", delay.Seconds()))
+			web.Warn(reqID, fmt.Sprintf("模型併發准入受限，先歸還槽位並於 %g s 後同號重試", delay.Seconds()))
 			return attemptResult{retryBusy: true, busyDelay: delay}
 		}
 		if !altCredential && e.canDegrade(acc) {
 			web.Warn(reqID, fmt.Sprintf("模型併發准入持續受限（帳號 %s），改用同號 Coding Plan 通道", acc.Name))
 			return attemptResult{retryAltCredential: true}
 		}
-		web.Warn(reqID, fmt.Sprintf("模型併發准入持續受限（帳號 %s），保留帳號狀態", acc.Name))
-		return attemptResult{final: runResult{
-			Status: resp.StatusCode,
-			Body:   passthroughBodyWithType(text, "upstream_rate_limit"),
-		}}
+		web.Warn(reqID, fmt.Sprintf("帳號 %s 持續併發受限，換下一個帳號", acc.Name))
+		return attemptResult{switchAccount: true, concurrencyRefused: true}
 	}
 
 	// 5) 429：官方用量上限码族 → 该模型耗尽；無業務碼裸 429 → 交由 RunMessages 雙號探測止損；其餘瞬時限流 → 冷卻

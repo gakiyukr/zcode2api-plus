@@ -102,7 +102,7 @@ sudo ./deploy/manage.sh docker-install         # Docker（未驗證）
 | `ZCODE_CAPTCHA_BROWSER` | false | 啟用 rod 瀏覽器池自動求解 |
 | `ZCODE_CAPTCHA_BROWSER_BIN` | 自動發現 | Chromium 二進制路徑 |
 | `ZCODE_ASYNC_ENABLED` | true | 掛載 /async/v1/messages 空閒池 |
-| `ZCODE_DUAL_CREDENTIAL_DEGRADE` | false | 雙憑證賬號 Start Plan 忙線時降級 Coding Plan |
+| `ZCODE_DUAL_CREDENTIAL_DEGRADE` | false | 雙憑證賬號 Start Plan 併發拒絕時降級 Coding Plan |
 | `ZCODE_EGRESS_PROBE_INTERVAL` | 600 | 匿名出口巡檢間隔（秒，0=關閉） |
 | `ZCODE_EGRESS_PROBE_WORKERS` | 4 | 出口巡檢併發上限 |
 

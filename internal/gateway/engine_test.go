@@ -888,6 +888,54 @@ func TestConcurrency3008RetriesWithoutCooling(t *testing.T) {
 	}
 }
 
+func TestConcurrencyLimitSwitchesToNextAccount(t *testing.T) {
+	f := newFixture(t)
+	busyAcc, _ := f.st.AddAccount(model.ProviderZai, "busy", "sk-busy")
+	if _, err := f.st.AddAccount(model.ProviderZai, "idle", "sk-idle"); err != nil {
+		t.Fatal(err)
+	}
+	header := http.Header{"Content-Type": []string{"application/json"}}
+	f.respond = func(_ int, r *http.Request) (int, http.Header, string) {
+		if r.Header.Get("x-api-key") == "sk-busy" {
+			return http.StatusTooManyRequests, header, `{"code":3008,"msg":"user concurrency limit exceeded"}`
+		}
+		return http.StatusOK, header, okUpstreamJSON
+	}
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != http.StatusOK || !strings.Contains(raw, "msg_1") {
+		t.Fatalf("併發拒答應換號成功: %d %s", status, raw)
+	}
+	if f.callCount() != 4 {
+		t.Fatalf("應為忙碌帳號重試 3 次後換號成功（共 4 次），實際: %d", f.callCount())
+	}
+	if got := f.st.Find(model.ProviderZai, busyAcc.ID); got.Status != model.StatusActive {
+		t.Fatalf("併發拒答不得標記帳號 cooling: %s", got.Status)
+	}
+}
+
+func TestAllAccountsConcurrencyLimitedReturns429(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.st.AddAccount(model.ProviderZai, "busy-1", "sk-busy-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.AddAccount(model.ProviderZai, "busy-2", "sk-busy-2"); err != nil {
+		t.Fatal(err)
+	}
+	header := http.Header{"Content-Type": []string{"application/json"}}
+	f.respond = func(int, *http.Request) (int, http.Header, string) {
+		return http.StatusTooManyRequests, header, `{"code":3008,"msg":"user concurrency limit exceeded"}`
+	}
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != http.StatusTooManyRequests || !strings.Contains(raw, "所有可用帳號") {
+		t.Fatalf("全池輪完才應回 429: %d %s", status, raw)
+	}
+	if f.callCount() != 6 {
+		t.Fatalf("兩個帳號各重試 2 次後換號，共應呼叫 6 次: %d", f.callCount())
+	}
+}
+
 func TestEngineBusyAttemptIndependentOfCaptcha(t *testing.T) {
 	f := newFixture(t)
 	oldBrowser := config.CaptchaBrowserEnabled

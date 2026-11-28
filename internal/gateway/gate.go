@@ -1,17 +1,16 @@
-// Start Plan 雙層併發閘門、自適應收窄與預防性忙線熔斷。
+// Start Plan 雙層併發閘門與自適應收窄。
 // 對齊 magpie zcode 插件 0.1.54~0.1.71 的併發治理策略：
 //   - 單帳號 Start Plan 預設最多 3 個在途請求（遇同帳號在途 3008/3009/3010
 //     於 1s 重試仍被拒時，自動收窄至 inFlight-1 維持 5 分鐘，並讓該請求歸還
 //     槽位排回隊首重送，不直接報 429）；
-//   - 同出口地址（直連或同代理）所有帳號共用最多 6 個在途 Start Plan 請求，
-//     避免觸發 zcode.z.ai 邊緣防火牆的 IP 級 405 封鎖；
-//   - 若 60 秒內出現 5 次單獨請求於 1s 重試仍被併發拒答，立即觸發該出口
-//     3 分鐘預防性忙線熔斷（busyHold），中止排隊與在途重試，趕在 405 前停火。
+//   - 同出口地址（直連或同代理）所有帳號共用最多 6 個在途 Start Plan 請求。
+//
+// 上游併發拒絕只縮小對應帳號的併發上限或延遲重試，不暫停整個出口，
+// 避免把正常的 3008/3009/3010 放大成全域 429。
 package gateway
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -22,16 +21,8 @@ import (
 )
 
 const (
-	// MaxGateRequeue 單一請求因觸發自適應收窄而被隊首重排的次數上限。
-	MaxGateRequeue = 4
-
 	defaultNarrowDuration = 5 * time.Minute
-	defaultBusyWindow     = 60 * time.Second
-	defaultBusyThreshold  = 5
 )
-
-// ErrBusyHold 該出口目前處於預防性忙線熔斷期（3 分鐘），暫停向 zcode.z.ai 發送 Start Plan 請求。
-var ErrBusyHold = errors.New("start plan busy hold")
 
 // GateWaitError 排隊等待槽位逾時，附帶等候診斷資訊（對齊 magpie 0.1.71）。
 type GateWaitError struct {
@@ -64,23 +55,9 @@ func (e *GateWaitError) Error() string {
 	return msg
 }
 
-// BusyHoldError 預防性忙線熔斷錯誤（回傳 429 + 剩餘秒數）。
-type BusyHoldError struct {
-	Remaining time.Duration
-}
-
-func (e *BusyHoldError) Error() string {
-	sec := max(1, int(e.Remaining.Seconds()))
-	return fmt.Sprintf("上游近期連續回報併發上限拒答，為避免出口觸發 405 防火牆封鎖，已暫停 Start Plan 請求 %ds", sec)
-}
-
-func (e *BusyHoldError) Unwrap() error { return ErrBusyHold }
-
 type gateWaiter struct {
 	ch      chan struct{}
-	addrKey string
 	granted bool
-	aborted bool
 }
 
 type laneState struct {
@@ -94,7 +71,7 @@ type narrowState struct {
 	until time.Time
 }
 
-// StartPlanGate 管理 Start Plan（JWT）請求的雙層併發與忙線熔斷。
+// StartPlanGate 管理 Start Plan（JWT）請求的雙層併發與自適應收窄。
 type StartPlanGate struct {
 	mu sync.Mutex
 
@@ -102,16 +79,11 @@ type StartPlanGate struct {
 	addressCap     int
 	waitTimeout    time.Duration
 	narrowDuration time.Duration
-	busyWindow     time.Duration
-	busyThreshold  int
-	busyHoldDur    time.Duration
 	now            func() time.Time
 
 	accountLanes map[string]*laneState
 	addressLanes map[string]*laneState
 	narrow       map[string]narrowState
-	busyWindows  map[string][]time.Time
-	busyHolds    map[string]time.Time
 }
 
 // NewStartPlanGate 以目前 config 建立 Start Plan 併發閘門。
@@ -121,15 +93,10 @@ func NewStartPlanGate() *StartPlanGate {
 		addressCap:     config.StartPlanAddressConcurrency,
 		waitTimeout:    time.Duration(config.StartPlanGateWaitSeconds) * time.Second,
 		narrowDuration: defaultNarrowDuration,
-		busyWindow:     defaultBusyWindow,
-		busyThreshold:  defaultBusyThreshold,
-		busyHoldDur:    time.Duration(config.StartPlanBusyHoldSeconds) * time.Second,
 		now:            time.Now,
 		accountLanes:   map[string]*laneState{},
 		addressLanes:   map[string]*laneState{},
 		narrow:         map[string]narrowState{},
-		busyWindows:    map[string][]time.Time{},
-		busyHolds:      map[string]time.Time{},
 	}
 }
 
@@ -164,28 +131,6 @@ func (l *GateLease) Release() {
 // wallNow 剝離單調時鐘讀數，確保系統休眠喚醒後熔斷、收窄與逾時仍按真實牆鐘即時生效。
 func (g *StartPlanGate) wallNow() time.Time {
 	return g.now().Round(0)
-}
-
-// BusyHeld 檢查指定出口目前是否處於預防性忙線熔斷期，並回傳剩餘時長。
-func (g *StartPlanGate) BusyHeld(addrKey string) (bool, time.Duration) {
-	if g == nil {
-		return false, 0
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.busyHeldLocked(addrKey, g.wallNow())
-}
-
-func (g *StartPlanGate) busyHeldLocked(addrKey string, now time.Time) (bool, time.Duration) {
-	until, ok := g.busyHolds[addrKey]
-	if !ok {
-		return false, 0
-	}
-	if !now.Before(until) {
-		delete(g.busyHolds, addrKey)
-		return false, 0
-	}
-	return true, until.Sub(now)
 }
 
 // AccountInFlight 回傳該帳號目前持有槽位的在途請求數。
@@ -256,10 +201,6 @@ func (g *StartPlanGate) acquireLane(
 ) (time.Time, error) {
 	g.mu.Lock()
 	now := g.wallNow()
-	if held, rem := g.busyHeldLocked(addrKey, now); held {
-		g.mu.Unlock()
-		return time.Time{}, &BusyHoldError{Remaining: rem}
-	}
 	lanes := g.addressLanes
 	if isAccount {
 		lanes = g.accountLanes
@@ -276,7 +217,7 @@ func (g *StartPlanGate) acquireLane(
 		g.mu.Unlock()
 		return now, nil
 	}
-	w := &gateWaiter{ch: make(chan struct{}), addrKey: addrKey}
+	w := &gateWaiter{ch: make(chan struct{})}
 	if front {
 		lane.waiters = append([]*gateWaiter{w}, lane.waiters...)
 	} else {
@@ -295,10 +236,6 @@ func (g *StartPlanGate) acquireLane(
 	case <-w.ch:
 		g.mu.Lock()
 		defer g.mu.Unlock()
-		if w.aborted {
-			_, holdRem := g.busyHeldLocked(addrKey, g.wallNow())
-			return time.Time{}, &BusyHoldError{Remaining: holdRem}
-		}
 		if w.granted {
 			ts := g.wallNow()
 			currentLanes := g.addressLanes
@@ -415,14 +352,12 @@ func (g *StartPlanGate) laneCapLocked(isAccount bool, key string, now time.Time)
 }
 
 // RecordConcurrencyRefusal 在上游回傳 3008/3009/3010 時呼叫。
-// 僅在 retryAttempt == 1（即 1s 重試仍被拒答）時觸發收窄或忙線熔斷計數：
-//   - 若同帳號在途數 > 1：自動收窄該帳號上限為 max(1, inFlight-1) 維持 5 分鐘，
-//     回傳 requeue=true（呼叫方釋放槽位並排回隊首重送），不計入忙線熔斷；
-//   - 若同帳號在途數 <= 1：計入該出口的 60 秒滑動視窗，達 5 次觸發 3 分鐘 busyHold
-//     並中止所有同出口排隊中的請求。
-func (g *StartPlanGate) RecordConcurrencyRefusal(accountKey, addrKey string, retryAttempt int) (requeue bool, holdTriggered bool) {
+// 僅在 retryAttempt == 1（即 1s 重試仍被拒答）且同帳號在途數 > 1 時，
+// 自動收窄該帳號上限為 max(1, inFlight-1) 維持 5 分鐘，並回傳 requeue=true
+// （呼叫方釋放槽位並排回隊首重送）。不再因連續拒答暫停整個出口。
+func (g *StartPlanGate) RecordConcurrencyRefusal(accountKey, _ string, retryAttempt int) bool {
 	if g == nil || retryAttempt != 1 {
-		return false, false
+		return false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -432,56 +367,15 @@ func (g *StartPlanGate) RecordConcurrencyRefusal(accountKey, addrKey string, ret
 	if lane := g.accountLanes[accountKey]; lane != nil {
 		inflight = lane.inflight
 	}
-	if inflight > 1 {
-		newCap := max(1, inflight-1)
-		if prev, ok := g.narrow[accountKey]; ok && now.Before(prev.until) && prev.cap < newCap {
-			newCap = prev.cap
-		}
-		g.narrow[accountKey] = narrowState{cap: newCap, until: now.Add(g.narrowDuration)}
-		return true, false
+	if inflight <= 1 {
+		return false
 	}
-
-	// 單獨請求於 1s 重試仍被拒：計入該出口忙線熔斷滑動窗
-	cutoff := now.Add(-g.busyWindow)
-	win := g.busyWindows[addrKey]
-	kept := win[:0]
-	for _, ts := range win {
-		if !ts.Before(cutoff) {
-			kept = append(kept, ts)
-		}
+	newCap := max(1, inflight-1)
+	if prev, ok := g.narrow[accountKey]; ok && now.Before(prev.until) && prev.cap < newCap {
+		newCap = prev.cap
 	}
-	kept = append(kept, now)
-	if len(kept) >= g.busyThreshold {
-		delete(g.busyWindows, addrKey)
-		g.busyHolds[addrKey] = now.Add(g.busyHoldDur)
-		g.abortWaitersForAddrLocked(addrKey)
-		return false, true
-	}
-	g.busyWindows[addrKey] = kept
-	return false, false
-}
-
-// abortWaitersForAddrLocked 熔斷觸發時立即中止所有正在等候該出口的請求（對齊 magpie 0.1.54）。
-func (g *StartPlanGate) abortWaitersForAddrLocked(addrKey string) {
-	abortIn := func(lanes map[string]*laneState) {
-		for k, lane := range lanes {
-			rem := lane.waiters[:0]
-			for _, w := range lane.waiters {
-				if w.addrKey == addrKey {
-					w.aborted = true
-					close(w.ch)
-					continue
-				}
-				rem = append(rem, w)
-			}
-			lane.waiters = rem
-			if lane.inflight == 0 && len(lane.waiters) == 0 {
-				delete(lanes, k)
-			}
-		}
-	}
-	abortIn(g.accountLanes)
-	abortIn(g.addressLanes)
+	g.narrow[accountKey] = narrowState{cap: newCap, until: now.Add(g.narrowDuration)}
+	return true
 }
 
 func (g *StartPlanGate) buildWaitError(isAccount bool, key string, waited time.Duration) *GateWaitError {

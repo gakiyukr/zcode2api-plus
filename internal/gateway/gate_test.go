@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 )
@@ -65,13 +64,12 @@ func TestStartPlanGateNarrowingAndFrontRequeue(t *testing.T) {
 	l2, _ := g.Acquire(context.Background(), "acc-1", "direct", false)
 
 	// retryAttempt == 0 不觸發收窄
-	if req, hold := g.RecordConcurrencyRefusal("acc-1", "direct", 0); req || hold {
-		t.Fatal("首次失敗不應立刻收窄或熔斷")
+	if g.RecordConcurrencyRefusal("acc-1", "direct", 0) {
+		t.Fatal("首次失敗不應立刻收窄")
 	}
-	// retryAttempt == 1 且在途 2 條 → 收窄為 1 並要求隊首重排，不觸發忙線熔斷
-	requeue, hold := g.RecordConcurrencyRefusal("acc-1", "direct", 1)
-	if !requeue || hold {
-		t.Fatalf("預期 requeue=true, hold=false，實際 %v/%v", requeue, hold)
+	// retryAttempt == 1 且在途 2 條 → 收窄為 1 並要求隊首重排
+	if !g.RecordConcurrencyRefusal("acc-1", "direct", 1) {
+		t.Fatal("預期觸發自適應收窄")
 	}
 	if gotCap := g.AccountCap("acc-1"); gotCap != 1 {
 		t.Fatalf("上限應收窄為 1: %d", gotCap)
@@ -109,49 +107,6 @@ func TestStartPlanGateNarrowingAndFrontRequeue(t *testing.T) {
 	second := <-order
 	if first != "front" || second != "back" {
 		t.Fatalf("隊首重排應優先取得槽位: %s -> %s", first, second)
-	}
-}
-
-func TestStartPlanGateBusyHoldAbortsWaiters(t *testing.T) {
-	g := NewStartPlanGate()
-	g.accountCap = 1
-	g.addressCap = 6
-	g.busyThreshold = 3
-	g.busyHoldDur = time.Minute
-	g.waitTimeout = 2 * time.Second
-
-	l1, _ := g.Acquire(context.Background(), "acc-solo", "direct", false)
-	waitRes := make(chan error, 1)
-	go func() {
-		_, err := g.Acquire(context.Background(), "acc-solo", "direct", false)
-		waitRes <- err
-	}()
-	time.Sleep(15 * time.Millisecond)
-
-	// 單獨在途連遇 3 次 1s 重試拒答 → 觸發忙線熔斷並立即中止排隊者
-	for i := 0; i < 2; i++ {
-		if _, hold := g.RecordConcurrencyRefusal("acc-solo", "direct", 1); hold {
-			t.Fatalf("第 %d 次尚不應觸發熔斷", i+1)
-		}
-	}
-	_, hold := g.RecordConcurrencyRefusal("acc-solo", "direct", 1)
-	if !hold {
-		t.Fatal("第 3 次應觸發忙線熔斷")
-	}
-	select {
-	case err := <-waitRes:
-		if !errors.Is(err, ErrBusyHold) {
-			t.Fatalf("排隊者應收到 ErrBusyHold，實際: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("排隊者未被熔斷即時喚醒")
-	}
-	l1.Release()
-
-	// 熔斷期內新請求應立即拒絕
-	_, err := g.Acquire(context.Background(), "acc-other", "direct", false)
-	if !errors.Is(err, ErrBusyHold) || !strings.Contains(err.Error(), "405") {
-		t.Fatalf("熔斷期內應立即拒絕: %v", err)
 	}
 }
 
@@ -225,7 +180,7 @@ func TestReleaseLaneWakesMultipleAfterNarrowExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req, _ := g.RecordConcurrencyRefusal("acc-narrow", "direct", 1); !req {
+	if !g.RecordConcurrencyRefusal("acc-narrow", "direct", 1) {
 		t.Fatal("預期觸發自適應收窄")
 	}
 	if got := g.AccountCap("acc-narrow"); got != 1 {
