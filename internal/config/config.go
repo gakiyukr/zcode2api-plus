@@ -171,7 +171,7 @@ var (
 	DualCredentialDegrade = envBool("ZCODE_DUAL_CREDENTIAL_DEGRADE", false)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.2.0-go"
+	AppVersion = "2.3.0-go"
 )
 
 // PlatformName 对齐官方客户端的 process.platform 取值（win32/darwin/linux）。
