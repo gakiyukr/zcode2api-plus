@@ -20,9 +20,10 @@ func ConvertResponsesRequest(body map[string]any) (map[string]any, error) {
 		return nil, &convertError{"previous_response_id 暫不支持（無狀態模式：每輪請求攜帶完整歷史）"}
 	}
 
+	modelName, _ := body["model"].(string)
 	out := map[string]any{}
-	if m, ok := body["model"].(string); ok && m != "" {
-		out["model"] = m
+	if modelName != "" {
+		out["model"] = modelName
 	}
 
 	// max_output_tokens → max_tokens（缺省 8192，对齐 completions）
@@ -46,10 +47,12 @@ func ConvertResponsesRequest(body map[string]any) (map[string]any, error) {
 		out["system"] = []any{map[string]any{"type": "text", "text": inst}}
 	}
 
-	// reasoning.effort → output_config.effort（§5.8 契约）
+	// reasoning.effort → output_config.effort（§5.8 契约），依模型歸一化為上游檔位
 	if reasoning, ok := body["reasoning"].(map[string]any); ok {
-		if effort, ok := reasoning["effort"].(string); ok && effort != "" {
-			out["output_config"] = map[string]any{"effort": effort}
+		if effort, ok := reasoning["effort"].(string); ok && effort != "" && gateway.SupportsEffort(modelName) {
+			if normalized := gateway.NormalizeEffort(modelName, effort); normalized != "" {
+				out["output_config"] = map[string]any{"effort": normalized}
+			}
 		}
 	}
 

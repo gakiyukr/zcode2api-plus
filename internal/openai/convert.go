@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"zcode2api/internal/gateway"
 )
 
 // convertError 请求转换失败（对应 HTTP 400，OpenAI 错误形态）。
@@ -22,9 +24,17 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 		}
 	}
 
+	modelName, _ := body["model"].(string)
 	out := map[string]any{}
-	if m, ok := body["model"].(string); ok && m != "" {
-		out["model"] = m
+	if modelName != "" {
+		out["model"] = modelName
+	}
+
+	// reasoning_effort / reasoning.effort → output_config.effort，並依模型歸一化
+	if effort := requestReasoningEffort(body, modelName); effort != "" && gateway.SupportsEffort(modelName) {
+		if normalized := gateway.NormalizeEffort(modelName, effort); normalized != "" {
+			out["output_config"] = map[string]any{"effort": normalized}
+		}
 	}
 
 	// max_tokens / max_completion_tokens → max_tokens（两者皆缺省 8192）
@@ -164,6 +174,25 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 	}
 	out["messages"] = messages
 	return out, nil
+}
+
+// requestReasoningEffort 提取 Chat 請求的思考強度：優先頂層 reasoning_effort，
+// 其次 reasoning.effort；Flash 模型明確關閉思考時回 "none" 供歸一化為 low。
+func requestReasoningEffort(body map[string]any, modelName string) string {
+	if v, ok := body["reasoning_effort"].(string); ok && strings.TrimSpace(v) != "" {
+		return v
+	}
+	if reasoning, ok := body["reasoning"].(map[string]any); ok {
+		if v, ok := reasoning["effort"].(string); ok && strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	if thinking, ok := body["thinking"].(map[string]any); ok {
+		if typ, _ := thinking["type"].(string); strings.EqualFold(typ, "disabled") && gateway.IsFlashModel(modelName) {
+			return "none"
+		}
+	}
+	return ""
 }
 
 // toolFunction 提取 OpenAI tools[] 项的 function 对象。

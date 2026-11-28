@@ -476,3 +476,29 @@ func TestResponsesInputJsonDeltaRoutedByIndex(t *testing.T) {
 		t.Fatalf("交錯 input_json_delta 應依 block index 路由至正確工具，實際 A=%v B=%v", fcA["arguments"], fcB["arguments"])
 	}
 }
+
+func TestResponsesEffortNormalization(t *testing.T) {
+	got, err := ConvertResponsesRequest(map[string]any{
+		"model": "GLM-5.4", "input": "hi",
+		"reasoning": map[string]any{"effort": "medium"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oc, ok := got["output_config"].(map[string]any)
+	if !ok || oc["effort"] != "high" {
+		t.Fatalf("medium 應映射為 high: %v", got["output_config"])
+	}
+
+	got, err = ConvertResponsesRequest(map[string]any{
+		"model": "glm-5.3-flash", "input": "hi",
+		"reasoning": map[string]any{"effort": "none"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oc, ok = got["output_config"].(map[string]any)
+	if !ok || oc["effort"] != "low" {
+		t.Fatalf("Flash 關閉思考應映射為 low: %v", got["output_config"])
+	}
+}

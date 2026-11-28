@@ -324,3 +324,28 @@ func TestConvertRequestMergesToolMessages(t *testing.T) {
 		}
 	}
 }
+
+func TestConvertRequestReasoningEffort(t *testing.T) {
+	out := convertInput(t, map[string]any{
+		"model": "GLM-5.4", "messages": []any{}, "reasoning_effort": "medium",
+	})
+	oc, ok := out["output_config"].(map[string]any)
+	if !ok || oc["effort"] != "high" {
+		t.Fatalf("medium 應映射為 high: %v", out["output_config"])
+	}
+
+	out = convertInput(t, map[string]any{
+		"model": "glm-5.3-flash", "messages": []any{}, "reasoning_effort": "none",
+	})
+	oc, ok = out["output_config"].(map[string]any)
+	if !ok || oc["effort"] != "low" {
+		t.Fatalf("Flash 關閉思考應映射為 low: %v", out["output_config"])
+	}
+
+	out = convertInput(t, map[string]any{
+		"model": "gpt-5", "messages": []any{}, "reasoning_effort": "medium",
+	})
+	if _, ok := out["output_config"]; ok {
+		t.Fatalf("非 GLM 模型不應注入 output_config: %v", out["output_config"])
+	}
+}
