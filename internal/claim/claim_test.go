@@ -5,16 +5,20 @@ package claim
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/store"
 )
 
 // fakeBilling 假计费上游：按注册路径返回响应体；记录每次收包。
@@ -36,7 +40,11 @@ func (f *fakeBilling) Do(r *http.Request) (*http.Response, error) {
 		call.Body, _ = io.ReadAll(r.Body)
 	}
 	f.requests = append(f.requests, call)
-	// 真实 URL 含 zcode-plan 前缀；按末段匹配（/billing/preview、/billing/claim）
+	// 先按完整路徑匹配，再回退末段匹配（/billing/preview、/billing/claim）
+	if handler, ok := f.responses[call.Path]; ok {
+		status, body := handler(call)
+		return jsonResponse(status, body)
+	}
 	handler, ok := f.responses["/billing/"+lastSegment(call.Path)]
 	if !ok {
 		return jsonResponse(http.StatusNotFound, `{"code":3001}`)
@@ -235,18 +243,22 @@ func TestAutoClaimPriorityOrder(t *testing.T) {
 
 func TestActivationReportingTolerated(t *testing.T) {
 	acc := newTestAccount(t)
-	oldURL := EventReportURL
-	EventReportURL = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	oldURL, oldDelays := EventReportURL, ActivationRetryDelays
+	ActivationRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { EventReportURL, ActivationRetryDelays = oldURL, oldDelays })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"code":0}`))
-	})).URL
+	}))
+	t.Cleanup(srv.Close)
+	EventReportURL = srv.URL
 
 	if err := ReportActivationEvents(acc); err != "" {
 		t.Fatalf("激活上报应成功: %s", err)
 	}
 
 	// 失败上报仅返回文案，不 panic；preview 不被阻断由 AutoClaimAllPlans 覆盖
-	t.Cleanup(func() { EventReportURL = oldURL })
 	EventReportURL = "http://127.0.0.1:1/nope"
 	if err := ReportActivationEvents(acc); err == "" {
 		t.Fatal("不可达端点应返回错误文案")
@@ -288,5 +300,194 @@ func TestPreviewPlansSortedAndBusinessError(t *testing.T) {
 	_, err = svc.PreviewPlans(acc)
 	if err == nil || !strings.Contains(err.Error(), "活動已結束") {
 		t.Fatalf("1002 应翻译为文案: %v", err)
+	}
+}
+
+func TestParseTouchPlansAndMergePreview(t *testing.T) {
+	acc := newTestAccount(t)
+	up := &fakeBilling{responses: map[string]func(upstreamCall) (int, string){
+		"/billing/preview": func(upstreamCall) (int, string) {
+			return 200, `{"code":0,"data":{"plans":[{"plan_id":"p-preview","name":"常駐方案","priority":5}]}}`
+		},
+		"/api/v1/marketing/touch": func(call upstreamCall) (int, string) {
+			if call.Headers.Get("X-Device-Mid") != acc.DeviceMid() {
+				t.Errorf("應帶帳號專屬 device_mid: %q", call.Headers.Get("X-Device-Mid"))
+			}
+			return 200, `{"code":0,"data":{"deliveries":[{"banner":{
+				"background":{"args":{"zcode_plan":{"name":"ZCODE WEEKEND BUILD"}}},
+				"buttons":[
+					{"action":{"type":"claim_zcode_plan","args":{"plan_id":"p-weekend"}}},
+					{"action":{"type":"claim_zcode_plan","args":{"plan_id":"p-preview"}}}
+				]
+			}}]}}`
+		},
+	}}
+	svc := &Service{Captcha: newSolvedManager(t), Client: up, GetRetryDelays: []time.Duration{}}
+	plans, err := svc.PreviewPlans(acc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 2 {
+		t.Fatalf("應合併去重為 2 個方案: %v", plans)
+	}
+	if plans[0]["plan_id"] != "p-preview" || plans[1]["plan_id"] != "p-weekend" || plans[1]["name"] != "ZCODE WEEKEND BUILD" {
+		t.Fatalf("合併結果不符: %v", plans)
+	}
+}
+
+type flakyClient struct {
+	failBefore int32
+	calls      atomic.Int32
+}
+
+func (f *flakyClient) Do(r *http.Request) (*http.Response, error) {
+	n := f.calls.Add(1)
+	if n <= f.failBefore {
+		return nil, errors.New("transient reset")
+	}
+	return jsonResponse(http.StatusOK, `{"code":0,"data":{"plans":[]}}`)
+}
+
+func TestGetTransientRetryAndPostSingleShot(t *testing.T) {
+	acc := newTestAccount(t)
+
+	// GET 遇瞬態錯誤應重試直到成功
+	fc := &flakyClient{failBefore: 2}
+	svc := &Service{
+		Captcha:        newSolvedManager(t),
+		Client:         fc,
+		GetRetryDelays: []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond},
+	}
+	if _, err := svc.TouchPlans(acc); err != nil {
+		t.Fatalf("GET 瞬態重試應成功: %v", err)
+	}
+	if fc.calls.Load() != 3 {
+		t.Fatalf("GET 應嘗試 3 次: %d", fc.calls.Load())
+	}
+
+	// POST claim 嚴格保持單發，絕不重試
+	postFC := &flakyClient{failBefore: 5}
+	svc.Client = postFC
+	if _, err := svc.Claim(acc, "p1"); err == nil {
+		t.Fatal("POST 失敗應直接返回錯誤")
+	}
+	if postFC.calls.Load() != 1 {
+		t.Fatalf("POST 必須單發防 1003 重發: %d", postFC.calls.Load())
+	}
+}
+
+func TestDayTrackerBeijingResetAndMonitorDedup(t *testing.T) {
+	tracker := NewDayTracker()
+	day1 := time.Date(2026, 11, 27, 23, 50, 0, 0, beijingZone)
+	now := day1
+	tracker.SetNow(func() time.Time { return now })
+
+	tracker.MarkSettled("acc-1", "p-1900", "claimed")
+	if !tracker.IsSettled("acc-1", "p-1900") {
+		t.Fatal("當日已領方案應標記為 settled")
+	}
+	if tracker.IsSettled("acc-1", "p-1930") {
+		t.Fatal("新掉落的 19:30 方案不應被去重")
+	}
+	// 跨北京午夜自動重置
+	now = day1.Add(20 * time.Minute)
+	if tracker.IsSettled("acc-1", "p-1900") {
+		t.Fatal("跨北京自然日後應清空當日去重記錄")
+	}
+
+	// 端對端驗證 Monitor.RunOnce：第 1 輪領 p-1900，第 2 輪出現 p-1930 時只領 p-1930（不重送 p-1900）
+	oldDB, oldData, oldURL, oldDelays := config.DBPath, config.DataDir, EventReportURL, ActivationRetryDelays
+	config.DBPath = filepath.Join(t.TempDir(), "accounts.db")
+	config.DataDir = t.TempDir()
+	ActivationRetryDelays = []time.Duration{}
+	t.Cleanup(func() {
+		config.DBPath, config.DataDir, EventReportURL, ActivationRetryDelays = oldDB, oldData, oldURL, oldDelays
+	})
+	evtSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0}`))
+	}))
+	t.Cleanup(evtSrv.Close)
+	EventReportURL = evtSrv.URL
+
+	st, err := store.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	jwt := "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"u99"}`)) + ".sig"
+	if _, err := st.AddAccount(model.ProviderZai, "mon-acc", jwt); err != nil {
+		t.Fatal(err)
+	}
+
+	round := 1
+	var claimedIDs []string
+	up := &fakeBilling{responses: map[string]func(upstreamCall) (int, string){
+		"/billing/preview": func(upstreamCall) (int, string) {
+			if round == 1 {
+				return 200, `{"code":0,"data":{"plans":[{"plan_id":"p-1900","name":"19點","priority":5}]}}`
+			}
+			return 200, `{"code":0,"data":{"plans":[{"plan_id":"p-1900","name":"19點","priority":5},{"plan_id":"p-1930","name":"1930點","priority":4}]}}`
+		},
+		"/billing/claim": func(call upstreamCall) (int, string) {
+			claimedIDs = append(claimedIDs, string(call.Body))
+			return 200, `{"code":0}`
+		},
+	}}
+	cm := newSolvedManager(t)
+	mon := NewMonitor(st, cm, nil)
+	mon.Service = &Service{Captcha: cm, Client: up, GetRetryDelays: []time.Duration{}}
+	mon.Pause = 0
+
+	mon.RunOnce()
+	round = 2
+	mon.RunOnce()
+
+	if len(claimedIDs) != 2 || !strings.Contains(claimedIDs[0], "p-1900") || !strings.Contains(claimedIDs[1], "p-1930") {
+		t.Fatalf("第 2 輪應跳過 p-1900 僅補領 p-1930，實際: %v", claimedIDs)
+	}
+}
+
+func TestClaimOutcome_LocalVerifyParam_CodeZero(t *testing.T) {
+	acc := newTestAccount(t)
+	// 建立未設 solver 且未啟用瀏覽器的 Manager → GetVerifyParam 返回 ErrUnavailable
+	cm := captcha.NewManager()
+	cm.SetConfigProvider(func(context.Context) (captcha.Config, error) {
+		return captcha.Config{Enabled: true, SceneID: "sc", Region: "cn", Prefix: "px"}, nil
+	})
+	svc := &Service{Captcha: cm, GetRetryDelays: []time.Duration{}}
+
+	_, err := svc.Claim(acc, "p-test")
+	var ce *ClaimError
+	if !errors.As(err, &ce) {
+		t.Fatalf("預期回傳 *ClaimError，實際: %v", err)
+	}
+	if ce.Code != 0 {
+		t.Fatalf("本地驗證碼求解失敗錯誤碼應為 0（不得冒充上游 3007），實際: %d", ce.Code)
+	}
+	if ShouldSettleCode(ce.Code) {
+		t.Fatal("錯誤碼 0 不應被 ShouldSettleCode 視為當日終態")
+	}
+}
+
+func TestBillingRequest_CancelableRetry(t *testing.T) {
+	acc := newTestAccount(t)
+	fc := &flakyClient{failBefore: 10}
+	svc := &Service{
+		Captcha:        newSolvedManager(t),
+		Client:         fc,
+		GetRetryDelays: []time.Duration{5 * time.Second, 5 * time.Second},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := svc.billingRequestCtx(ctx, acc, http.MethodGet, "/billing/preview", authHeaders(acc), nil)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("重試退避期間取消應返回 ctx.Err()，實際: %v", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("重試等待未被即時取消，耗時 %s", elapsed)
 	}
 }

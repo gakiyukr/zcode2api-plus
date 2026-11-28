@@ -73,6 +73,12 @@ func (h *Handler) handleUsage(w http.ResponseWriter, r *http.Request) {
 	accounts, stats := h.accountSnapshot()
 	ranking := make([]map[string]any, 0, len(accounts))
 	for _, view := range accounts {
+		// 過濾歸檔帳號：archived_at 在 PublicView 中為 *float64（需區分 typed nil）
+		if archived, ok := view["archived_at"].(*float64); ok && archived != nil {
+			continue
+		} else if f, ok := view["archived_at"].(float64); ok && f > 0 {
+			continue
+		}
 		tokens := 0
 		if tt, ok := view["total_tokens"].(map[string]int); ok {
 			for _, v := range tt {
@@ -80,6 +86,7 @@ func (h *Handler) handleUsage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		ranking = append(ranking, map[string]any{
+			"id":       view["id"],
 			"name":     view["name"],
 			"provider": view["provider"],
 			"requests": view["use_count"],

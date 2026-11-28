@@ -3,6 +3,9 @@
 package adminapi
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -38,7 +41,7 @@ func (h *Handler) jwtAccounts(ids []string) []*model.Account {
 	return out
 }
 
-// scheduleAutoClaim 入池后后台自动领取（fire-and-forget；对齐 _schedule_auto_claim）。
+// scheduleAutoClaim 入池後背景自動領取（fire-and-forget）；領取成功時同步刷新額度。
 func (h *Handler) scheduleAutoClaim(acc *model.Account) {
 	svc := claim.NewService(h.Captcha)
 	autoClaimTasks.Add(1)
@@ -49,7 +52,15 @@ func (h *Handler) scheduleAutoClaim(acc *model.Account) {
 				web.Warn("claim", "自动领取任务异常（已兜底）")
 			}
 		}()
-		_ = svc.AutoClaimAllPlans(acc)
+		outcomes := svc.AutoClaimAllPlans(acc)
+		if h.Quota != nil {
+			for _, o := range outcomes {
+				if ok, _ := o["ok"].(bool); ok {
+					h.Quota.RefreshAccounts([]*model.Account{acc})
+					break
+				}
+			}
+		}
 	}()
 }
 
@@ -93,12 +104,20 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"preview": out})
 }
 
-// handleClaim POST /admin/api/claim（body 可选 account_ids / plan_id）
-// 缺省对全部 JWT 账号自动选最优套餐；冷却账号跳过（上游写流量，风控期不加剧）。
+// handleClaim POST /admin/api/claim（body 可選 account_ids / plan_id）
+// 空 body 視為預設全量領取；非空但 JSON 格式錯誤時回傳 400。
 func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
-	payload, apiErr := decodeBody(r)
-	if apiErr != nil {
-		payload = map[string]any{} // Python Body(default=None)：空体全量领取
+	payload := map[string]any{}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAPIError(w, errBadRequest("讀取請求體失敗"))
+		return
+	}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(raw, &payload); err != nil || payload == nil {
+			writeAPIError(w, errBadRequest("請求體不是合法 JSON 物件"))
+			return
+		}
 	}
 	var ids []string
 	if raw, ok := payload["account_ids"].([]any); ok {
@@ -111,37 +130,63 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 	planID := strings.TrimSpace(strOf(payload["plan_id"]))
 
 	candidates := h.jwtAccounts(ids)
-	outcomes := []map[string]any{}
-	for _, acc := range candidates {
-		// 用 IsSelectable 判断（与 preview 一致）：EffectiveStatus 把「冷却
-		// 已到期」视为 active，只看原始 Status 会让同一账号 preview 可查、
-		// claim 被拒，用户看到自相矛盾的结果。
-		if !acc.IsSelectable(time.Now()) && acc.Status == model.StatusCooling {
-			outcomes = append(outcomes, map[string]any{
-				"account_id": acc.ID, "account_name": acc.Name, "ok": false,
-				"message": "賬號冷卻中（風控/限流），已跳過領取",
-			})
-			continue
-		}
-		svc := claim.NewService(h.Captcha)
-		result, err := svc.Claim(acc, planID)
-		if err != nil {
-			web.Warn("claim", "账号 "+acc.Name+" 领取失败: "+err.Error())
-			outcomes = append(outcomes, map[string]any{
-				"account_id": acc.ID, "account_name": acc.Name,
-				"ok": false, "message": err.Error(),
-			})
-			continue
-		}
-		h.Quota.RefreshAccounts([]*model.Account{acc})
-		outcome := map[string]any{
-			"account_id": acc.ID, "account_name": acc.Name, "ok": true,
-		}
-		for k, v := range result {
-			outcome[k] = v
-		}
-		outcomes = append(outcomes, outcome)
+	outcomes := make([]map[string]any, len(candidates))
+
+	// 受控併發（上限 4 workers）+ 單號後間隔 400ms，避免大帳號池全量領取打爆出站代理池
+	type claimJob struct {
+		idx int
+		acc *model.Account
 	}
+	workers := min(claim.BatchMaxWorkers, len(candidates))
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan claimJob, len(candidates))
+	for i, acc := range candidates {
+		jobs <- claimJob{idx: i, acc: acc}
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				acc := job.acc
+				if !acc.IsSelectable(time.Now()) && acc.Status == model.StatusCooling {
+					outcomes[job.idx] = map[string]any{
+						"account_id": acc.ID, "account_name": acc.Name, "ok": false,
+						"message": "賬號冷卻中（風控/限流），已跳過領取",
+					}
+					continue
+				}
+				svc := claim.NewService(h.Captcha)
+				result, err := svc.Claim(acc, planID)
+				if err != nil {
+					web.Warn("claim", "账号 "+acc.Name+" 领取失败: "+err.Error())
+					outcomes[job.idx] = map[string]any{
+						"account_id": acc.ID, "account_name": acc.Name,
+						"ok": false, "message": err.Error(),
+					}
+				} else {
+					h.Quota.RefreshAccounts([]*model.Account{acc})
+					outcome := map[string]any{
+						"account_id": acc.ID, "account_name": acc.Name, "ok": true,
+					}
+					for k, v := range result {
+						outcome[k] = v
+					}
+					outcomes[job.idx] = outcome
+				}
+				// 多帳號全量領取時節流避讓出站代理
+				if len(candidates) > 1 {
+					time.Sleep(claim.BatchAccountPause)
+				}
+			}
+		}()
+	}
+	wg.Wait()
 	ok := 0
 	for _, o := range outcomes {
 		if b, isBool := o["ok"].(bool); isBool && b {

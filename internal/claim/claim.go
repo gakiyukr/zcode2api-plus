@@ -6,6 +6,7 @@ package claim
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"zcode2api/internal/captcha"
@@ -24,10 +26,27 @@ import (
 	"zcode2api/internal/web"
 )
 
-// ClaimError 业务失败（含上游 code 语义），消息面向使用者。
-type ClaimError struct{ msg string }
+// ClaimError 業務失敗（含上游 code 語義），消息面向使用者。
+type ClaimError struct {
+	Code int
+	msg  string
+}
 
 func (e *ClaimError) Error() string { return e.msg }
+
+// MarketingTouchURL ZCode 官方活動橫幅投放端點（測試可覆寫）。
+var MarketingTouchURL = "https://zcode.z.ai/api/v1/marketing/touch"
+
+// defaultGetRetryDelays 冪等 GET 請求遇瞬態傳輸錯誤的階梯重試間隔（共 5 次嘗試）。
+var defaultGetRetryDelays = []time.Duration{
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	15 * time.Second,
+}
+
+// touchSeq 進程級遞增請求計數（官方 marketingTouchService.ts 的 bootRequestSeq）。
+var touchSeq atomic.Int64
 
 var claimFail = map[int]string{
 	1001: "套餐不存在",
@@ -45,11 +64,13 @@ const (
 	captchaRegionHeader = "X-Aliyun-Captcha-Verify-Region"
 )
 
-// Service 领取服务：captcha 求解 + billing HTTP（账号代理生效）。
+// Service 領取服務：captcha 求解 + billing/marketing HTTP（帳號代理生效）。
 type Service struct {
 	Captcha *captcha.Manager
-	// Client 测试注入；nil 时按账号代理构造（25s 超时，短请求语义）。
+	// Client 測試注入；nil 時按帳號代理構造（25s 超時，短請求語義）。
 	Client HTTPClient
+	// GetRetryDelays 覆寫 GET 瞬態重試延遲（nil 使用預設 2/4/8/15s；測試可設空或短延遲）。
+	GetRetryDelays []time.Duration
 }
 
 // HTTPClient 计费端点客户端抽象。
@@ -180,45 +201,104 @@ func splitJWT(token string) string {
 	return ""
 }
 
-// billingRequest 统一计费请求：网络错误/鉴权失败统一转 ClaimError。
+// billingRequest 統一計費／活動請求：網路錯誤／鑑權失敗統一轉 ClaimError。
+// 冪等 GET/HEAD 遇傳輸層瞬態錯誤依階梯重試（預設 5 次 2/4/8/15s）；
+// POST 寫操作嚴格保持單發，避免重發撞 1003 或浪費驗證碼。
 func (s *Service) billingRequest(acc *model.Account, method, path string, headers map[string]string, payload []byte) (map[string]any, error) {
-	req, err := http.NewRequest(method, config.ZcodeBillingBase+path, bytes.NewReader(payload))
-	if err != nil {
-		return nil, &ClaimError{fmt.Sprintf("上游網路錯誤: %v", err)}
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	res, err := s.clientFor(acc).Do(req)
-	if err != nil {
-		return nil, &ClaimError{fmt.Sprintf("上游網路錯誤: %v", err)}
-	}
-	defer res.Body.Close()
-	raw, readErr := io.ReadAll(res.Body)
-	if res.StatusCode == 401 || res.StatusCode == 403 {
-		text := lower(raw)
-		if !containsAny(text, "captcha", "verify") {
-			return nil, &ClaimError{fmt.Sprintf("鑑權失敗 HTTP %d", res.StatusCode)}
-		}
-	}
-	if readErr != nil {
-		return nil, &ClaimError{fmt.Sprintf("上游回應讀取失敗: %v", readErr)}
-	}
-	var body map[string]any
-	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, &ClaimError{fmt.Sprintf("上游回應非 JSON HTTP %d", res.StatusCode)}
-	}
-	return body, nil
+	return s.billingRequestCtx(context.Background(), acc, method, path, headers, payload)
 }
 
-// authHeaders 计费端点鉴权头（与 quota._auth_headers 同源形态）。
+// billingRequestCtx 帶可取消 context 的計費／活動請求；重試退避期間支援立即中斷。
+func (s *Service) billingRequestCtx(ctx context.Context, acc *model.Account, method, path string, headers map[string]string, payload []byte) (map[string]any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	targetURL := path
+	if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
+		targetURL = config.ZcodeBillingBase + path
+	}
+	var delays []time.Duration
+	if strings.EqualFold(method, http.MethodGet) || strings.EqualFold(method, http.MethodHead) {
+		if s.GetRetryDelays != nil {
+			delays = s.GetRetryDelays
+		} else {
+			delays = defaultGetRetryDelays
+		}
+	}
+	client := s.clientFor(acc)
+	var lastNetErr error
+	for attempt := 0; attempt <= len(delays); attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(delays[attempt-1])
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var bodyReader io.Reader
+		if len(payload) > 0 {
+			bodyReader = bytes.NewReader(payload)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, targetURL, bodyReader)
+		if err != nil {
+			return nil, &ClaimError{msg: fmt.Sprintf("上游網路錯誤: %v", err)}
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			lastNetErr = err
+			continue // 僅網路傳輸層錯誤重試（對 POST 因 len(delays)==0 立即退出）
+		}
+		raw, readErr := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		if readErr != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			lastNetErr = readErr
+			continue
+		}
+		if res.StatusCode == 401 || res.StatusCode == 403 {
+			text := lower(raw)
+			if !containsAny(text, "captcha", "verify") {
+				return nil, &ClaimError{Code: res.StatusCode, msg: fmt.Sprintf("鑑權失敗 HTTP %d", res.StatusCode)}
+			}
+		}
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return nil, &ClaimError{msg: fmt.Sprintf("上游回應非 JSON HTTP %d", res.StatusCode)}
+		}
+		// HTTP >= 400 且未帶非零業務碼時統一視為請求失敗，避免誤判為 code=0 成功
+		if res.StatusCode >= 400 && (body["code"] == nil || BusinessCode(body) == 0) {
+			return nil, &ClaimError{Code: res.StatusCode, msg: fmt.Sprintf("計費 API 回傳 HTTP %d", res.StatusCode)}
+		}
+		return body, nil
+	}
+	return nil, &ClaimError{msg: fmt.Sprintf("上游網路錯誤: %v", lastNetErr)}
+}
+
+// authHeaders 計費／活動端點鑑權頭（使用帳號專屬 device_mid 與計費鏈版本號）。
 func authHeaders(acc *model.Account) map[string]string {
+	deviceMid := acc.DeviceMid()
+	if deviceMid == "" {
+		deviceMid = config.DeviceMid()
+	}
 	headers := map[string]string{
 		"Content-Type":        "application/json",
 		"User-Agent":          config.UserAgent,
-		"X-ZCode-App-Version": config.ZcodeClientVersion,
+		"X-ZCode-App-Version": config.ZcodeBillingVersion,
 		"X-Platform":          config.ZcodeClientPlatform,
-		"X-Device-Mid":        config.DeviceMid(),
+		"X-Device-Mid":        deviceMid,
 		"HTTP-Referer":        "https://zcode.z.ai/",
 	}
 	if acc.Mode == "jwt" && acc.JWTToken != nil {
@@ -229,45 +309,199 @@ func authHeaders(acc *model.Account) map[string]string {
 	return headers
 }
 
-// ReportActivationEvents 上报激活事件（app_launch + app_daily_active），
-// 返回错误文案或空串；首个失败即中止（日活键上游按 device_mid+日期去重）。
+// ReportActivationEvents 上報激活事件（app_launch + app_daily_active），
+// 跟隨帳號出站代理並攜帶帳號專屬 device_mid；返回錯誤文案或空串。
 func ReportActivationEvents(acc *model.Account) string {
+	return ReportActivationEventsContext(context.Background(), acc)
+}
+
+// ReportActivationEventsContext 帶可取消 context 的激活事件上報。
+func ReportActivationEventsContext(ctx context.Context, acc *model.Account) string {
 	userID := JWTUserID(acc.Secret())
 	if userID == "" {
 		return "JWT 無 user_id，跳過激活上報"
 	}
-	deviceMid := config.DeviceMid()
+	deviceMid := acc.DeviceMid()
+	if deviceMid == "" {
+		deviceMid = config.DeviceMid()
+	}
 	for _, element := range ActivationElements {
-		if err := PostActivationEvent(userID, element, deviceMid); err != nil {
+		if err := PostActivationEventContext(ctx, acc, userID, element, deviceMid); err != nil {
 			return fmt.Sprintf("激活事件 %s 上報失敗: %v", element, err)
 		}
 	}
 	return ""
 }
 
-// PreviewPlans 拉取账号当前可领取套餐，按优先级降序。
-func (s *Service) PreviewPlans(acc *model.Account) ([]map[string]any, error) {
+// ParseTouchPlans 解析 /api/v1/marketing/touch 的 data 物件，遞歸掃描
+// deliveries[] 中的 claim_zcode_plan 動作與 zcode_plan 名稱（對齊 magpie touchPlans）。
+func ParseTouchPlans(data any) []map[string]any {
+	obj, ok := data.(map[string]any)
+	if !ok || obj == nil {
+		return nil
+	}
+	deliveries, ok := obj["deliveries"].([]any)
+	if !ok || len(deliveries) == 0 {
+		return []map[string]any{}
+	}
+	var out []map[string]any
+	seen := map[string]bool{}
+	for _, dv := range deliveries {
+		var ids []string
+		var names []string
+		var walk func(v any, depth int)
+		walk = func(v any, depth int) {
+			if v == nil || depth > 12 {
+				return
+			}
+			switch cur := v.(type) {
+			case []any:
+				for _, item := range cur {
+					walk(item, depth+1)
+				}
+			case map[string]any:
+				if t, _ := cur["type"].(string); t == "claim_zcode_plan" {
+					if args, ok := cur["args"].(map[string]any); ok {
+						if pid := strings.TrimSpace(orFirst(args, "plan_id", "planId")); pid != "" {
+							ids = append(ids, pid)
+						}
+					}
+				}
+				if zp, ok := cur["zcode_plan"].(map[string]any); ok {
+					if name := strings.TrimSpace(orFirst(zp, "name", "display_name")); name != "" {
+						names = append(names, name)
+					}
+				}
+				keys := make([]string, 0, len(cur))
+				for k := range cur {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					walk(cur[k], depth+1)
+				}
+			}
+		}
+		walk(dv, 0)
+		planName := ""
+		if len(names) > 0 {
+			planName = names[0]
+		}
+		for _, id := range ids {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			name := planName
+			if name == "" {
+				name = id
+			}
+			out = append(out, map[string]any{
+				"plan_id":     id,
+				"name":        name,
+				"description": "",
+				"priority":    float64(0),
+				"grants":      []any{},
+				"source":      "marketing_touch",
+			})
+		}
+	}
+	return out
+}
+
+// marketingLanguage 歸一為 ZCode 活動端點接受的兩種 UI 語言（zh-CN / en-US）。
+func marketingLanguage() string {
+	lang := strings.ToLower(language())
+	if strings.HasPrefix(lang, "zh") {
+		return "zh-CN"
+	}
+	return "en-US"
+}
+
+// TouchPlans 拉取 /api/v1/marketing/touch 活動橫幅可領取套餐（v3.17+ 週末／限時活動主入口）。
+func (s *Service) TouchPlans(acc *model.Account) ([]map[string]any, error) {
+	return s.TouchPlansContext(context.Background(), acc)
+}
+
+// TouchPlansContext 帶可取消 context 拉取 /api/v1/marketing/touch 活動套餐。
+func (s *Service) TouchPlansContext(ctx context.Context, acc *model.Account) ([]map[string]any, error) {
 	headers := authHeaders(acc)
-	body, err := s.billingRequest(acc, http.MethodGet,
-		"/billing/preview?app_version="+config.ZcodeClientVersion+"&platform="+config.ZcodeClientPlatform,
-		headers, nil)
+	headers["X-Client-Language"] = marketingLanguage()
+	seq := touchSeq.Add(1) - 1
+	url := fmt.Sprintf("%s?seq=%d", MarketingTouchURL, seq)
+	body, err := s.billingRequestCtx(ctx, acc, http.MethodGet, url, headers, nil)
 	if err != nil {
 		return nil, err
 	}
 	if code := BusinessCode(body); code != 0 {
-		return nil, &ClaimError{failMessage(code, body)}
+		return nil, &ClaimError{Code: code, msg: failMessage(code, body)}
 	}
-	var rawPlans []any
-	if data, ok := body["data"].(map[string]any); ok {
-		rawPlans, _ = data["plans"].([]any)
+	plans := ParseTouchPlans(body["data"])
+	if plans == nil {
+		return []map[string]any{}, nil
 	}
-	plans := make([]map[string]any, 0, len(rawPlans))
-	for _, raw := range rawPlans {
-		if obj, ok := raw.(map[string]any); ok {
-			if parsed := ParsePlan(obj); parsed != nil {
-				plans = append(plans, parsed)
+	return plans, nil
+}
+
+// PreviewPlans 拉取帳號當前可領取套餐（合併 billing/preview 與 marketing/touch 兩路，
+// 依 plan_id 去重後按優先級降序排序）。單路失敗時容錯保留另一路結果。
+func (s *Service) PreviewPlans(acc *model.Account) ([]map[string]any, error) {
+	return s.PreviewPlansContext(context.Background(), acc)
+}
+
+// PreviewPlansContext 帶可取消 context 拉取帳號當前可領取套餐。
+func (s *Service) PreviewPlansContext(ctx context.Context, acc *model.Account) ([]map[string]any, error) {
+	headers := authHeaders(acc)
+	body, previewErr := s.billingRequestCtx(ctx, acc, http.MethodGet,
+		"/billing/preview?app_version="+config.ZcodeBillingVersion+"&platform="+config.ZcodeClientPlatform,
+		headers, nil)
+	var previewPlans []map[string]any
+	if previewErr == nil {
+		if code := BusinessCode(body); code != 0 {
+			previewErr = &ClaimError{Code: code, msg: failMessage(code, body)}
+		} else {
+			var rawPlans []any
+			if data, ok := body["data"].(map[string]any); ok {
+				rawPlans, _ = data["plans"].([]any)
+			}
+			for _, raw := range rawPlans {
+				if obj, ok := raw.(map[string]any); ok {
+					if parsed := ParsePlan(obj); parsed != nil {
+						previewPlans = append(previewPlans, parsed)
+					}
+				}
 			}
 		}
+	}
+
+	touchPlans, touchErr := s.TouchPlansContext(ctx, acc)
+	if previewErr != nil && touchErr != nil {
+		return nil, previewErr
+	}
+	if previewErr != nil {
+		web.Warn("claim", fmt.Sprintf("帳號 %s billing/preview 失敗（已改用 marketing/touch）: %v", acc.Name, previewErr))
+	}
+	if touchErr != nil {
+		web.Warn("claim", fmt.Sprintf("帳號 %s marketing/touch 失敗（已改用 billing/preview）: %v", acc.Name, touchErr))
+	}
+
+	seen := map[string]bool{}
+	plans := make([]map[string]any, 0, len(previewPlans)+len(touchPlans))
+	for _, p := range previewPlans {
+		pid, _ := p["plan_id"].(string)
+		if pid == "" || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		plans = append(plans, p)
+	}
+	for _, p := range touchPlans {
+		pid, _ := p["plan_id"].(string)
+		if pid == "" || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		plans = append(plans, p)
 	}
 	sort.Slice(plans, func(i, j int) bool {
 		pi, pj := asFloat(plans[i]["priority"]), asFloat(plans[j]["priority"])
@@ -282,19 +516,27 @@ func (s *Service) PreviewPlans(acc *model.Account) ([]map[string]any, error) {
 // Claim 领取套餐。planID 为空时自动选优先级最高的可领套餐。
 // 返回 {plan_id, plan_name, grants}；3007（验证码失败）自动换码重试一次。
 func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, error) {
+	return s.ClaimContext(context.Background(), acc, planID)
+}
+
+// ClaimContext 帶可取消 context 領取套餐。
+func (s *Service) ClaimContext(ctx context.Context, acc *model.Account, planID string) (map[string]any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if acc.Mode != "jwt" || acc.JWTToken == nil || *acc.JWTToken == "" {
-		return nil, &ClaimError{"僅 Coding Plan (JWT) 賬號支持領取"}
+		return nil, &ClaimError{msg: "僅 Coding Plan (JWT) 賬號支持領取"}
 	}
 
 	planName := ""
 	grants := []any{}
 	if planID == "" {
-		plans, err := s.PreviewPlans(acc)
+		plans, err := s.PreviewPlansContext(ctx, acc)
 		if err != nil {
 			return nil, err
 		}
 		if len(plans) == 0 {
-			return nil, &ClaimError{"沒有待領取的套餐"}
+			return nil, &ClaimError{msg: "沒有待領取的套餐"}
 		}
 		best := plans[0]
 		planID, _ = best["plan_id"].(string)
@@ -307,36 +549,44 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 		}
 	}
 
+	addrKey := "direct"
+	if acc.ProxyURL != nil && strings.TrimSpace(*acc.ProxyURL) != "" {
+		addrKey = strings.TrimSpace(*acc.ProxyURL)
+	}
+
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
-		token, err := s.Captcha.GetVerifyParam(nil)
+		token, err := s.Captcha.GetVerifyParamForClaim(ctx, addrKey)
 		if err != nil {
-			return nil, &ClaimError{"驗證碼求解失敗，請到後台驗證碼頁面回填參數"}
+			// 本地驗證碼求解失敗不得冒充上游 3007（否則背景補領會誤判為當日終態）
+			return nil, &ClaimError{Code: 0, msg: "驗證碼求解失敗，請到後台驗證碼頁面回填參數"}
 		}
-		// token == nil 表示上游停用验证码（无需携带该头），不是失败。
-		// gateway 与 async 对同一语义都放行；claim 曾把它当终止错误，
-		// 于是同一账号能正常转发请求却永远领不了套餐。
 		var verifyParam, verifyRegion string
 		if token != nil {
 			verifyParam, verifyRegion = token.VerifyParam, token.Region
 		}
 		headers := claimHeaders(acc, verifyParam, verifyRegion)
 		payload, _ := json.Marshal(map[string]string{"plan_id": planID})
-		body, err := s.billingRequest(acc, http.MethodPost, "/billing/claim", headers, payload)
+		body, err := s.billingRequestCtx(ctx, acc, http.MethodPost, "/billing/claim", headers, payload)
 		if err != nil {
 			return nil, err
 		}
 		code := BusinessCode(body)
 		if code == 0 {
+			if planName == "" {
+				if dataObj, ok := body["data"].(map[string]any); ok {
+					planName = strings.TrimSpace(orFirst(dataObj, "plan_name", "planName", "name"))
+				}
+			}
 			return map[string]any{"plan_id": planID, "plan_name": planName, "grants": grants}, nil
 		}
 		if code == 3007 && attempt == 1 {
 			web.Warn("claim", fmt.Sprintf("账号 %s 验证码被拒，换码重试", acc.Name))
-			s.Captcha.Invalidate()
-			lastErr = &ClaimError{failMessage(code, body)}
+			s.Captcha.InvalidateForAddr(addrKey)
+			lastErr = &ClaimError{Code: code, msg: failMessage(code, body)}
 			continue
 		}
-		return nil, &ClaimError{failMessage(code, body)}
+		return nil, &ClaimError{Code: code, msg: failMessage(code, body)}
 	}
 	if lastErr == nil {
 		lastErr = errors.New("領取失敗")
@@ -344,18 +594,16 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 	return nil, lastErr
 }
 
-// claimHeaders billing/claim 客户端请求头形态（asar claimManualPlan）。
-// 实测缺版本/平台头时即使验证码有效也 3007；X-Device-Mid 由 authHeaders 提供。
+// claimHeaders billing/claim 客戶端請求頭形態。
 func claimHeaders(acc *model.Account, verifyParam, region string) map[string]string {
 	headers := authHeaders(acc)
-	// 上游停用验证码时不携带该头（与 gateway/async 一致），避免送空值
 	if verifyParam != "" {
 		headers[captchaHeader] = verifyParam
 	}
 	if region != "" {
 		headers[captchaRegionHeader] = region
 	}
-	headers["X-ZCode-App-Version"] = config.ZcodeClientVersion
+	headers["X-ZCode-App-Version"] = config.ZcodeBillingVersion
 	headers["X-Platform"] = config.ZcodeClientPlatform
 	return headers
 }
@@ -405,11 +653,21 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 		for k, v := range result {
 			outcome[k] = v
 		}
-		outcomes = append(outcomes, outcome)
-		planName, _ := result["plan_name"].(string)
+		planName, _ := outcome["plan_name"].(string)
 		if planName == "" {
-			planName = planID
+			if name, _ := plan["name"].(string); name != "" {
+				planName = name
+			} else {
+				planName = planID
+			}
+			outcome["plan_name"] = planName
 		}
+		if g, ok := outcome["grants"].([]any); !ok || len(g) == 0 {
+			if pg, ok := plan["grants"].([]any); ok && len(pg) > 0 {
+				outcome["grants"] = pg
+			}
+		}
+		outcomes = append(outcomes, outcome)
 		web.Ok("claim", fmt.Sprintf("账号 %s 自动领取成功: %s", acc.Name, planName))
 	}
 	return outcomes
@@ -426,8 +684,6 @@ func orFirst(m map[string]any, keys ...string) string {
 	}
 	return ""
 }
-
-
 
 // firstNonNil 取首个非 nil 值。
 func firstNonNil(values ...any) any {
@@ -481,5 +737,3 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
-
-
