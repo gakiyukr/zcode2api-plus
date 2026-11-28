@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,8 +35,20 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	var body map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if errors.As(err, new(*http.MaxBytesError)) {
+			WriteJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+				"error": map[string]any{"message": "請求體過大", "type": "request_too_large"},
+			})
+			return
+		}
 		WriteJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]any{"message": "请求体不是合法 JSON", "type": "invalid_request"},
+			"error": map[string]any{"message": "請求體不是合法 JSON", "type": "invalid_request_error"},
+		})
+		return
+	}
+	if body == nil {
+		WriteJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]any{"message": "請求體不能為空", "type": "invalid_request_error"},
 		})
 		return
 	}

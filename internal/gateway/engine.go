@@ -11,11 +11,10 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"zcode2api/internal/captcha"
@@ -28,22 +27,42 @@ import (
 	"zcode2api/internal/web"
 )
 
-// edgeHoldUntil 本机出口被上游边缘防火墙（405 拦截页）封锁后的全局熔断
-// 截止时间（unix nano，0 = 未熔断）。进程级而非账号级：出口地址是全体
-// 账号共用的，熔断期内继续请求只会让计数中的防火墙更确定（magpie
-// plugins#649：两账号三会话齐敲，连官方 App 都被拖下水；封锁一般数分钟自解）。
-var edgeHoldUntil atomic.Int64
+// edgeHoldMap 按出口地址（代理 URL 或 "direct"）隔離的上游邊緣防火牆 405 熔斷
+// 截止時間表（key: addrKey string, value: int64 unix nano）。不同出口 IP 互不阻塞。
+var edgeHoldMap sync.Map
 
-// HoldEdge 开启全局熔断：duration 内所有发往 zcode.z.ai 的 messages 请求
-// 在入口直接拒绝，不再触碰上游。engine 与 asyncpool 共用。
-func HoldEdge(duration time.Duration, now time.Time) {
-	edgeHoldUntil.Store(now.Add(duration).UnixNano())
+func normalizeEdgeKey(addrKey string) string {
+	if strings.TrimSpace(addrKey) == "" {
+		return "direct"
+	}
+	return addrKey
 }
 
-// EdgeHeld 当前是否处于边缘熔断期。
-func EdgeHeld(now time.Time) bool {
-	until := edgeHoldUntil.Load()
+// HoldEdgeFor 開啟指定出口的邊緣熔斷：duration 內該出口不再發送請求，其他出口不受影響。
+func HoldEdgeFor(addrKey string, duration time.Duration, now time.Time) {
+	now = now.Round(0)
+	edgeHoldMap.Store(normalizeEdgeKey(addrKey), now.Add(duration).UnixNano())
+}
+
+// EdgeHeldFor 判斷指定出口目前是否處於邊緣熔斷期。
+func EdgeHeldFor(addrKey string, now time.Time) bool {
+	now = now.Round(0)
+	v, ok := edgeHoldMap.Load(normalizeEdgeKey(addrKey))
+	if !ok {
+		return false
+	}
+	until, _ := v.(int64)
 	return until > 0 && now.UnixNano() < until
+}
+
+// HoldEdge 開啟直連出口的邊緣熔斷（相容舊介面包裝）。
+func HoldEdge(duration time.Duration, now time.Time) {
+	HoldEdgeFor("direct", duration, now)
+}
+
+// EdgeHeld 判斷直連出口是否處於邊緣熔斷期（相容舊介面包裝）。
+func EdgeHeld(now time.Time) bool {
+	return EdgeHeldFor("direct", now)
 }
 
 // Delivery 上游 200 响应的交付物；Body 已被 usage 收集器包装（流式）或已缓冲。
@@ -63,9 +82,17 @@ type Engine struct {
 	Store   *store.Store
 	Captcha *captcha.Manager
 	Client  *http.Client
+	// Gate 管理 Start Plan（JWT）雙層併發（單號 3 + 同出口 6）、自適應收窄與預防性忙線熔斷。
+	Gate *StartPlanGate
+	// Affinity 管理三級會話親和性路由（LRU 8192，TTL 30m），提升上游 Prompt Cache 命中率。
+	Affinity *SessionAffinity
 
-	// BusyRetryDelays 3010 并发准入的重试延迟（默认 1s/2s；测试可缩短）。
+	// BusyRetryDelays 3008/3009/3010 併發准入的重試延遲（預設 1s/2s；測試可縮短）。
 	BusyRetryDelays []time.Duration
+	// ReplayDelay 未寫完請求體或複用斷連透明重放前的等待間隔（預設 250ms；測試可縮短）。
+	ReplayDelay time.Duration
+	// UploadStallTimeout 請求體上傳流控看門狗逾時（預設 90s；測試可縮短）。
+	UploadStallTimeout time.Duration
 	// OnQuotaRefresh 成功/耗尽后触发的额度刷新（M3 接入 quota 包；nil 跳过）。
 	OnQuotaRefresh func(acc *model.Account)
 
@@ -78,16 +105,48 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 		client = defaultUpstreamClient()
 	}
 	return &Engine{
-		Store:           st,
-		Captcha:         cm,
-		Client:          client,
-		BusyRetryDelays: startPlanBusyRetryDelays,
-		now:             time.Now,
+		Store:              st,
+		Captcha:            cm,
+		Client:             client,
+		Gate:               NewStartPlanGate(),
+		Affinity:           NewSessionAffinity(DefaultAffinityMaxEntries, DefaultAffinityTTL),
+		BusyRetryDelays:    startPlanBusyRetryDelays,
+		ReplayDelay:        DefaultReplayDelay,
+		UploadStallTimeout: DefaultUploadStallTimeout,
+		now:                time.Now,
 	}
 }
 
 // SetNow 注入时钟（测试用）。
 func (e *Engine) SetNow(fn func() time.Time) { e.now = fn }
+
+func (e *Engine) wallNow() time.Time { return e.now().Round(0) }
+
+func (e *Engine) replayDelay() time.Duration {
+	if e.ReplayDelay > 0 {
+		return e.ReplayDelay
+	}
+	return DefaultReplayDelay
+}
+
+func (e *Engine) uploadStallTimeout() time.Duration {
+	if e.UploadStallTimeout > 0 {
+		return e.UploadStallTimeout
+	}
+	return DefaultUploadStallTimeout
+}
+
+// closeIdleForAccount 驅逐該帳號所屬出口的髒閒置連線（401/403/405/斷連重放時呼叫）。
+func (e *Engine) closeIdleForAccount(acc *model.Account) {
+	if acc == nil || acc.ProxyURL == nil || strings.TrimSpace(*acc.ProxyURL) == "" {
+		if e.Client != nil {
+			e.Client.CloseIdleConnections()
+		}
+		proxy.CloseIdleFor("")
+		return
+	}
+	proxy.CloseIdleFor(*acc.ProxyURL)
+}
 
 // clientFor 返回账号出站客户端：配置了代理（proxy_url，含代理线路指派）时
 // 走代理 Transport，否则用引擎默认客户端。代理构造失败回退直连并记日志。
@@ -103,12 +162,13 @@ func (e *Engine) clientFor(acc *model.Account) *http.Client {
 	return &http.Client{Transport: t}
 }
 
-// defaultUpstreamClient 对齐 Python 版超时语义：连接 30s、响应头最长 120s、
-// 响应体流式读取不设超时（长连接 SSE）。
+// defaultUpstreamClient 對齊官方與長串流語義：強制啟用 HTTP/2、SmartDialContext（IPv6 零位元組自動降級）、
+// 響應頭最長 120s、響應體串流讀取不設總逾時。
 func defaultUpstreamClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
-			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			DialContext:           proxy.SmartDialContext,
+			ForceAttemptHTTP2:     true,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 120 * time.Second,
 			MaxIdleConnsPerHost:   8,
@@ -125,44 +185,184 @@ type runResult struct {
 	Body      any
 }
 
-// attemptResult 单次账号尝试的出路：retryCaptcha（同账号换令牌重试）、
-// switchAccount（换下一个账号）、final（终止并返回）。
+// emptyReply 暫存非串流 HTTP 200 空回覆（無文字也無 tool_use），供全池皆空時原樣交回。
+type emptyReply struct {
+	acc         *model.Account
+	contentType string
+	buffered    []byte
+}
+
+// attemptResult 單次帳號嘗試的出路：retryCaptcha（同帳號換驗證碼令牌重試）、
+// skippedCaptchaRetry（免驗遇 3007/挑戰頭，不扣減重試次數立即補驗）、
+// retryBusy（同帳號併發准入睡前釋放槽位延遲重試）、requeueGate（觸發自適應收窄，歸還槽位排回隊首）、
+// switchAccount（換下一個帳號）、bare429（疑似請求級裸 429）、edgeBlocked（命中出口邊緣 405）、final（終止並返回）。
 type attemptResult struct {
-	retryCaptcha  bool
-	switchAccount bool
-	final         runResult
+	retryCaptcha        bool
+	skippedCaptchaRetry bool
+	retryBusy           bool
+	busyDelay           time.Duration
+	requeueGate         bool
+	switchAccount       bool
+	bare429             bool
+	edgeBlocked         bool
+	empty               *emptyReply
+	final               runResult
+}
+
+// ResolveModel 解析請求模型名：若屬退役旗艦別名（如 GLM-5.3），且帳號池中無
+// 可選帳號對原模型標記 available、但存在可選帳號對 LiveFlagshipModel（GLM-5.4）
+// 標記 available，則自動改寫為 GLM-5.4，讓舊客戶端無感渡過上游改名。
+func ResolveModel(st *store.Store, modelName string, now time.Time) string {
+	alias := FlagshipAlias(modelName)
+	if alias == "" || st == nil {
+		return modelName
+	}
+	hasOrig, hasAlias := false, false
+	for _, a := range st.ListAccounts(model.ProviderZai) {
+		if !a.IsSelectable(now) {
+			continue
+		}
+		if a.ModelAvailability(modelName) == "available" {
+			hasOrig = true
+			break
+		}
+		if a.ModelAvailability(alias) == "available" {
+			hasAlias = true
+		}
+	}
+	if !hasOrig && hasAlias {
+		return alias
+	}
+	return modelName
 }
 
 // RunMessages 执行完整循环。body 是入口 NormalizeBody 后的请求体；
 // incomingHeaders 为客户端透传头；deliver 在上游 200 时被调用一次。
 func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingHeaders map[string]string, deliver DeliverFunc) runResult {
 	modelName, _ := body["model"].(string)
+	if resolved := ResolveModel(e.Store, modelName, e.wallNow()); resolved != modelName {
+		web.Warn("gateway", fmt.Sprintf("旗艦模型自動相容改寫: %s → %s", modelName, resolved))
+		modelName = resolved
+		body = shallowCopyBody(body)
+		body["model"] = modelName
+	}
 	stream := bodyBool(body, "stream")
 	reqID := util.RandomHex(3)
 	web.Req(reqID, orDash(modelName), stream)
 
-	// 边缘熔断期：本出口正被上游防火墙计数，入口直接拒绝，一个账号都不碰
-	if EdgeHeld(e.now()) {
-		web.Warn(reqID, "边缘熔断期，拒绝请求 zcode.z.ai")
-		return errResult(http.StatusServiceUnavailable, "upstream_edge_blocked",
-			"上游边缘防火墙已封锁本机出口，稍后自动恢复（可在后台更换出口代理）")
+	lookupKey, bindKey := DeriveAffinityKeys(body, incomingHeaders)
+	preferredID := ""
+	if e.Affinity != nil && lookupKey != "" {
+		preferredID = e.Affinity.Lookup(lookupKey, e.wallNow())
 	}
 
 	tried := map[string]bool{}
+	var lastEmpty *emptyReply
+	edgeBlocked := false
+	bare429Count := 0
+	var firstBare429Acc *model.Account
+
 	for range MaxAccountAttempts {
-		acc := e.Store.Select(model.ProviderZai, tried, modelName)
+		now := e.wallNow()
+		var inFlightFn func(string) int
+		if e.Gate != nil {
+			inFlightFn = e.Gate.AccountInFlight
+		}
+		acc := e.Store.SelectSmart(model.ProviderZai, tried, modelName, store.SelectOptions{
+			Now:         now,
+			PreferredID: preferredID,
+			InFlight:    inFlightFn,
+			CanStick: func(cand *model.Account) bool {
+				ak := AddressKeyFor(cand)
+				if EdgeHeldFor(ak, now) {
+					return false
+				}
+				if cand.Mode == "jwt" && e.Gate != nil {
+					if held, _ := e.Gate.BusyHeld(ak); held {
+						return false
+					}
+					if e.Gate.AccountInFlight(cand.ID) >= e.Gate.AccountCap(cand.ID) {
+						return false
+					}
+				}
+				return true
+			},
+		})
 		if acc == nil {
 			break
 		}
 		tried[acc.ID] = true
-		res := e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, deliver)
+		if EdgeHeldFor(AddressKeyFor(acc), now) {
+			edgeBlocked = true
+			if acc.ID == preferredID && e.Affinity != nil {
+				e.Affinity.EvictIfAccount(lookupKey, acc.ID)
+			}
+			web.Warn(reqID, fmt.Sprintf("帳號 %s 所屬出口處於邊緣熔斷期，跳過並嘗試其他出口", acc.Name))
+			continue
+		}
+		res := e.tryAccount(ctx, reqID, acc, body, modelName, stream, true, incomingHeaders, deliver)
+		if res.empty != nil {
+			lastEmpty = res.empty
+		}
+		if res.edgeBlocked {
+			edgeBlocked = true
+		}
+
+		// 請求級裸 429 防雪崩：第 1 號標記探測冷卻並換號探測；連續第 2 號再回裸 429 則僅平反探測冷卻並立即止損
+		if res.bare429 {
+			bare429Count++
+			if acc.ID == preferredID && e.Affinity != nil {
+				e.Affinity.EvictIfAccount(lookupKey, acc.ID)
+			}
+			if bare429Count == 1 {
+				firstBare429Acc = acc
+				e.mark(acc, model.StatusCooling, Bare429ProbeReason)
+				web.Warn(reqID, fmt.Sprintf("帳號 %s 收到裸 429，暫標冷卻並換號探測", acc.Name))
+				continue
+			}
+			if firstBare429Acc != nil {
+				e.Store.Update(firstBare429Acc.Provider, firstBare429Acc.ID, func(a *model.Account) {
+					if a.Status == model.StatusCooling && a.LastError != nil && *a.LastError == Bare429ProbeReason {
+						a.Status = model.StatusActive
+						a.CoolingUntil = nil
+						a.LastError = nil
+					}
+				})
+			}
+			web.Warn(reqID, fmt.Sprintf("連續 2 個帳號觸發無業務碼裸 429（疑似請求級限流），已恢復探路帳號並立即止損"))
+			return res.final
+		}
+		bare429Count = 0
+		firstBare429Acc = nil
+
 		if res.retryCaptcha {
 			continue
 		}
 		if res.switchAccount {
+			if acc.ID == preferredID && e.Affinity != nil {
+				e.Affinity.EvictIfAccount(lookupKey, acc.ID)
+			}
 			continue
 		}
+		if res.final.Delivered && e.Affinity != nil && bindKey != "" {
+			e.Affinity.Bind(bindKey, acc.ID, e.wallNow())
+		}
 		return res.final
+	}
+
+	// 若全部可選帳號均回傳非串流 200 空回覆，則誠實交付最後一次空回覆
+	if lastEmpty != nil {
+		res := e.deliverJSONPayload(reqID, lastEmpty.acc, lastEmpty.contentType, lastEmpty.buffered, deliver).final
+		if res.Delivered && e.Affinity != nil && bindKey != "" {
+			e.Affinity.Bind(bindKey, lastEmpty.acc.ID, e.wallNow())
+		}
+		return res
+	}
+
+	if edgeBlocked {
+		web.Warn(reqID, "目前可用出口均處於邊緣熔斷期，拒絕請求 zcode.z.ai")
+		return errResult(http.StatusServiceUnavailable, "upstream_edge_blocked",
+			"上游邊緣防火牆已封鎖目前出口，稍後自動恢復（可在後台更換出口代理）")
 	}
 
 	if modelName != "" {
@@ -241,7 +441,10 @@ func (e *Engine) TestAccount(ctx context.Context, acc *model.Account, modelName 
 		return nil
 	}
 
-	res := e.tryAccount(ctx, reqID, acc, body, modelName, false, nil, deliver)
+	res := e.tryAccount(ctx, reqID, acc, body, modelName, false, false, nil, deliver)
+	if res.bare429 {
+		e.mark(acc, model.StatusCooling, "上游限流 HTTP 429")
+	}
 	if delivered {
 		web.ReqOk(reqID, 0)
 		return TestAccountResult{OK: true, Status: http.StatusOK}
@@ -265,7 +468,8 @@ func (e *Engine) TestAccount(ctx context.Context, acc *model.Account, modelName 
 	return TestAccountResult{OK: false, Status: status, Reason: reason}
 }
 
-// tryAccount 单个账号的尝试：内层为验证码重试（对齐 MAX_CAPTCHA_RETRIES）。
+// tryAccount 單個帳號的嘗試：外層處理 Start Plan 雙層閘門與收窄隊首重排，
+// 內層處理驗證碼與併發准入重試（對齊 MaxCaptchaRetries）。
 func (e *Engine) tryAccount(
 	ctx context.Context,
 	reqID string,
@@ -273,19 +477,85 @@ func (e *Engine) tryAccount(
 	body map[string]any,
 	modelName string,
 	stream bool,
+	retryEmpty bool,
 	incomingHeaders map[string]string,
 	deliver DeliverFunc,
 ) attemptResult {
 	needsCaptcha := acc.Mode == "jwt"
+	addrKey := AddressKeyFor(acc)
 
-	for captchaAttempt := range MaxCaptchaRetries {
+	for requeueCount := 0; requeueCount <= MaxGateRequeue; requeueCount++ {
+		var lease *GateLease
+		if needsCaptcha && e.Gate != nil {
+			var err error
+			lease, err = e.Gate.Acquire(ctx, acc.ID, addrKey, requeueCount > 0)
+			if err != nil {
+				if isCanceled(ctx, err) {
+					web.Warn(reqID, "客户端已断开，终止等待")
+					return canceledResult()
+				}
+				var holdErr *BusyHoldError
+				if errors.As(err, &holdErr) {
+					web.Warn(reqID, holdErr.Error())
+					return attemptResult{final: errResult(http.StatusTooManyRequests, "start_plan_busy_hold", holdErr.Error())}
+				}
+				var waitErr *GateWaitError
+				if errors.As(err, &waitErr) {
+					web.Warn(reqID, waitErr.Error())
+					return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", waitErr.Error())}
+				}
+				return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", err.Error())}
+			}
+		}
+
+		res := e.tryAccountWithLease(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, needsCaptcha, requeueCount, incomingHeaders, deliver, &lease)
+		if lease != nil {
+			lease.Release()
+			lease = nil
+		}
+		if res.requeueGate && requeueCount < MaxGateRequeue {
+			web.Warn(reqID, fmt.Sprintf("帳號 %s 併發上限已自適應收窄，歸還槽位並排回隊首重試（第 %d 次）", acc.Name, requeueCount+1))
+			continue
+		}
+		return res
+	}
+	return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", "併發重排次數已達上限")}
+}
+
+// tryAccountWithLease 在已持有 Start Plan 閘門租約期間執行上游呼叫與內層重試。
+// 傳入 leasePtr 供 3008/3009/3010 延遲重試前主動歸還槽位、醒來後隊首重取，避免睡眠佔槽。
+func (e *Engine) tryAccountWithLease(
+	ctx context.Context,
+	reqID string,
+	acc *model.Account,
+	addrKey string,
+	body map[string]any,
+	modelName string,
+	stream bool,
+	retryEmpty bool,
+	needsCaptcha bool,
+	requeueCount int,
+	incomingHeaders map[string]string,
+	deliver DeliverFunc,
+	leasePtr **GateLease,
+) attemptResult {
+	captchaAttempt := 0
+	busyAttempt := 0
+	forceCaptcha := false
+	for captchaAttempt < MaxCaptchaRetries {
 		var verifyParam, verifyRegion string
 		if needsCaptcha {
-			token, err := e.Captcha.GetVerifyParam(ctx)
+			token, err := e.Captcha.GetVerifyParamForModel(ctx, addrKey, forceCaptcha)
 			if err != nil {
-				e.Captcha.Invalidate()
-				if captchaAttempt+1 < MaxCaptchaRetries {
-					web.Warn(reqID, fmt.Sprintf("验证码自动求解失败，刷新令牌重试（第 %d 次）", captchaAttempt+1))
+				// 客戶端斷線不得清空全域驗證碼快取
+				if isCanceled(ctx, err) {
+					web.Warn(reqID, "客户端已断开，终止验证码获取")
+					return canceledResult()
+				}
+				e.Captcha.InvalidateForAddr(addrKey)
+				captchaAttempt++
+				if captchaAttempt < MaxCaptchaRetries {
+					web.Warn(reqID, fmt.Sprintf("验证码自动求解失败，刷新令牌重试（第 %d 次）", captchaAttempt))
 					continue
 				}
 				return attemptResult{final: e.captchaRequired(reqID, err.Error())}
@@ -294,15 +564,7 @@ func (e *Engine) tryAccount(
 				verifyParam, verifyRegion = token.VerifyParam, token.Region
 			}
 		}
-
-		// 每个账号在副本上做 NormalizeBody（system 注入不幂等，见 body.go）
-		actualBody := shallowCopyBody(body)
-		NormalizeBody(actualBody, needsCaptcha)
-		payload, err := util.MarshalJSON(actualBody)
-		if err != nil {
-			web.Err(reqID, fmt.Sprintf("请求体序列化失败: %v", err))
-			return attemptResult{final: errResult(http.StatusBadRequest, "invalid_request", "请求体无法序列化")}
-		}
+		skippedCaptcha := needsCaptcha && verifyParam == ""
 
 		req, err := upstream.BuildRequest(acc, verifyParam, verifyRegion, incomingHeaders)
 		if err != nil {
@@ -311,38 +573,135 @@ func (e *Engine) tryAccount(
 			return attemptResult{switchAccount: true}
 		}
 
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, bytes.NewReader(payload))
+		// 每個帳號在副本上進行 ToolSearch 清洗、QueryID 計算與 NormalizeBodyFor
+		// （須於 DressSystem 插入日期前綴之前計算 QueryID，確保使用者輪次計數正確）
+		actualBody := shallowCopyBody(body)
+		toolSearchRenamed := RewriteToolSearchRequest(actualBody)
+		upstream.SetQueryID(&req, actualBody)
+		NormalizeBodyFor(actualBody, needsCaptcha, upstream.AccountDeviceMid(acc), req.Headers["x-session-id"])
+		payload, err := util.MarshalJSON(actualBody)
 		if err != nil {
-			// 失败源于 req.URL（即 ZAI_UPSTREAM_URL 配置），与账号凭证无关。
-			// 标 invalid 会把整池账号逐个标失效并落库，且 last_error 指向错误方向。
-			// 配置错误换号也修不好，直接终止并如实报告。
-			web.Err(reqID, fmt.Sprintf("上游地址无效（检查 ZAI_UPSTREAM_URL）: %v", err))
-			return attemptResult{final: errResult(http.StatusBadGateway, "invalid_upstream_url",
-				"上游地址配置无效，请检查 ZAI_UPSTREAM_URL")}
-		}
-		for k, v := range req.Headers {
-			httpReq.Header.Set(k, v)
+			web.Err(reqID, fmt.Sprintf("请求体序列化失败: %v", err))
+			return attemptResult{final: errResult(http.StatusBadRequest, "invalid_request", "请求体无法序列化")}
 		}
 
-		resp, err := e.clientFor(acc).Do(httpReq)
-		if err != nil {
-			// 客户端主动断开（Ctrl-C、调用方超时、反代截断）会让 ctx 取消，
-			// Do 随即返回 context.Canceled。这不是账号的问题：若照「连接失败」
-			// 处理，后续每轮 Select→Do 都会立刻失败，最多把 5 个账号各标一次
-			// 冷却并落库，小账号池几次中断就全池不可用。此时直接终止，
-			// 不写任何账号状态。
-			if isCanceled(ctx, err) {
-				web.Warn(reqID, "客户端已断开，终止重试")
-				return canceledResult()
+		// 出站呼叫 + 未寫完請求體／複用斷連 1 次透明重放（250ms）+ 上傳流控看門狗
+		var (
+			resp          *http.Response
+			reqCleanup    func()
+			sendAttempted attemptResult
+			sendFailed    bool
+		)
+		for netAttempt := 0; netAttempt < 2; netAttempt++ {
+			tracedCtx, traceState := AttachReplayTrace(ctx)
+			reqCtx, reqBody, cleanup, stalled := WrapBodyWithStallGuard(tracedCtx, payload, e.uploadStallTimeout(), traceState)
+
+			httpReq, reqErr := http.NewRequestWithContext(reqCtx, http.MethodPost, req.URL, reqBody)
+			if reqErr != nil {
+				cleanup()
+				web.Err(reqID, fmt.Sprintf("上游地址无效（检查 ZAI_UPSTREAM_URL）: %v", reqErr))
+				return attemptResult{final: errResult(http.StatusBadGateway, "invalid_upstream_url",
+					"上游地址配置无效，请检查 ZAI_UPSTREAM_URL")}
 			}
-			e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
+			httpReq.ContentLength = int64(len(payload))
+			for k, v := range req.Headers {
+				httpReq.Header.Set(k, v)
+			}
+
+			r, doErr := e.clientFor(acc).Do(httpReq)
+			if doErr == nil {
+				resp = r
+				reqCleanup = cleanup
+				break
+			}
+			wasStalled := stalled()
+			cleanup()
+			if wasStalled {
+				e.closeIdleForAccount(acc)
+				web.Warn(reqID, fmt.Sprintf("帳號 %s 上游請求體上傳流控停滯逾時，驅逐閒置連線並切換帳號", acc.Name))
+				sendAttempted = attemptResult{switchAccount: true}
+				sendFailed = true
+				break
+			}
+			if isCanceled(ctx, doErr) {
+				web.Warn(reqID, "客户端已断开，终止重试")
+				sendAttempted = canceledResult()
+				sendFailed = true
+				break
+			}
+			if netAttempt == 0 && ShouldTransparentReplay(ctx, doErr, traceState, false) {
+				e.closeIdleForAccount(acc)
+				web.Warn(reqID, fmt.Sprintf("帳號 %s 出站連線未送達即斷開，%dms 後透明重放 1 次", acc.Name, e.replayDelay().Milliseconds()))
+				select {
+				case <-ctx.Done():
+					sendAttempted = canceledResult()
+					sendFailed = true
+				case <-time.After(e.replayDelay()):
+					continue
+				}
+				break
+			}
+			e.mark(acc, model.StatusCooling, "连接失败: "+doErr.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))
-			return attemptResult{switchAccount: true}
+			sendAttempted = attemptResult{switchAccount: true}
+			sendFailed = true
+			break
+		}
+		if sendFailed {
+			return sendAttempted
 		}
 
 		if resp.StatusCode >= 400 {
-			res := e.handleUpstreamError(ctx, reqID, acc, modelName, needsCaptcha, resp, captchaAttempt)
+			res := e.handleUpstreamError(ctx, reqID, acc, addrKey, modelName, needsCaptcha, skippedCaptcha, resp, captchaAttempt, busyAttempt, requeueCount)
+			reqCleanup()
+			if res.skippedCaptchaRetry {
+				forceCaptcha = true
+				continue
+			}
 			if res.retryCaptcha {
+				captchaAttempt++
+				continue
+			}
+			if res.retryBusy {
+				// 睡眠前主動歸還 Start Plan 槽位，避免等待期間阻塞其他併發請求；醒來隊首重取
+				if leasePtr != nil && *leasePtr != nil {
+					(*leasePtr).Release()
+					*leasePtr = nil
+				}
+				select {
+				case <-ctx.Done():
+					return canceledResult()
+				case <-time.After(res.busyDelay):
+				}
+				if needsCaptcha && e.Gate != nil {
+					if held, rem := e.Gate.BusyHeld(addrKey); held {
+						holdErr := &BusyHoldError{Remaining: rem}
+						web.Warn(reqID, holdErr.Error())
+						return attemptResult{final: errResult(http.StatusTooManyRequests, "start_plan_busy_hold", holdErr.Error())}
+					}
+					newLease, acqErr := e.Gate.Acquire(ctx, acc.ID, addrKey, true)
+					if acqErr != nil {
+						if isCanceled(ctx, acqErr) {
+							web.Warn(reqID, "客户端已断开，终止等待")
+							return canceledResult()
+						}
+						var holdErr *BusyHoldError
+						if errors.As(acqErr, &holdErr) {
+							web.Warn(reqID, holdErr.Error())
+							return attemptResult{final: errResult(http.StatusTooManyRequests, "start_plan_busy_hold", holdErr.Error())}
+						}
+						var waitErr *GateWaitError
+						if errors.As(acqErr, &waitErr) {
+							web.Warn(reqID, waitErr.Error())
+							return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", waitErr.Error())}
+						}
+						return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", acqErr.Error())}
+					}
+					if leasePtr != nil {
+						*leasePtr = newLease
+					}
+				}
+				busyAttempt++
 				continue
 			}
 			return res
@@ -353,24 +712,38 @@ func (e *Engine) tryAccount(
 			contentType = "application/json"
 		}
 
-		// HTTP 200 且为 JSON：先缓冲，处理 HTTP 200 包装的业务错误
+		// HTTP 200 且為 JSON：限長 32 MiB 緩衝，處理業務錯誤、靜默空拒絕與空回覆故障轉移
 		if strings.Contains(contentType, "application/json") {
-			buffered, err := io.ReadAll(resp.Body)
+			buffered, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 			_ = resp.Body.Close()
+			reqCleanup()
 			if err != nil {
+				if isCanceled(ctx, err) {
+					web.Warn(reqID, "客戶端已斷開，終止讀取回應")
+					return canceledResult()
+				}
 				e.bumpFail(acc)
-				web.ReqErr(reqID, fmt.Sprintf("上游错误体读取失败（账号 %s）", acc.Name))
+				web.ReqErr(reqID, fmt.Sprintf("上游回應體讀取失敗（帳號 %s）", acc.Name))
 				return attemptResult{final: errResult(http.StatusBadGateway, "upstream_error", textPreview(err.Error()))}
 			}
-			res := e.handleUpstreamJSON(reqID, acc, modelName, needsCaptcha, stream, contentType, buffered, captchaAttempt, deliver)
+			if toolSearchRenamed {
+				buffered = RestoreToolSearchJSON(buffered)
+			}
+			res := e.handleUpstreamJSON(reqID, acc, addrKey, modelName, needsCaptcha, skippedCaptcha, stream, retryEmpty, contentType, buffered, captchaAttempt, deliver)
+			if res.skippedCaptchaRetry {
+				forceCaptcha = true
+				continue
+			}
 			if res.retryCaptcha {
+				captchaAttempt++
 				continue
 			}
 			return res
 		}
 
-		// SSE 成功：tee 读取流，交付完整后计入 usage
-		return e.deliverStream(reqID, acc, contentType, resp, deliver)
+		// SSE 成功：串流交付結束並關閉 Body 後再釋放看門狗上下文
+		defer reqCleanup()
+		return e.deliverStream(reqID, acc, contentType, resp, toolSearchRenamed, deliver)
 	}
 
 	// 验证码重试次数耗尽
@@ -385,10 +758,14 @@ func (e *Engine) handleUpstreamError(
 	ctx context.Context,
 	reqID string,
 	acc *model.Account,
+	addrKey string,
 	modelName string,
 	needsCaptcha bool,
+	skippedCaptcha bool,
 	resp *http.Response,
 	captchaAttempt int,
+	busyAttempt int,
+	requeueCount int,
 ) attemptResult {
 	// 错误响应体限长：正常路径是流式转发（边读边发），只有错误分支才整段读进
 	// 内存。上游或账号级代理异常时可能回一个极大的 body，无上限会直接吃光内存。
@@ -408,7 +785,12 @@ func (e *Engine) handleUpstreamError(
 
 	// 1) 验证码挑战（响应头 / code=3007 / F001 与文本仅限 400/403）
 	if needsCaptcha && IsCaptchaError(text, resp.StatusCode, resp.Header) {
-		e.Captcha.Invalidate()
+		if skippedCaptcha {
+			e.Captcha.InvalidateModelSkip()
+			web.Warn(reqID, fmt.Sprintf("帳號 %s 免驗請求遭遇上游驗證碼挑戰，已失效 skip_model_request 並立即補驗", acc.Name))
+			return attemptResult{skippedCaptchaRetry: true}
+		}
+		e.Captcha.InvalidateForAddr(addrKey)
 		web.Warn(reqID, fmt.Sprintf("账号 %s 验证码失效，刷新重试（第 %d 次）", acc.Name, captchaAttempt+1))
 		if captchaAttempt+1 >= MaxCaptchaRetries {
 			detail := "上游连续拒绝验证码"
@@ -423,25 +805,31 @@ func (e *Engine) handleUpstreamError(
 	// 1.5) 上游风控（405）：先区分边缘拦截页与账号级拒绝——两者共用同一句
 	// "request has been blocked" 文案，处置完全不同。
 	if IsZcodeEdgeBlocked(resp.StatusCode, text) {
-		// 边缘拦截页 = 本机出口被封（网络级）：全局熔断，本请求终止。
-		// 账号状态不动（账号是好的，换 IP 即恢复），也不换号——换号结果相同。
-		HoldEdge(time.Duration(config.EdgeHoldSeconds)*time.Second, e.now())
+		// 邊緣攔截頁 = 該出口 IP 被封：熔斷該出口、驅逐髒連線並換下一個其他出口帳號
+		HoldEdgeFor(addrKey, time.Duration(config.EdgeHoldSeconds)*time.Second, e.wallNow())
+		e.closeIdleForAccount(acc)
 		e.bumpFail(acc)
-		web.Warn(reqID, fmt.Sprintf("上游边缘防火墙拦截本机出口，全局熔断 %d s", config.EdgeHoldSeconds))
-		return attemptResult{final: errResult(http.StatusServiceUnavailable, "upstream_edge_blocked",
-			"上游边缘防火墙已封锁本机出口，稍后自动恢复（可在后台更换出口代理）")}
+		web.Warn(reqID, fmt.Sprintf("上游邊緣防火牆攔截出口（%s），熔斷 %d s 並嘗試切換其他出口帳號", addrKey, config.EdgeHoldSeconds))
+		return attemptResult{
+			switchAccount: true,
+			edgeBlocked:   true,
+			final: errResult(http.StatusServiceUnavailable, "upstream_edge_blocked",
+				"上游邊緣防火牆已封鎖目前出口，稍後自動恢復（可在後台更換出口代理）"),
+		}
 	}
 	if IsZcodeRestricted(resp.StatusCode, text) {
-		// 3012 = 账号被风控限制（官方 App 同样被拒）：长冷却休息，换号。
+		// 3012 = 账号被风控限制（官方 App 同样被拒）：驅逐髒連線、長冷卻休息並換號
+		e.closeIdleForAccount(acc)
 		e.bumpFail(acc)
 		MarkAccountCooling(e.Store, acc.Provider, acc.ID,
-			fmt.Sprintf("上游风控 3012 拒绝（HTTP 405）"), time.Duration(config.RestrictedCooldownSeconds)*time.Second, e.now())
+			"上游风控 3012 拒绝（HTTP 405）", time.Duration(config.RestrictedCooldownSeconds)*time.Second, e.wallNow())
 		web.Warn(reqID, fmt.Sprintf("账号 %s 被上游风控限制（3012），冷却 %d s 后重试", acc.Name, config.RestrictedCooldownSeconds))
 		return attemptResult{switchAccount: true}
 	}
 
 	// 2) 鉴权失败是强信号（JWT 上游为裸 401 空 body；api.z.ai 为 type=1000/1001/1003）
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		e.closeIdleForAccount(acc)
 		e.mark(acc, model.StatusInvalid, fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
 		web.Warn(reqID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
 		return attemptResult{switchAccount: true}
@@ -455,35 +843,56 @@ func (e *Engine) handleUpstreamError(
 		return attemptResult{switchAccount: true}
 	}
 
-	// 4) 429 且 code=3010：模型并发准入限制，账号仍可用，按原版客户端延迟重试
+	// 4) 429 且 code∈{3008,3009,3010}：併發准入限制，帳號仍可用，先於持槽期回報閘門再交由外層釋槽睡眠重試
 	if IsModelConcurrencyLimit(resp.StatusCode, text) {
-		if captchaAttempt < len(e.BusyRetryDelays) {
-			delay := e.BusyRetryDelays[captchaAttempt]
-			web.Warn(reqID, fmt.Sprintf("模型并发准入受限，%g s 后重试（账号仍可用）", delay.Seconds()))
-			select {
-			case <-ctx.Done():
-				return canceledResult()
-			case <-time.After(delay):
+		if needsCaptcha && e.Gate != nil {
+			requeue, holdTriggered := e.Gate.RecordConcurrencyRefusal(acc.ID, addrKey, busyAttempt)
+			if holdTriggered {
+				_, rem := e.Gate.BusyHeld(addrKey)
+				holdErr := &BusyHoldError{Remaining: rem}
+				web.Warn(reqID, holdErr.Error())
+				return attemptResult{final: errResult(http.StatusTooManyRequests, "start_plan_busy_hold", holdErr.Error())}
 			}
-			return attemptResult{retryCaptcha: true}
+			if requeue && requeueCount < MaxGateRequeue {
+				return attemptResult{requeueGate: true}
+			}
 		}
-		web.Warn(reqID, fmt.Sprintf("模型并发准入持续受限（账号 %s），保留账号状态", acc.Name))
+		if busyAttempt < len(e.BusyRetryDelays) {
+			delay := e.BusyRetryDelays[busyAttempt]
+			web.Warn(reqID, fmt.Sprintf("模型併發准入受限，先歸還槽位並於 %g s 後隊首重取重試", delay.Seconds()))
+			return attemptResult{retryBusy: true, busyDelay: delay}
+		}
+		web.Warn(reqID, fmt.Sprintf("模型併發准入持續受限（帳號 %s），保留帳號狀態", acc.Name))
 		return attemptResult{final: runResult{
 			Status: resp.StatusCode,
 			Body:   passthroughBodyWithType(text, "upstream_rate_limit"),
 		}}
 	}
 
-	// 5) 429：官方用量上限码族 → 该模型耗尽；其余瞬时限流 → 冷却
+	// 5) 429：官方用量上限码族 → 该模型耗尽；無業務碼裸 429 → 交由 RunMessages 雙號探測止損；其餘瞬時限流 → 冷卻
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if quotaExhaustedCodes[UpstreamBusinessCode(text)] {
 			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", OrCurrent(modelName)))
 			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, OrCurrent(modelName)))
 			e.fireRefresh(acc)
-		} else {
-			e.mark(acc, model.StatusCooling, "上游限流 HTTP 429")
-			web.Warn(reqID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
+			return attemptResult{switchAccount: true}
 		}
+		if IsBare429(resp.StatusCode, text, resp.Header) {
+			msg := text
+			if strings.TrimSpace(msg) == "" {
+				msg = Bare429FallbackMessage
+			}
+			return attemptResult{
+				switchAccount: true,
+				bare429:       true,
+				final: runResult{
+					Status: resp.StatusCode,
+					Body:   passthroughBodyWithType(msg, "upstream_rate_limit"),
+				},
+			}
+		}
+		e.mark(acc, model.StatusCooling, "上游限流 HTTP 429")
+		web.Warn(reqID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
 		return attemptResult{switchAccount: true}
 	}
 
@@ -509,9 +918,12 @@ func (e *Engine) handleUpstreamError(
 func (e *Engine) handleUpstreamJSON(
 	reqID string,
 	acc *model.Account,
+	addrKey string,
 	modelName string,
 	needsCaptcha bool,
+	skippedCaptcha bool,
 	stream bool,
+	retryEmpty bool,
 	contentType string,
 	buffered []byte,
 	captchaAttempt int,
@@ -528,7 +940,12 @@ func (e *Engine) handleUpstreamJSON(
 		return attemptResult{switchAccount: true}
 
 	case needsCaptcha && code == "3007":
-		e.Captcha.Invalidate()
+		if skippedCaptcha {
+			e.Captcha.InvalidateModelSkip()
+			web.Warn(reqID, fmt.Sprintf("帳號 %s 免驗請求收到 HTTP 200 業務碼 3007，已失效 skip_model_request 並立即補驗", acc.Name))
+			return attemptResult{skippedCaptchaRetry: true}
+		}
+		e.Captcha.InvalidateForAddr(addrKey)
 		web.Warn(reqID, fmt.Sprintf("帳號 %s 驗證碼失效，刷新重試（第 %d 次）", acc.Name, captchaAttempt+1))
 		if captchaAttempt+1 >= MaxCaptchaRetries {
 			return attemptResult{final: e.captchaRequired(reqID, "上游連續拒絕驗證碼")}
@@ -547,13 +964,32 @@ func (e *Engine) handleUpstreamJSON(
 			}},
 		}}
 
+	case IsRefusedEnvelope(buffered):
+		// 上游靜默版本拒絕空信封：不記帳號失敗、不換號空轉，直接回報客戶端版本異常
+		web.ReqErr(reqID, fmt.Sprintf("上游返回靜默空拒絕信封（帳號 %s，疑似版本過舊）", acc.Name))
+		return attemptResult{final: errResult(http.StatusBadGateway, "upstream_version_refused",
+			"上游靜默拒絕請求（返回空信封，疑似客戶端版本號過舊，請檢查 ZCODE_CLIENT_VERSION）")}
+
 	case stream:
 		e.bumpFail(acc)
 		web.ReqErr(reqID, fmt.Sprintf("上游串流請求返回非 SSE JSON（帳號 %s）", acc.Name))
 		return attemptResult{final: errResult(http.StatusBadGateway, "invalid_upstream_response", "上游未返回有效的 SSE 串流")}
 	}
 
-	// 成功（业务码缺失 / 0）：交付缓冲体
+	// 非串流空回覆（HTTP 200 且具 content 陣列但無非空 text 亦無 tool_use）：
+	// 換號重試並保留本次空回覆，若全池皆空才原樣交付（對齊 D3-vin/Zcode2Api）。
+	if retryEmpty && isEmptyAnthropicReply(buffered) {
+		web.Warn(reqID, fmt.Sprintf("帳號 %s 回傳空回覆（無 text/tool_use），切換下一個帳號重試", acc.Name))
+		return attemptResult{
+			switchAccount: true,
+			empty:         &emptyReply{acc: acc, contentType: contentType, buffered: buffered},
+		}
+	}
+
+	return e.deliverJSONPayload(reqID, acc, contentType, buffered, deliver)
+}
+
+func (e *Engine) deliverJSONPayload(reqID string, acc *model.Account, contentType string, buffered []byte, deliver DeliverFunc) attemptResult {
 	e.success(acc)
 	usage := NewUsageCollector(strings.Contains(contentType, "text/event-stream"))
 	usage.Feed(buffered)
@@ -567,15 +1003,52 @@ func (e *Engine) handleUpstreamJSON(
 	return e.finishDelivery(reqID, acc, usage, err)
 }
 
+// isEmptyAnthropicReply 判斷非串流 JSON 回覆是否為「含 content 陣列但無非空 text 且無 tool_use」的空回覆。
+// 不含 content 欄位的非標準 JSON 視為非空，避免誤判。
+func isEmptyAnthropicReply(buffered []byte) bool {
+	var payload map[string]any
+	if err := json.Unmarshal(buffered, &payload); err != nil {
+		return false
+	}
+	blocks, ok := payload["content"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch block["type"] {
+		case "text":
+			if t, _ := block["text"].(string); strings.TrimSpace(t) != "" {
+				return false
+			}
+		case "thinking":
+			// 空白 thinking 區塊僅為佔位結構，須含實質思考文字才視為非空回覆
+			if t, _ := block["thinking"].(string); strings.TrimSpace(t) != "" {
+				return false
+			}
+		case "tool_use", "redacted_thinking":
+			return false
+		}
+	}
+	return true
+}
+
 // deliverStream 交付 SSE 流式响应；usage 随读取同步收集，客户端完整接收后计入。
-func (e *Engine) deliverStream(reqID string, acc *model.Account, contentType string, resp *http.Response, deliver DeliverFunc) attemptResult {
+func (e *Engine) deliverStream(reqID string, acc *model.Account, contentType string, resp *http.Response, restoreToolSearch bool, deliver DeliverFunc) attemptResult {
 	e.success(acc)
 	usage := NewUsageCollector(strings.Contains(contentType, "text/event-stream"))
+	var bodyReader io.Reader = resp.Body
+	if restoreToolSearch {
+		bodyReader = RestoreToolSearchStream(bodyReader)
+	}
 	err := deliver(Delivery{
 		StatusCode:  resp.StatusCode,
 		ContentType: contentType,
 		Header:      resp.Header,
-		Body:        &teeReader{r: resp.Body, c: usage},
+		Body:        &teeReader{r: bodyReader, c: usage},
 	})
 	_ = resp.Body.Close()
 	return e.finishDelivery(reqID, acc, usage, err)
@@ -604,9 +1077,10 @@ func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCo
 // 二者按账号 ID 定位并在 Store 锁内修改真实对象：调用方持有的是 Select
 // 返回的深拷贝，直接改它既不会落库、也会与并发读取竞争。
 
-// MarkAccount 设置账号状态；status 为 cooling 时按配置写入冷却截止时间。
+// MarkAccount 设置账号状态；status 为 cooling 时按配置写入冷却截止时间（使用牆鐘時間）。
 // 账号不存在时静默返回（可能已被后台删除）。
 func MarkAccount(st *store.Store, provider, id, status, errMsg string, now time.Time) {
+	now = now.Round(0)
 	st.Update(provider, id, func(acc *model.Account) {
 		acc.Status = status
 		acc.LastError = &errMsg
@@ -617,10 +1091,9 @@ func MarkAccount(st *store.Store, provider, id, status, errMsg string, now time.
 	})
 }
 
-// MarkAccountCooling 以自定义冷却时长标记账号 cooling（区别于配置的默认
-// 冷却）：上游风控 3012 的限制远比瞬时限流持久，用默认 5 分钟冷却会让
-// 被封账号反复回池空耗请求。engine 与 asyncpool 共用。
+// MarkAccountCooling 以自定义冷却时长标记账号 cooling（使用牆鐘時間）。
 func MarkAccountCooling(st *store.Store, provider, id, errMsg string, cooldown time.Duration, now time.Time) {
+	now = now.Round(0)
 	st.Update(provider, id, func(acc *model.Account) {
 		acc.Status = model.StatusCooling
 		until := float64(now.Add(cooldown).UnixNano()) / 1e9
@@ -685,7 +1158,7 @@ func isStrongStatus(status string) bool {
 }
 
 func (e *Engine) mark(acc *model.Account, status, errMsg string) {
-	MarkAccount(e.Store, acc.Provider, acc.ID, status, errMsg, e.now())
+	MarkAccount(e.Store, acc.Provider, acc.ID, status, errMsg, e.wallNow())
 }
 
 func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg string) {
@@ -699,6 +1172,7 @@ func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg st
 // 否则后台用量页会漏算 async 流量，冷却到期的账号也只能等下一轮额度轮询
 // 才恢复调度。
 func MarkSuccess(st *store.Store, provider, id string, now time.Time) {
+	now = now.Round(0)
 	ts := float64(now.UnixNano()) / 1e9
 	st.Update(provider, id, func(a *model.Account) {
 		a.UseCount++
@@ -712,7 +1186,7 @@ func MarkSuccess(st *store.Store, provider, id string, now time.Time) {
 // success 记录成功调用的账号状态；并异步触发一次额度刷新
 // （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
 func (e *Engine) success(acc *model.Account) {
-	MarkSuccess(e.Store, acc.Provider, acc.ID, e.now())
+	MarkSuccess(e.Store, acc.Provider, acc.ID, e.wallNow())
 	e.fireRefresh(acc)
 }
 
@@ -749,7 +1223,6 @@ func (e *Engine) captchaRequired(reqID, detail string) runResult {
 // ── 小工具 ──────────────────────────────────────────────────────────────────
 
 // marshalJSON 与 Python json.dumps(ensure_ascii=False) 对齐：不转义 HTML 字符。
-
 
 // teeReader 在读取时同步餵入 usage 收集器。
 type teeReader struct {
@@ -860,5 +1333,3 @@ func orDash(modelName string) string {
 	}
 	return modelName
 }
-
-

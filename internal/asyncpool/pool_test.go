@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,17 +71,22 @@ type upstreamSpec struct {
 
 // scriptedUpstream 脚本化上游服务器。
 type scriptedUpstream struct {
-	mu    sync.Mutex
-	specs []upstreamSpec
-	calls []http.Header
+	mu     sync.Mutex
+	specs  []upstreamSpec
+	calls  []http.Header
+	bodies []map[string]any
 }
 
 func (s *scriptedUpstream) start(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ := io.ReadAll(r.Body)
+		var parsedBody map[string]any
+		_ = json.Unmarshal(rawBody, &parsedBody)
 		s.mu.Lock()
 		n := len(s.calls)
 		s.calls = append(s.calls, r.Header.Clone())
+		s.bodies = append(s.bodies, parsedBody)
 		spec := upstreamSpec{status: http.StatusBadGateway}
 		if n < len(s.specs) {
 			spec = s.specs[n]
@@ -1001,6 +1007,170 @@ func TestConcurrencyLimitKeepsAccountState(t *testing.T) {
 	}
 }
 
+func TestAsyncPoolRetriesConcurrencyLimit(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	p.BusyRetryDelay = time.Millisecond
+	config.AsyncMaxRetries = 2
+	acc1, err := st.AddAccount(model.ProviderZai, "acc-1", "h1.p1.s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc2, err := st.AddAccount(model.ProviderZai, "acc-2", "h2.p2.s2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 透過額外佔用 acc1 與 acc2 各 1 條槽位（令兩者最小在飛數相等以按輪詢先選 acc1），
+	// 並於短暫延遲後釋放 acc1 槽位，驗證第二次 3008 會觸發收窄並隊首重排成功
+	extraLease, err := p.Gate.Acquire(context.Background(), acc1.ID, "direct", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc2Lease, err := p.Gate.Acquire(context.Background(), acc2.ID, "direct", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer acc2Lease.Release()
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		extraLease.Release()
+	}()
+
+	// 前兩次（首發 + 1s 同號重試）皆回 429+3008，收窄至 1 後歸還槽位並於隊首重排成功
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusTooManyRequests, body: `{"code":3008,"msg":"concurrency limit"}`},
+		{status: http.StatusTooManyRequests, body: `{"code":3008,"msg":"concurrency limit"}`},
+		{status: http.StatusOK, lines: []string{`data: {"id":"ok-requeued"}`, `data: [DONE]`}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-3008-retry", map[string]any{
+		"model":    "GLM-5.3",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	p.processTicket(context.Background(), "ticket-3008-retry")
+
+	events := drainEvents(tk)
+	hasDone := false
+	for _, ev := range events {
+		if ev.Type == "done" {
+			hasDone = true
+		}
+	}
+	if !hasDone {
+		t.Fatalf("第二次 3008 觸發收窄重排後應成功完成: %+v", events)
+	}
+	if up.callCount() != 3 {
+		t.Fatalf("應呼叫上游 3 次（首發 + 同號重試 + 隊首重排），實際: %d", up.callCount())
+	}
+	// acc1 在途 2 條遇 retryAttempt=1 → 閘門上限必須收窄至 1
+	if gotCap := p.Gate.AccountCap(acc1.ID); gotCap != 1 {
+		t.Fatalf("retryAttempt=1 應觸發 acc1 收窄至 1，實際上限: %d", gotCap)
+	}
+}
+
+func TestProcessTicket_GateRequeue(t *testing.T) {
+	// 單帳號池情境：觸發 3008 收窄時應在同帳號歸還租約並隊首重排，不得標記 tried 誤報 no_account
+	p, st, _, _ := newTestPool(t)
+	p.BusyRetryDelay = time.Millisecond
+	config.AsyncMaxRetries = 0
+	acc, err := st.AddAccount(model.ProviderZai, "solo-acc", "h1.p1.s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	extraLease, err := p.Gate.Acquire(context.Background(), acc.ID, "direct", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		extraLease.Release()
+	}()
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusTooManyRequests, body: `{"code":3008,"msg":"concurrency limit"}`},
+		{status: http.StatusTooManyRequests, body: `{"code":3008,"msg":"concurrency limit"}`},
+		{status: http.StatusOK, lines: []string{`data: {"id":"solo-ok"}`, `data: [DONE]`}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-solo-requeue", map[string]any{
+		"model":    "GLM-5.4",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	p.processTicket(context.Background(), "ticket-solo-requeue")
+
+	events := drainEvents(tk)
+	hasDone := false
+	for _, ev := range events {
+		if ev.Type == "done" {
+			hasDone = true
+		}
+	}
+	if !hasDone {
+		t.Fatalf("單帳號池收窄隊首重排應成功而非誤報 no_account，實際事件: %+v", events)
+	}
+	if up.callCount() != 3 {
+		t.Fatalf("應呼叫上游 3 次，實際: %d", up.callCount())
+	}
+}
+
+func TestAsyncPoolForcesStreamTrue(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "stream-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, lines: []string{`data: {"id":"streamed"}`, `data: [DONE]`}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	// 刻意不傳 stream（或傳 false），async 路徑應強制對上游送 stream: true
+	tk := insertTicket(p, "ticket-force-stream", map[string]any{
+		"model":    "GLM-5.3",
+		"stream":   false,
+		"messages": []any{map[string]any{"role": "user", "content": "ping"}},
+	})
+	p.processTicket(context.Background(), "ticket-force-stream")
+	_ = drainEvents(tk)
+
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if len(up.bodies) != 1 || up.bodies[0]["stream"] != true {
+		t.Fatalf("async 請求送往上游必須強制設 stream=true，實際: %+v", up.bodies)
+	}
+}
+
+func TestForwardSSEHandlesCompactData(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "compact-sse-acc")
+
+	// data: 後不帶空格的緊湊 SSE 行同樣必須被解析為 chunk
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, lines: []string{`data:{"id":"compact-1"}`, `data:[DONE]`}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-compact", map[string]any{
+		"model":    "GLM-5.3",
+		"messages": []any{map[string]any{"role": "user", "content": "ping"}},
+	})
+	p.processTicket(context.Background(), "ticket-compact")
+
+	events := drainEvents(tk)
+	gotChunk := false
+	for _, ev := range events {
+		if ev.Type == "chunk" {
+			if m, ok := ev.Data.(map[string]any); ok && m["id"] == "compact-1" {
+				gotChunk = true
+			}
+		}
+	}
+	if !gotChunk {
+		t.Fatalf("緊湊 data: 行應正確解析為 chunk，實際事件: %+v", events)
+	}
+}
+
 func containsStr(list []string, want string) bool {
 	for _, s := range list {
 		if s == want {
@@ -1008,4 +1178,247 @@ func containsStr(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestIsRefusedEnvelopeAndAsyncPoolIntercept(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	a1, err := st.AddAccount(model.ProviderZai, "a1", "h1.p1.s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddAccount(model.ProviderZai, "a2", "h2.p2.s2"); err != nil {
+		t.Fatal(err)
+	}
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "application/json", body: `{"code":0,"data":null,"success":true}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-refused-env", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-refused-env")
+
+	events := drainEvents(tk)
+	last := events[len(events)-1]
+	errObj, _ := last.Data.(map[string]any)["error"].(map[string]any)
+	if last.Type != "error" || errObj == nil || errObj["type"] != "upstream_version_refused" {
+		t.Fatalf("空信封應投遞 upstream_version_refused，實際: %+v", events)
+	}
+	if up.callCount() != 1 {
+		t.Fatalf("空信封不應換號重試，實際呼叫: %d", up.callCount())
+	}
+	got := st.Find(model.ProviderZai, a1.ID)
+	if got.FailCount != 0 || got.Status != model.StatusActive {
+		t.Fatalf("空信封不應汙染帳號狀態或增加 FailCount: status=%s fail=%d", got.Status, got.FailCount)
+	}
+}
+
+func TestEdgeBlocked405SwitchesProxyExit_AsyncPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	t.Cleanup(func() {
+		gateway.HoldEdgeFor("direct", -time.Second, time.Now())
+	})
+
+	// 建立測試 HTTP 代理並注入標記頭以區分出口
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				req, err := http.ReadRequest(bufio.NewReader(c))
+				if err != nil {
+					return
+				}
+				outReq := req.Clone(context.Background())
+				outReq.RequestURI = ""
+				if outReq.URL.Host == "" {
+					outReq.URL.Host = req.Host
+				}
+				outReq.Header.Set("X-Test-Proxy-Exit", "proxy-async")
+				resp, err := http.DefaultTransport.RoundTrip(outReq)
+				if err != nil {
+					return
+				}
+				defer resp.Body.Close()
+				_ = resp.Write(c)
+			}(conn)
+		}
+	}()
+
+	var calls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		calls.Add(1)
+		if r.Header.Get("X-Test-Proxy-Exit") == "" {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = w.Write([]byte(`<html><body>errors.aliyun.com</body></html>`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"via-proxy\"}\n\ndata: [DONE]\n\n")
+	}))
+	t.Cleanup(up.Close)
+	config.UpstreamZai = up.URL
+
+	// 直連帳號配置臨期一次性優惠以確保先被選中（注意不同帳號必須使用相異 JWT 憑證避免去重覆蓋）
+	a1, err := st.AddAccount(model.ProviderZai, "direct-jwt", "hd.pd.sd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	soon := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	_ = st.Update(a1.Provider, a1.ID, func(a *model.Account) {
+		a.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(50), "period": "one_time", "expires_at": soon},
+		}
+	})
+	a2, err := st.AddAccount(model.ProviderZai, "proxy-jwt", "hp.pp.sp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL := "http://" + ln.Addr().String()
+	_ = st.Update(a2.Provider, a2.ID, func(a *model.Account) {
+		a.ProxyURL = &proxyURL
+		a.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(50), "period": "daily"},
+		}
+	})
+	a2Updated := st.Find(model.ProviderZai, a2.ID)
+	t.Cleanup(func() {
+		gateway.HoldEdgeFor(gateway.AddressKeyFor(a2Updated), -time.Second, time.Now())
+	})
+
+	tk := insertTicket(p, "ticket-405-switch", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-405-switch")
+
+	events := drainEvents(tk)
+	hasDone := false
+	for _, ev := range events {
+		if ev.Type == "done" {
+			hasDone = true
+		}
+	}
+	if !hasDone {
+		t.Fatalf("直連 405 應無縫切換代理出口完成交付: %+v", events)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("應先試直連再切代理共 2 次，實際: %d", calls.Load())
+	}
+}
+
+func TestConcurrencyRetryReleasesGateLeaseDuringSleep_AsyncPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	oldCap := config.StartPlanAccountConcurrency
+	config.StartPlanAccountConcurrency = 1
+	t.Cleanup(func() { config.StartPlanAccountConcurrency = oldCap })
+
+	p.Gate = gateway.NewStartPlanGate()
+	p.BusyRetryDelay = 150 * time.Millisecond
+	addJWTAccount(t, st, "solo-async-jwt")
+
+	aGot3008 := make(chan struct{})
+	var reqACalls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.Header.Get("X-Test-Caller") == "A" {
+			if reqACalls.Add(1) == 1 {
+				close(aGot3008)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"code":3008,"msg":"user concurrency limit exceeded"}`))
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"ok\"}\n\ndata: [DONE]\n\n")
+	}))
+	t.Cleanup(up.Close)
+	config.UpstreamZai = up.URL
+
+	tkA := insertTicket(p, "ticket-A", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	tkA.headers = map[string]string{"X-Test-Caller": "A"}
+	tkB := insertTicket(p, "ticket-B", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	tkB.headers = map[string]string{"X-Test-Caller": "B"}
+
+	aDone := make(chan struct{})
+	go func() {
+		defer close(aDone)
+		p.processTicket(context.Background(), "ticket-A")
+	}()
+
+	select {
+	case <-aGot3008:
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待 ticket A 收到 3008 逾時")
+	}
+
+	bStart := time.Now()
+	p.processTicket(context.Background(), "ticket-B")
+	bElapsed := time.Since(bStart)
+	eventsB := drainEvents(tkB)
+	if len(eventsB) == 0 || eventsB[len(eventsB)-1].Type != "done" {
+		t.Fatalf("ticket B 應在 A 睡眠期間立即成功完成: %+v", eventsB)
+	}
+	if bElapsed >= 120*time.Millisecond {
+		t.Fatalf("ticket B 疑遭 A 睡眠佔槽阻塞，耗時 %v", bElapsed)
+	}
+
+	select {
+	case <-aDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待 ticket A 完成逾時")
+	}
+	eventsA := drainEvents(tkA)
+	if len(eventsA) == 0 || eventsA[len(eventsA)-1].Type != "done" {
+		t.Fatalf("ticket A 醒來重取槽位後應完成交付: %+v", eventsA)
+	}
+}
+
+func TestBare429CircuitBreakerProtectsPool_AsyncPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	for i := range 4 {
+		if _, err := st.AddAccount(model.ProviderZai, fmt.Sprintf("bare-jwt-%d", i+1),
+			fmt.Sprintf("h%d.p%d.s%d", i+1, i+1, i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusTooManyRequests, contentType: "text/plain", body: ""},
+		{status: http.StatusTooManyRequests, contentType: "text/plain", body: ""},
+		{status: http.StatusTooManyRequests, contentType: "text/plain", body: ""},
+		{status: http.StatusTooManyRequests, contentType: "text/plain", body: ""},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-bare429", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-bare429")
+
+	events := drainEvents(tk)
+	last := events[len(events)-1]
+	errObj, _ := last.Data.(map[string]any)["error"].(map[string]any)
+	if last.Type != "error" || errObj == nil || errObj["type"] != "upstream_rate_limit" {
+		t.Fatalf("連續裸 429 應止損投遞 upstream_rate_limit，實際: %+v", events)
+	}
+	if strings.TrimSpace(fmt.Sprint(errObj["message"])) == "" {
+		t.Fatalf("空正文裸 429 投遞的 error.message 不得為空: %+v", errObj)
+	}
+	if up.callCount() != 2 {
+		t.Fatalf("應在第 2 號裸 429 時立即止損，實際呼叫: %d", up.callCount())
+	}
+	for _, acc := range st.ListAccounts(model.ProviderZai) {
+		if acc.Status != model.StatusActive || acc.CoolingUntil != nil {
+			t.Fatalf("帳號 %s 應全部保持 active（首號已平反），實際 status=%s", acc.Name, acc.Status)
+		}
+	}
 }

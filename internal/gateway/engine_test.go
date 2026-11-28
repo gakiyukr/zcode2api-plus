@@ -3,16 +3,19 @@
 package gateway
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -728,8 +731,8 @@ func TestModelsEndpointFromQuotaSnapshot(t *testing.T) {
 	}
 	if err := f.st.Update(acc.Provider, acc.ID, func(a *model.Account) {
 		a.Quota = map[string]map[string]any{
-			"GLM-5.4": {"model": "GLM-5.4", "remaining": float64(10)},
-			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(10)},
+			"GLM-5.4":       {"model": "GLM-5.4", "remaining": float64(10)},
+			"GLM-5.3":       {"model": "GLM-5.3", "remaining": float64(10)},
 			"glm-5.3-flash": {"model": "glm-5.3-flash", "remaining": float64(10)},
 			// 同名多订阅列（不同 key、相同 model）应去重
 			"GLM-5.3 · 活动套餐": {"model": "GLM-5.3", "remaining": float64(5)},
@@ -775,3 +778,691 @@ func (s stubSolver) Solve(_ context.Context, _ captcha.Config) (string, error) {
 }
 
 func (s stubSolver) Close() error { return nil }
+
+func TestFlagshipGLM53AutoFallsBackToGLM54(t *testing.T) {
+	f := newFixture(t)
+	f.respond = jsonResp(200, okUpstreamJSON)
+	acc, _ := f.st.AddAccount(model.ProviderZai, "v54", "sk-54")
+	_ = f.st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.Quota = map[string]map[string]any{
+			"GLM-5.4": {"model": "GLM-5.4", "remaining": float64(500)},
+		}
+	})
+
+	// 舊客戶端仍送 GLM-5.3：因帳號池僅有 GLM-5.4 可用，應無縫改寫為 GLM-5.4 並命中帳號
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != 200 {
+		t.Fatalf("應自動改寫 GLM-5.3 → GLM-5.4 成功: %d %s", status, raw)
+	}
+	if got := f.lastCall().Body["model"]; got != "GLM-5.4" {
+		t.Fatalf("上游應收到改寫後的 GLM-5.4，實際: %v", got)
+	}
+}
+
+func TestEmptyNonStreamReplyFailsOverAndRelaysLast(t *testing.T) {
+	t.Run("首號空回覆自動換號成功", func(t *testing.T) {
+		f := newFixture(t)
+		_, _ = f.st.AddAccount(model.ProviderZai, "a1", "sk-1")
+		_, _ = f.st.AddAccount(model.ProviderZai, "a2", "sk-2")
+		f.respond = func(n int, _ *http.Request) (int, http.Header, string) {
+			if n == 1 {
+				return 200, http.Header{"Content-Type": []string{"application/json"}},
+					`{"id":"m_empty","content":[],"usage":{"input_tokens":5,"output_tokens":0}}`
+			}
+			return 200, http.Header{"Content-Type": []string{"application/json"}},
+				`{"id":"m_ok","content":[{"type":"text","text":"正常回答"}],"usage":{"input_tokens":5,"output_tokens":3}}`
+		}
+		status, raw := f.post(t, msgBody(), "sk-test")
+		if status != 200 || !strings.Contains(raw, "正常回答") {
+			t.Fatalf("空回覆應自動換號並成功: %d %s", status, raw)
+		}
+		if f.callCount() != 2 {
+			t.Fatalf("應嘗試 2 個帳號: %d", f.callCount())
+		}
+	})
+
+	t.Run("全池皆空則原樣交付最後一次空回覆", func(t *testing.T) {
+		f := newFixture(t)
+		_, _ = f.st.AddAccount(model.ProviderZai, "a1", "sk-1")
+		emptyBody := `{"id":"m_empty","content":[{"type":"text","text":"   "}],"usage":{"input_tokens":2,"output_tokens":0}}`
+		f.respond = jsonResp(200, emptyBody)
+		status, raw := f.post(t, msgBody(), "sk-test")
+		if status != 200 || raw != emptyBody {
+			t.Fatalf("全池皆空應誠實交付空回覆: %d %s", status, raw)
+		}
+	})
+}
+
+func TestToolSearchEndToEndRewriteAndRestore(t *testing.T) {
+	f := newFixture(t)
+	_, _ = f.st.AddAccount(model.ProviderZai, "k", "sk-abc")
+	f.respond = jsonResp(200, `{"id":"m1","content":[{"type":"tool_use","id":"tu_1","name":"ToolSearchTool","input":{"query":"bash"}}],"usage":{"input_tokens":3,"output_tokens":2}}`)
+
+	body := msgBody()
+	body["tools"] = []any{
+		map[string]any{"name": "ToolSearch", "description": "s"},
+		map[string]any{"name": "Bash", "defer_loading": true},
+	}
+	status, raw := f.post(t, body, "sk-test")
+	if status != 200 {
+		t.Fatalf("應 200: %d %s", status, raw)
+	}
+	// 上游應收到 ToolSearchTool 且不含 defer_loading
+	sentTools := f.lastCall().Body["tools"].([]any)
+	if sentTools[0].(map[string]any)["name"] != "ToolSearchTool" {
+		t.Fatalf("上游應收到改名後工具: %v", sentTools)
+	}
+	if _, has := sentTools[1].(map[string]any)["defer_loading"]; has {
+		t.Fatal("上游不應收到 defer_loading")
+	}
+	// 客戶端應收到還原後的 ToolSearch
+	if !strings.Contains(raw, `"name":"ToolSearch"`) || strings.Contains(raw, "ToolSearchTool") {
+		t.Fatalf("回應應還原為 ToolSearch: %s", raw)
+	}
+}
+
+func TestConcurrency3008RetriesWithoutCooling(t *testing.T) {
+	f := newFixture(t)
+	acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+	f.respond = func(n int, _ *http.Request) (int, http.Header, string) {
+		if n == 1 {
+			return jsonResp(429, `{"code":3008,"msg":"user concurrency limit exceeded"}`)(n, nil)
+		}
+		return jsonResp(200, okUpstreamJSON)(n, nil)
+	}
+	status, _ := f.post(t, msgBody(), "sk-test")
+	if status != 200 || f.callCount() != 2 {
+		t.Fatalf("3008 應重試成功: status=%d calls=%d", status, f.callCount())
+	}
+	if got := f.st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusActive {
+		t.Fatalf("3008 不應標記帳號 cooling: %s", got.Status)
+	}
+}
+
+func TestEngineBusyAttemptIndependentOfCaptcha(t *testing.T) {
+	f := newFixture(t)
+	oldBrowser := config.CaptchaBrowserEnabled
+	config.CaptchaBrowserEnabled = true
+	t.Cleanup(func() { config.CaptchaBrowserEnabled = oldBrowser })
+	f.cm.SetConfigProvider(func(context.Context) (captcha.Config, error) {
+		return captcha.Config{Enabled: true, SceneID: "s", Region: "cn", Prefix: "p"}, nil
+	})
+	f.cm.SetSolver(stubSolver{token: "tok"})
+
+	acc, err := f.st.AddAccount(model.ProviderZai, "jwt-acc", "header.payload.sig")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 佔住第 2 條在途槽位：若 busyAttempt 被 captchaAttempt 污染為 1，首次 3010 就會立刻觸發收窄
+	extra, err := f.eng.Gate.Acquire(context.Background(), acc.ID, "direct", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer extra.Release()
+
+	// 第 1 次回 3007（驗證碼重試 → captchaAttempt 升至 1）；
+	// 第 2 次回 3010（首次併發受限 → busyAttempt 應仍為 0，不應觸發收窄）；
+	// 第 3 次成功 200。
+	f.respond = func(n int, _ *http.Request) (int, http.Header, string) {
+		switch n {
+		case 1:
+			return jsonResp(400, `{"code":3007,"msg":"captcha rejected"}`)(n, nil)
+		case 2:
+			return jsonResp(429, `{"code":3010,"msg":"concurrency limit"}`)(n, nil)
+		default:
+			return jsonResp(200, okUpstreamJSON)(n, nil)
+		}
+	}
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != 200 || !strings.Contains(raw, "msg_1") {
+		t.Fatalf("3007 後接首次 3010 應重試成功: status=%d body=%s", status, raw)
+	}
+	if f.callCount() != 3 {
+		t.Fatalf("應呼叫上游 3 次，實際: %d", f.callCount())
+	}
+	if gotCap := f.eng.Gate.AccountCap(acc.ID); gotCap != config.StartPlanAccountConcurrency {
+		t.Fatalf("首次 3010（busyAttempt=0）不應被 captchaAttempt 污染而觸發收窄，實際上限: %d", gotCap)
+	}
+}
+
+type cancelInjectSolver struct {
+	calls int
+	onRun func()
+}
+
+func (s *cancelInjectSolver) Solve(ctx context.Context, _ captcha.Config) (string, error) {
+	s.calls++
+	if s.onRun != nil {
+		s.onRun()
+	}
+	return "", context.Canceled
+}
+
+func (s *cancelInjectSolver) Close() error { return nil }
+
+func TestCaptchaInvalidateNotCalledOnCancel(t *testing.T) {
+	f := newFixture(t)
+	oldBrowser := config.CaptchaBrowserEnabled
+	config.CaptchaBrowserEnabled = true
+	t.Cleanup(func() { config.CaptchaBrowserEnabled = oldBrowser })
+	f.cm.SetConfigProvider(func(context.Context) (captcha.Config, error) {
+		return captcha.Config{Enabled: true, SceneID: "s", Region: "cn", Prefix: "p"}, nil
+	})
+
+	solver := &cancelInjectSolver{
+		onRun: func() {
+			// 模擬其他並發來源同時補入有效手動令牌：客戶端取消不得觸發 Invalidate 清空它
+			_ = f.cm.SetManualParam("manual-keep-token", "cn")
+		},
+	}
+	f.cm.SetSolver(solver)
+
+	if _, err := f.st.AddAccount(model.ProviderZai, "jwt-acc", "header.payload.sig"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res := f.eng.RunMessages(ctx, msgBody(), nil, func(d Delivery) error { return nil })
+	if res.Delivered {
+		t.Fatal("已取消的請求不應交付成功")
+	}
+	if solver.calls != 1 {
+		t.Fatalf("取消時應立即中止而不重試驗證碼，實際呼叫次數: %d", solver.calls)
+	}
+	// 驗證手動令牌仍保留在快取中（未被誤呼叫 Invalidate）
+	tok, err := f.cm.GetVerifyParam(context.Background())
+	if err != nil || tok == nil || tok.VerifyParam != "manual-keep-token" {
+		t.Fatalf("客戶端取消不應清空全域驗證碼快取，實際: tok=%+v err=%v", tok, err)
+	}
+}
+
+func TestIsEmptyAnthropicReply_Thinking(t *testing.T) {
+	thinkingOnly := []byte(`{"id":"msg_t","content":[{"type":"thinking","thinking":"思考過程"}]}`)
+	if isEmptyAnthropicReply(thinkingOnly) {
+		t.Fatal("僅含非空 thinking block 的回覆不應誤判為空回覆")
+	}
+	redactedOnly := []byte(`{"id":"msg_r","content":[{"type":"redacted_thinking","data":"abc"}]}`)
+	if isEmptyAnthropicReply(redactedOnly) {
+		t.Fatal("僅含 redacted_thinking block 的回覆不應誤判為空回覆")
+	}
+	emptyContent := []byte(`{"id":"msg_e","content":[]}`)
+	if !isEmptyAnthropicReply(emptyContent) {
+		t.Fatal("空 content 陣列應判為空回覆")
+	}
+}
+
+func TestIsEmptyAnthropicReply_EmptyThinking(t *testing.T) {
+	emptyThinking := []byte(`{"id":"msg_et","content":[{"type":"thinking","thinking":""}]}`)
+	if !isEmptyAnthropicReply(emptyThinking) {
+		t.Fatal("空白 thinking block 僅為佔位結構，應判為空回覆")
+	}
+	whitespaceThinking := []byte(`{"id":"msg_wt","content":[{"type":"thinking","thinking":"   \n\t  "}]}`)
+	if !isEmptyAnthropicReply(whitespaceThinking) {
+		t.Fatal("純空白 thinking block 應判為空回覆")
+	}
+}
+
+func TestEdgeHold_PerAddrKey(t *testing.T) {
+	now := time.Now()
+	proxyA := "http://proxy-a.invalid:8080"
+	proxyB := "http://proxy-b.invalid:8080"
+	HoldEdgeFor(proxyA, 5*time.Minute, now)
+	t.Cleanup(func() {
+		edgeHoldMap.Delete(proxyA)
+		edgeHoldMap.Delete(proxyB)
+	})
+
+	if !EdgeHeldFor(proxyA, now.Add(time.Minute)) {
+		t.Fatal("proxy-a 應處於熔斷期")
+	}
+	if EdgeHeldFor("direct", now.Add(time.Minute)) {
+		t.Fatal("proxy-a 熔斷不應影響 direct 出口")
+	}
+	if EdgeHeldFor(proxyB, now.Add(time.Minute)) {
+		t.Fatal("proxy-a 熔斷不應影響 proxy-b 出口")
+	}
+	if EdgeHeldFor(proxyA, now.Add(6*time.Minute)) {
+		t.Fatal("超過熔斷時長後 proxy-a 應自動恢復")
+	}
+}
+
+func TestNilBodyReturns400(t *testing.T) {
+	f := newFixture(t)
+	h := f.srv.Config.Handler
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("null"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", "sk-test")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("body=null 應回傳 400，實際: %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"invalid_request_error"`) {
+		t.Fatalf("錯誤型別應為 invalid_request_error，實際: %s", rec.Body.String())
+	}
+
+	// 超過 MaxBytesReader 應回傳 413 request_too_large
+	bigReq := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"GLM-5.4","messages":[{"role":"user","content":"0123456789abcdef"}]}`))
+	bigReq.Header.Set("Content-Type", "application/json")
+	bigReq.Header.Set("x-api-key", "sk-test")
+	bigRec := httptest.NewRecorder()
+	bigReq.Body = http.MaxBytesReader(bigRec, bigReq.Body, 16)
+	h.ServeHTTP(bigRec, bigReq)
+	if bigRec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超過上限應回傳 413，實際: %d %s", bigRec.Code, bigRec.Body.String())
+	}
+	if !strings.Contains(bigRec.Body.String(), `"request_too_large"`) {
+		t.Fatalf("413 錯誤型別應為 request_too_large，實際: %s", bigRec.Body.String())
+	}
+}
+
+func TestIsRefusedEnvelopeAndEngineIntercept(t *testing.T) {
+	f := newFixture(t)
+	a1, _ := f.st.AddAccount(model.ProviderZai, "a1", "sk-1")
+	_, _ = f.st.AddAccount(model.ProviderZai, "a2", "sk-2")
+	f.respond = jsonResp(http.StatusOK, `{"code":0,"data":null,"success":true}`)
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != http.StatusBadGateway {
+		t.Fatalf("空信封應回傳 502，實際: %d %s", status, raw)
+	}
+	if !strings.Contains(raw, `"upstream_version_refused"`) {
+		t.Fatalf("錯誤型別應為 upstream_version_refused，實際: %s", raw)
+	}
+	if f.callCount() != 1 {
+		t.Fatalf("空信封不應盲目換號重試，實際呼叫次數: %d", f.callCount())
+	}
+	got := f.st.Find(model.ProviderZai, a1.ID)
+	if got.Status != model.StatusActive || got.FailCount != 0 {
+		t.Fatalf("空信封不應汙染帳號狀態或增加 FailCount: status=%s fail=%d", got.Status, got.FailCount)
+	}
+}
+
+func TestBare429CircuitBreakerProtectsPool(t *testing.T) {
+	t.Run("連續兩號裸 429 觸發止損並平反首號", func(t *testing.T) {
+		f := newFixture(t)
+		for i := range 4 {
+			if _, err := f.st.AddAccount(model.ProviderZai, fmt.Sprintf("a%d", i+1), fmt.Sprintf("sk-%d", i+1)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.respond = func(int, *http.Request) (int, http.Header, string) {
+			return http.StatusTooManyRequests, http.Header{"Content-Type": []string{"text/plain"}}, "Too Many Requests"
+		}
+
+		status, _ := f.post(t, msgBody(), "sk-test")
+		if status != http.StatusTooManyRequests {
+			t.Fatalf("連續裸 429 應止損回傳 429，實際: %d", status)
+		}
+		if f.callCount() != 2 {
+			t.Fatalf("應在第 2 號裸 429 時立即止損，實際呼叫: %d", f.callCount())
+		}
+		for _, acc := range f.st.ListAccounts(model.ProviderZai) {
+			if acc.Status != model.StatusActive || acc.CoolingUntil != nil {
+				t.Fatalf("帳號 %s 應保留 active（首號須已平反），實際 status=%s cooling=%v", acc.Name, acc.Status, acc.CoolingUntil)
+			}
+		}
+	})
+
+	t.Run("連續兩號空正文裸 429 止損並回傳非空文案", func(t *testing.T) {
+		f := newFixture(t)
+		for i := range 3 {
+			if _, err := f.st.AddAccount(model.ProviderZai, fmt.Sprintf("e%d", i+1), fmt.Sprintf("sk-e-%d", i+1)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.respond = func(int, *http.Request) (int, http.Header, string) {
+			return http.StatusTooManyRequests, http.Header{"Content-Type": []string{"text/plain"}}, ""
+		}
+
+		status, raw := f.post(t, msgBody(), "sk-test")
+		if status != http.StatusTooManyRequests {
+			t.Fatalf("空正文裸 429 應止損回傳 429，實際: %d %s", status, raw)
+		}
+		var body map[string]any
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("回傳應為合法 JSON: %v %s", err, raw)
+		}
+		errObj, _ := body["error"].(map[string]any)
+		if errObj == nil || strings.TrimSpace(fmt.Sprint(errObj["message"])) == "" {
+			t.Fatalf("空正文裸 429 回傳的 error.message 不得為空: %s", raw)
+		}
+	})
+
+	t.Run("帶業務碼 1302 的 429 正常冷卻並換號", func(t *testing.T) {
+		f := newFixture(t)
+		a1, _ := f.st.AddAccount(model.ProviderZai, "a1", "sk-1")
+		_, _ = f.st.AddAccount(model.ProviderZai, "a2", "sk-2")
+		f.respond = func(n int, _ *http.Request) (int, http.Header, string) {
+			if n == 1 {
+				return jsonResp(http.StatusTooManyRequests, `{"code":1302,"msg":"rate limited"}`)(n, nil)
+			}
+			return jsonResp(http.StatusOK, okUpstreamJSON)(n, nil)
+		}
+
+		status, _ := f.post(t, msgBody(), "sk-test")
+		if status != http.StatusOK {
+			t.Fatalf("第二號應接手成功 200，實際: %d", status)
+		}
+		if got := f.st.Find(model.ProviderZai, a1.ID); got.Status != model.StatusCooling {
+			t.Fatalf("帶 1302 業務碼的帳號應標記 cooling，實際: %s", got.Status)
+		}
+	})
+}
+
+func TestModelSkipFallbackOn3007(t *testing.T) {
+	f := newFixture(t)
+	oldBrowser := config.CaptchaBrowserEnabled
+	config.CaptchaBrowserEnabled = true
+	t.Cleanup(func() { config.CaptchaBrowserEnabled = oldBrowser })
+
+	f.cm.SetConfigProvider(func(context.Context) (captcha.Config, error) {
+		return captcha.Config{
+			Enabled:          true,
+			SkipModelRequest: true,
+			Prefix:           "p",
+			Region:           "cn",
+			SceneID:          "s",
+		}, nil
+	})
+	f.cm.SetSolver(stubSolver{token: "recovered-token"})
+	if _, err := f.st.AddAccount(model.ProviderZai, "jwt-skip", "header.payload.sig"); err != nil {
+		t.Fatal(err)
+	}
+
+	f.respond = func(n int, r *http.Request) (int, http.Header, string) {
+		if n == 1 {
+			if got := r.Header.Get("X-Aliyun-Captcha-Verify-Param"); got != "" {
+				return http.StatusInternalServerError, nil, "首發免驗不應帶驗證碼標頭"
+			}
+			return jsonResp(http.StatusBadRequest, `{"code":3007,"msg":"captcha required"}`)(n, nil)
+		}
+		if got := r.Header.Get("X-Aliyun-Captcha-Verify-Param"); got != "recovered-token" {
+			return http.StatusInternalServerError, nil, "補驗未攜帶求解令牌: " + got
+		}
+		return jsonResp(http.StatusOK, okUpstreamJSON)(n, nil)
+	}
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != http.StatusOK || !strings.Contains(raw, "msg_1") {
+		t.Fatalf("免驗遇 3007 應自動補驗成功 200: %d %s", status, raw)
+	}
+	if f.callCount() != 2 {
+		t.Fatalf("應剛好呼叫上游 2 次（首發免驗 + 補驗），實際: %d", f.callCount())
+	}
+}
+
+func TestEdgeBlocked405SwitchesProxyExit(t *testing.T) {
+	f := newFixture(t)
+	t.Cleanup(func() {
+		edgeHoldMap.Delete("direct")
+	})
+
+	// 建立本機測試 HTTP 代理並附加標記頭，讓 mock 上游區分直連與代理出口
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				req, err := http.ReadRequest(bufio.NewReader(c))
+				if err != nil {
+					return
+				}
+				outReq := req.Clone(context.Background())
+				outReq.RequestURI = ""
+				if outReq.URL.Host == "" {
+					outReq.URL.Host = req.Host
+				}
+				outReq.Header.Set("X-Test-Proxy-Exit", "proxy-1")
+				resp, err := http.DefaultTransport.RoundTrip(outReq)
+				if err != nil {
+					return
+				}
+				defer resp.Body.Close()
+				_ = resp.Write(c)
+			}(conn)
+		}
+	}()
+
+	// a1 為直連（給予臨期一次性優惠使其在同組中必定先被選中）；a2 走代理出口（一般日常額度）
+	a1, _ := f.st.AddAccount(model.ProviderZai, "direct-acc", "sk-direct")
+	soon := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	_ = f.st.Update(a1.Provider, a1.ID, func(a *model.Account) {
+		a.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(50), "period": "one_time", "expires_at": soon},
+		}
+	})
+	a2, _ := f.st.AddAccount(model.ProviderZai, "proxy-acc", "sk-proxy")
+	proxyURL := "http://" + ln.Addr().String()
+	_ = f.st.Update(a2.Provider, a2.ID, func(a *model.Account) {
+		a.ProxyURL = &proxyURL
+		a.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(50), "period": "daily"},
+		}
+	})
+	a2Updated := f.st.Find(model.ProviderZai, a2.ID)
+	t.Cleanup(func() {
+		edgeHoldMap.Delete(AddressKeyFor(a2Updated))
+	})
+
+	f.respond = func(_ int, r *http.Request) (int, http.Header, string) {
+		if r.Header.Get("X-Test-Proxy-Exit") == "" {
+			return http.StatusMethodNotAllowed, http.Header{"Content-Type": []string{"text/html"}},
+				`<html><body>errors.aliyun.com blocked</body></html>`
+		}
+		return http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, okUpstreamJSON
+	}
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != http.StatusOK || !strings.Contains(raw, "msg_1") {
+		t.Fatalf("直連 405 應自動熔斷並切換代理出口成功 200: %d %s", status, raw)
+	}
+	if f.callCount() != 2 {
+		t.Fatalf("應先試直連再切代理共 2 次，實際: %d", f.callCount())
+	}
+	if !EdgeHeldFor("direct", time.Now()) {
+		t.Fatal("direct 出口應已進入邊緣熔斷")
+	}
+	if EdgeHeldFor(AddressKeyFor(a2Updated), time.Now()) {
+		t.Fatal("代理出口不應被熔斷")
+	}
+}
+
+func TestTransparentReplayOnBrokenConnDoesNotCoolAccount(t *testing.T) {
+	f := newFixture(t)
+	f.eng.ReplayDelay = 10 * time.Millisecond
+	tr := &http.Transport{MaxIdleConnsPerHost: 4}
+	t.Cleanup(tr.CloseIdleConnections)
+	f.eng.Client = &http.Client{Transport: tr}
+
+	// 自建可劫持關閉複用連線的上游伺服器
+	var hits atomic.Int32
+	brokenUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		if n == 2 {
+			// 第 2 次命中複用連線時，不回傳任何位元組直接斷開底層 TCP 觸發 EOF
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(okUpstreamJSON))
+	}))
+	t.Cleanup(brokenUp.Close)
+
+	oldFB := config.UpstreamZaiFallback
+	config.UpstreamZaiFallback = brokenUp.URL + "/fallback"
+	t.Cleanup(func() { config.UpstreamZaiFallback = oldFB })
+
+	acc, _ := f.st.AddAccount(model.ProviderZai, "replay-acc", "sk-replay")
+
+	// 第 1 次請求：建立 keep-alive 閒置連線
+	if status, raw := f.post(t, msgBody(), "sk-test"); status != http.StatusOK {
+		t.Fatalf("暖連線請求應 200: %d %s", status, raw)
+	}
+	// 第 2 次請求：複用連線遭對端無聲關閉 → 透明重放 1 次成功 200
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != http.StatusOK || !strings.Contains(raw, "msg_1") {
+		t.Fatalf("複用斷連應透明重放成功 200: %d %s", status, raw)
+	}
+	if hits.Load() != 3 {
+		t.Fatalf("上游應共收到 3 次（暖連線 + 斷開 + 重放），實際: %d", hits.Load())
+	}
+	if got := f.st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusActive {
+		t.Fatalf("透明重放成功後帳號必須維持 active，實際: %s", got.Status)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return fn(r) }
+
+func TestUploadStallGuardCancelsHungStream(t *testing.T) {
+	f := newFixture(t)
+	f.eng.UploadStallTimeout = 40 * time.Millisecond
+
+	a1, _ := f.st.AddAccount(model.ProviderZai, "hung-acc", "sk-1")
+	_, _ = f.st.AddAccount(model.ProviderZai, "healthy-acc", "sk-2")
+
+	var calls atomic.Int32
+	f.eng.Client = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			n := calls.Add(1)
+			if n == 1 {
+				// 刻意不讀 r.Body，模擬 H2 上傳流控視窗歸零掛死
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			_, _ = io.Copy(io.Discard, r.Body)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(okUpstreamJSON)),
+			}, nil
+		}),
+	}
+
+	start := time.Now()
+	status, raw := f.post(t, msgBody(), "sk-test")
+	elapsed := time.Since(start)
+	if status != http.StatusOK || !strings.Contains(raw, "msg_1") {
+		t.Fatalf("上傳停滯逾時後應切換健康帳號成功 200: %d %s", status, raw)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("應嘗試 2 次（首號停滯中斷 + 次號成功），實際: %d", calls.Load())
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("上傳停滯看門狗未準時觸發，耗時過長: %v", elapsed)
+	}
+	if got := f.st.Find(model.ProviderZai, a1.ID); got.Status != model.StatusActive {
+		t.Fatalf("上傳流控停滯不應將首號誤標 cooling，實際: %s", got.Status)
+	}
+}
+
+func TestConcurrencyRetryReleasesGateLeaseDuringSleep(t *testing.T) {
+	f := newFixture(t)
+	oldBrowser, oldCap := config.CaptchaBrowserEnabled, config.StartPlanAccountConcurrency
+	config.CaptchaBrowserEnabled = true
+	config.StartPlanAccountConcurrency = 1
+	t.Cleanup(func() {
+		config.CaptchaBrowserEnabled = oldBrowser
+		config.StartPlanAccountConcurrency = oldCap
+	})
+
+	f.cm.SetConfigProvider(func(context.Context) (captcha.Config, error) {
+		return captcha.Config{Enabled: true, Prefix: "p", Region: "cn", SceneID: "s"}, nil
+	})
+	f.cm.SetSolver(stubSolver{token: "tok-gate"})
+	f.eng.Gate = NewStartPlanGate()
+	f.eng.BusyRetryDelays = []time.Duration{150 * time.Millisecond}
+
+	if _, err := f.st.AddAccount(model.ProviderZai, "solo-jwt", "header.payload.sig"); err != nil {
+		t.Fatal(err)
+	}
+
+	aGot3008 := make(chan struct{})
+	bSucceeded := make(chan struct{})
+	var reqACall atomic.Int32
+
+	f.respond = func(_ int, r *http.Request) (int, http.Header, string) {
+		var payload map[string]any
+		// 透過 x-client-tag 區分請求 A 與請求 B
+		if r.Header.Get("X-Test-Caller") == "A" {
+			if reqACall.Add(1) == 1 {
+				close(aGot3008)
+				return http.StatusTooManyRequests, http.Header{"Content-Type": []string{"application/json"}},
+					`{"code":3008,"msg":"user concurrency limit exceeded"}`
+			}
+			return http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, okUpstreamJSON
+		}
+		_ = payload
+		select {
+		case <-bSucceeded:
+		default:
+			close(bSucceeded)
+		}
+		return http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, okUpstreamJSON
+	}
+
+	postWithCaller := func(caller string) (int, string) {
+		data, _ := json.Marshal(msgBody())
+		req, _ := http.NewRequest(http.MethodPost, f.srv.URL+"/v1/messages", bytes.NewReader(data))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", "sk-test")
+		req.Header.Set("X-Test-Caller", caller)
+		resp, err := f.srv.Client().Do(req)
+		if err != nil {
+			return 0, err.Error()
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(raw)
+	}
+
+	aDone := make(chan int, 1)
+	go func() {
+		st, _ := postWithCaller("A")
+		aDone <- st
+	}()
+
+	select {
+	case <-aGot3008:
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待請求 A 收到 3008 逾時")
+	}
+
+	// 請求 A 正處於 150ms 退避睡眠中：此時發起請求 B，必須能在 A 醒來前立刻取得唯一槽位完成
+	bStart := time.Now()
+	bStatus, bRaw := postWithCaller("B")
+	bElapsed := time.Since(bStart)
+	if bStatus != http.StatusOK {
+		t.Fatalf("請求 B 在 A 睡眠期間應立即成功 200: %d %s", bStatus, bRaw)
+	}
+	if bElapsed >= 120*time.Millisecond {
+		t.Fatalf("請求 B 疑遭 A 睡眠佔槽阻塞，耗時 %v（應遠小於 150ms）", bElapsed)
+	}
+
+	select {
+	case aStatus := <-aDone:
+		if aStatus != http.StatusOK {
+			t.Fatalf("請求 A 醒來隊首重取槽位後應成功 200，實際: %d", aStatus)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待請求 A 完成逾時")
+	}
+}

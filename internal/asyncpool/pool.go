@@ -45,6 +45,7 @@ type ticketEvent struct {
 type ticket struct {
 	status    string
 	body      map[string]any
+	headers   map[string]string
 	queue     chan ticketEvent
 	createdAt time.Time
 	cancel    context.CancelFunc // 中止后台任务（释放票务时调用）
@@ -62,6 +63,16 @@ type Pool struct {
 	Auth    *auth.Service
 	Captcha *captcha.Manager
 	Client  *http.Client // nil 时使用与网关一致的上游客户端
+	// Gate Start Plan 雙層併發閘門（生產環境由 main 與 gateway.Engine 共用同一實例）。
+	Gate *gateway.StartPlanGate
+	// Affinity 快取感知會話親和路由表（生產環境由 main 與 gateway.Engine 共用同一實例）。
+	Affinity *gateway.SessionAffinity
+	// BusyRetryDelay 遇 3008/3009/3010 同號重試的延遲（零值預設 1s，測試可縮短）。
+	BusyRetryDelay time.Duration
+	// ReplayDelay 未寫完／複用斷連透明重放延遲（零值預設 gateway.DefaultReplayDelay）。
+	ReplayDelay time.Duration
+	// UploadStallTimeout 上傳請求體流控停滯看門狗逾時（零值預設 gateway.DefaultUploadStallTimeout）。
+	UploadStallTimeout time.Duration
 
 	mu      sync.Mutex
 	tickets map[string]*ticket
@@ -69,7 +80,14 @@ type Pool struct {
 
 // NewPool 创建空闲池。
 func NewPool(st *store.Store, au *auth.Service, cm *captcha.Manager) *Pool {
-	return &Pool{Store: st, Auth: au, Captcha: cm, tickets: map[string]*ticket{}}
+	return &Pool{
+		Store:    st,
+		Auth:     au,
+		Captcha:  cm,
+		Gate:     gateway.NewStartPlanGate(),
+		Affinity: gateway.NewSessionAffinity(gateway.DefaultAffinityMaxEntries, gateway.DefaultAffinityTTL),
+		tickets:  map[string]*ticket{},
+	}
 }
 
 // Register 在 mux 上注册异步路由（调用方按 config.AsyncEnabled 决定是否挂载，
@@ -94,25 +112,29 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 
 	var body map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if errors.As(err, new(*http.MaxBytesError)) {
+			gateway.WriteJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+				"error": map[string]any{"message": "請求體過大", "type": "request_too_large"},
+			})
+			return
+		}
 		gateway.WriteJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]any{"message": "请求体不是合法 JSON", "type": "invalid_request"},
+			"error": map[string]any{"message": "請求體不是合法 JSON", "type": "invalid_request_error"},
+		})
+		return
+	}
+	if body == nil {
+		gateway.WriteJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]any{"message": "請求體不能為空", "type": "invalid_request_error"},
 		})
 		return
 	}
 
-	// 入口整形一次，与 /v1/messages 一致（去掉 provider/ 前缀、套用名称映射）。
+	// 入口整形一次，與 /v1/messages 一致（去掉 provider/ 前綴、套用名稱映射）。
 	gateway.NormalizeBody(body, false)
 
-	// 边缘熔断期与 /v1/messages 一致：入口直接拒绝，不建票不碰上游
-	if gateway.EdgeHeld(time.Now()) {
-		web.Warn("async", "边缘熔断期，拒绝请求 zcode.z.ai")
-		gateway.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": map[string]any{"message": "上游边缘防火墙已封锁本机出口，稍后自动恢复", "type": "upstream_edge_blocked"},
-		})
-		return
-	}
-
-	ticketID := p.newTicket(body)
+	// 透傳客戶端請求頭（upstream.BuildRequest 內部會依 dropHeaders 剔除鑑權與反代頭）
+	ticketID := p.newTicketWithHeaders(body, gateway.IncomingHeaders(r))
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
@@ -190,14 +212,20 @@ func (p *Pool) streamTicket(ctx context.Context, write func(string) error, ticke
 
 // ── 票务生命周期 ────────────────────────────────────────────────────────────
 
-// newTicket 创建 ticket 并启动后台任务，返回 ticket_id。
+// newTicket 建立 ticket 並啟動背景任務（無透傳標頭的相容包裝）。
 func (p *Pool) newTicket(body map[string]any) string {
+	return p.newTicketWithHeaders(body, nil)
+}
+
+// newTicketWithHeaders 建立攜帶透傳標頭的 ticket 並啟動背景任務，返回 ticket_id。
+func (p *Pool) newTicketWithHeaders(body map[string]any, headers map[string]string) string {
 	p.sweepExpiredTickets()
 	ticketID := util.NewUUID()
 	ctx, cancel := context.WithCancel(context.Background())
 	tk := &ticket{
 		status:    "pending",
 		body:      body,
+		headers:   headers,
 		queue:     make(chan ticketEvent, 256),
 		createdAt: time.Now(),
 		cancel:    cancel,
@@ -271,101 +299,332 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		return
 	}
 	body := tk.body
+	if modelName, _ := body["model"].(string); modelName != "" {
+		if resolved := gateway.ResolveModel(p.Store, modelName, time.Now().Round(0)); resolved != modelName {
+			web.Warn(ticketID, fmt.Sprintf("旗艦模型自動相容改寫: %s → %s", modelName, resolved))
+			body = shallowCopyBody(body)
+			body["model"] = resolved
+		}
+	}
+
+	lookupKey, bindKey := gateway.DeriveAffinityKeys(body, tk.headers)
+	preferredID := ""
+	if p.Affinity != nil && lookupKey != "" {
+		preferredID = p.Affinity.Lookup(lookupKey, time.Now().Round(0))
+	}
+
 	retries := 0
 	announcedReady := false
 	tried := map[string]bool{}
+	edgeBlocked := false
+	bare429Count := 0
+	var firstBare429Acc *model.Account
 
 	for {
 		modelName, _ := body["model"].(string)
-
-		// async 仅支持 JWT 账号，但池中可以混有 apiKey 账号：Select 是
-		// round-robin，轮到 apiKey 账号时必须跳过并继续找下一个，而不是
-		// 直接终止整张票——否则池里明明有可用 JWT 账号，请求却间歇性失败。
-		// 先记 tried 再判断：漏记会让下一次轮询又选中同一账号。
-		acc := p.Store.Select(model.ProviderZai, tried, modelName)
-		for acc != nil && acc.Mode != "jwt" {
-			tried[acc.ID] = true
-			acc = p.Store.Select(model.ProviderZai, tried, modelName)
+		now := time.Now().Round(0)
+		var inFlightFn func(string) int
+		if p.Gate != nil {
+			inFlightFn = p.Gate.AccountInFlight
 		}
+
+		// async 僅支援 JWT 帳號，結合會話親和性、6h 臨期優惠與最小在飛選號，並跳過熔斷出口
+		acc := p.Store.SelectSmart(model.ProviderZai, tried, modelName, store.SelectOptions{
+			Now:         now,
+			PreferredID: preferredID,
+			InFlight:    inFlightFn,
+			Filter:      func(a *model.Account) bool { return a.Mode == "jwt" },
+			CanStick: func(cand *model.Account) bool {
+				ak := gateway.AddressKeyFor(cand)
+				if gateway.EdgeHeldFor(ak, now) {
+					return false
+				}
+				if p.Gate != nil {
+					if held, _ := p.Gate.BusyHeld(ak); held {
+						return false
+					}
+					if p.Gate.AccountInFlight(cand.ID) >= p.Gate.AccountCap(cand.ID) {
+						return false
+					}
+				}
+				return true
+			},
+		})
 		if acc == nil {
-			p.emitError(ctx, ticketID, "无可用 OAuth 账号", "no_account")
+			if edgeBlocked {
+				p.emitError(ctx, ticketID, "上游邊緣防火牆已封鎖目前出口，稍後自動恢復", "upstream_edge_blocked")
+			} else {
+				p.emitError(ctx, ticketID, "无可用 OAuth 账号", "no_account")
+			}
 			return
 		}
 		tried[acc.ID] = true
-
-		// 每个账号在副本上注入 zcode_system（NormalizeBody 的 system 注入不幂等）
-		actualBody := shallowCopyBody(body)
-		gateway.NormalizeBody(actualBody, true)
-		payload, err := util.MarshalJSON(actualBody)
-		if err != nil {
-			p.emitError(ctx, ticketID, "请求体序列化失败", "build_error")
-			return
+		addrKey := gateway.AddressKeyFor(acc)
+		if gateway.EdgeHeldFor(addrKey, now) {
+			edgeBlocked = true
+			if acc.ID == preferredID && p.Affinity != nil {
+				p.Affinity.EvictIfAccount(lookupKey, acc.ID)
+			}
+			web.Warn(ticketID, fmt.Sprintf("帳號 %s 所屬出口處於邊緣熔斷期，跳過並嘗試其他出口", acc.Name))
+			continue
 		}
 
 		networkRetry := false
+		immediateSwitch := false
 		lastNetworkError := ""
-		for attempt := range gateway.MaxCaptchaRetries {
-			var verifyParam, verifyRegion string
-			token, err := p.Captcha.GetVerifyParam(ctx)
-			if err != nil {
-				p.Captcha.Invalidate()
-				if attempt+1 < gateway.MaxCaptchaRetries {
-					web.Warn(ticketID, fmt.Sprintf("验证码自动求解失败，刷新令牌重试（第 %d 次）", attempt+1))
-					continue
-				}
-				p.emitError(ctx, ticketID, fmt.Sprintf("自动验证码暂时失败: %s", err.Error()), "captcha_required")
-				return
-			}
-			if token != nil {
-				verifyParam, verifyRegion = token.VerifyParam, token.Region
-			}
 
-			req, err := upstream.BuildRequest(acc, verifyParam, verifyRegion, nil)
-			if err != nil {
-				p.emitError(ctx, ticketID, err.Error(), "build_error")
-				return
-			}
-
-			if !announcedReady {
-				if !p.emit(ctx, ticketID, ticketEvent{Type: "ready"}) {
+		// 單帳號外層處理 Start Plan 閘門與自適應收窄隊首重排（對齊 engine.tryAccount），
+		// 避免單帳號池收窄時直接換號誤報 no_account。
+		for requeueCount := 0; requeueCount <= gateway.MaxGateRequeue; requeueCount++ {
+			var lease *gateway.GateLease
+			if p.Gate != nil {
+				var err error
+				lease, err = p.Gate.Acquire(ctx, acc.ID, addrKey, requeueCount > 0)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					var holdErr *gateway.BusyHoldError
+					if errors.As(err, &holdErr) {
+						p.emitError(ctx, ticketID, holdErr.Error(), "start_plan_busy_hold")
+						return
+					}
+					p.emitError(ctx, ticketID, err.Error(), "rate_limit_error")
 					return
 				}
-				announcedReady = true
 			}
 
-			midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, modelName, req, payload)
-			if midStream {
-				// 已向客户端发出内容块，不能换号重发（会收到重复事件），终止本票
-				web.Warn(ticketID, fmt.Sprintf("流转发中断: %s", streamErr.Error()))
-				p.emitError(ctx, ticketID, fmt.Sprintf("上游流式响应中断: %s", streamErr.Error()), "upstream_stream_interrupted")
-				return
-			}
-			if streamErr == nil {
-				return // 200 流已完整转发并投递 done
-			}
-			// 上游拒绝验证码：同一账号换令牌重试，次数与求解失败共享内层循环
-			//（对齐 Python _is_captcha_error 分支的 continue）
-			if errors.Is(streamErr, errCaptchaRejected) {
-				if attempt+1 < gateway.MaxCaptchaRetries {
-					web.Warn(ticketID, fmt.Sprintf("账号 %s 验证码失效，刷新重试（第 %d 次）", acc.Name, attempt+1))
+			requeueGate := false
+			captchaAttempt := 0
+			busyAttempt := 0
+			forceCaptcha := false
+			for captchaAttempt < gateway.MaxCaptchaRetries {
+				var verifyParam, verifyRegion string
+				token, err := p.Captcha.GetVerifyParamForModel(ctx, addrKey, forceCaptcha)
+				if err != nil {
+					// 客戶端斷線或票務釋放時不得清空全域驗證碼快取
+					if ctx.Err() != nil {
+						if lease != nil {
+							lease.Release()
+						}
+						return
+					}
+					p.Captcha.InvalidateForAddr(addrKey)
+					captchaAttempt++
+					if captchaAttempt < gateway.MaxCaptchaRetries {
+						web.Warn(ticketID, fmt.Sprintf("验证码自动求解失败，刷新令牌重试（第 %d 次）", captchaAttempt))
+						continue
+					}
+					if lease != nil {
+						lease.Release()
+					}
+					p.emitError(ctx, ticketID, fmt.Sprintf("自动验证码暂时失败: %s", err.Error()), "captcha_required")
+					return
+				}
+				if token != nil {
+					verifyParam, verifyRegion = token.VerifyParam, token.Region
+				}
+				skippedCaptcha := verifyParam == ""
+
+				req, err := upstream.BuildRequest(acc, verifyParam, verifyRegion, tk.headers)
+				if err != nil {
+					if lease != nil {
+						lease.Release()
+					}
+					p.emitError(ctx, ticketID, err.Error(), "build_error")
+					return
+				}
+
+				// 每個帳號在副本上進行 ToolSearch 清洗、QueryID 計算與 system 注入；
+				// async 路由固定以 SSE 串流轉發，必須強制設 stream: true
+				actualBody := shallowCopyBody(body)
+				actualBody["stream"] = true
+				toolSearchRenamed := gateway.RewriteToolSearchRequest(actualBody)
+				upstream.SetQueryID(&req, actualBody)
+				gateway.NormalizeBodyFor(actualBody, true, upstream.AccountDeviceMid(acc), req.Headers["x-session-id"])
+				payload, err := util.MarshalJSON(actualBody)
+				if err != nil {
+					if lease != nil {
+						lease.Release()
+					}
+					p.emitError(ctx, ticketID, "请求体序列化失败", "build_error")
+					return
+				}
+
+				if !announcedReady {
+					if !p.emit(ctx, ticketID, ticketEvent{Type: "ready"}) {
+						if lease != nil {
+							lease.Release()
+						}
+						return
+					}
+					announcedReady = true
+				}
+
+				midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, addrKey, modelName, busyAttempt, requeueCount, toolSearchRenamed, skippedCaptcha, req, payload)
+				if midStream {
+					if lease != nil {
+						lease.Release()
+					}
+					// 已向客户端发出内容块，不能换号重发（会收到重复事件），终止本票
+					web.Warn(ticketID, fmt.Sprintf("流转发中断: %s", streamErr.Error()))
+					p.emitError(ctx, ticketID, fmt.Sprintf("上游流式响应中断: %s", streamErr.Error()), "upstream_stream_interrupted")
+					return
+				}
+				if streamErr == nil {
+					if lease != nil {
+						lease.Release()
+					}
+					if p.Affinity != nil && bindKey != "" {
+						p.Affinity.Bind(bindKey, acc.ID, time.Now().Round(0))
+					}
+					return // 200 流已完整转发并投递 done
+				}
+				// 免驗動態回退：上游拒絕無驗證碼請求時強制補驗，不消耗驗證碼重試次數
+				if errors.Is(streamErr, errSkippedCaptchaRetry) {
+					forceCaptcha = true
 					continue
 				}
-				p.emitError(ctx, ticketID, "上游连续拒绝验证码", "captcha_required")
-				return
+				// 觸發自適應收窄：歸還槽位並排回同帳號隊首重試，不消耗換號次數
+				if errors.Is(streamErr, errGateRequeue) {
+					requeueGate = true
+					break
+				}
+				// 上游拒絕併發准入（3008/3009/3010）：睡眠前主動歸還閘門槽位，醒來隊首重取，避免佔槽
+				if errors.Is(streamErr, errConcurrencyRetry) {
+					delay := p.BusyRetryDelay
+					if delay <= 0 {
+						delay = 1 * time.Second
+					}
+					web.Warn(ticketID, fmt.Sprintf("帳號 %s 模型併發准入受限，%g s 後同號重試", acc.Name, delay.Seconds()))
+					if lease != nil {
+						lease.Release()
+						lease = nil
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(delay):
+					}
+					if p.Gate != nil {
+						if held, rem := p.Gate.BusyHeld(addrKey); held {
+							holdErr := &gateway.BusyHoldError{Remaining: rem}
+							p.emitError(ctx, ticketID, holdErr.Error(), "start_plan_busy_hold")
+							return
+						}
+						var acqErr error
+						lease, acqErr = p.Gate.Acquire(ctx, acc.ID, addrKey, true)
+						if acqErr != nil {
+							if ctx.Err() != nil {
+								return
+							}
+							var holdErr *gateway.BusyHoldError
+							if errors.As(acqErr, &holdErr) {
+								p.emitError(ctx, ticketID, holdErr.Error(), "start_plan_busy_hold")
+								return
+							}
+							p.emitError(ctx, ticketID, acqErr.Error(), "rate_limit_error")
+							return
+						}
+					}
+					busyAttempt++
+					continue
+				}
+				// 上游拒绝验证码：同一账号换令牌重试，次数与求解失败共享内层循环
+				//（对齐 Python _is_captcha_error 分支的 continue）
+				if errors.Is(streamErr, errCaptchaRejected) {
+					captchaAttempt++
+					if captchaAttempt < gateway.MaxCaptchaRetries {
+						web.Warn(ticketID, fmt.Sprintf("账号 %s 验证码失效，刷新重试（第 %d 次）", acc.Name, captchaAttempt))
+						continue
+					}
+					if lease != nil {
+						lease.Release()
+					}
+					p.emitError(ctx, ticketID, "上游连续拒绝验证码", "captcha_required")
+					return
+				}
+				// 邊緣 405：僅熔斷當前出口，立即切換其他代理出口帳號（不耗換號重試與退避）
+				if errors.Is(streamErr, errEdgeBlocked) {
+					edgeBlocked = true
+					bare429Count = 0
+					firstBare429Acc = nil
+					if acc.ID == preferredID && p.Affinity != nil {
+						p.Affinity.EvictIfAccount(lookupKey, acc.ID)
+					}
+					immediateSwitch = true
+					break
+				}
+				// 請求級裸 429 防雪崩：第 1 號暫標探測冷卻立即換號探測；連續第 2 號仍裸 429 則僅平反探測冷卻並立即止損
+				var bareErr errBare429
+				if errors.As(streamErr, &bareErr) {
+					bare429Count++
+					if acc.ID == preferredID && p.Affinity != nil {
+						p.Affinity.EvictIfAccount(lookupKey, acc.ID)
+					}
+					if bare429Count == 1 {
+						firstBare429Acc = acc
+						gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling, gateway.Bare429ProbeReason, time.Now().Round(0))
+						web.Warn(ticketID, fmt.Sprintf("帳號 %s 收到裸 429，暫標冷卻並換號探測", acc.Name))
+						immediateSwitch = true
+						break
+					}
+					if firstBare429Acc != nil {
+						p.Store.Update(firstBare429Acc.Provider, firstBare429Acc.ID, func(a *model.Account) {
+							if a.Status == model.StatusCooling && a.LastError != nil && *a.LastError == gateway.Bare429ProbeReason {
+								a.Status = model.StatusActive
+								a.CoolingUntil = nil
+								a.LastError = nil
+							}
+						})
+					}
+					if lease != nil {
+						lease.Release()
+					}
+					web.Warn(ticketID, "連續 2 個帳號觸發無業務碼裸 429（疑似請求級限流），已恢復探路帳號並立即止損")
+					msg := bareErr.body
+					if strings.TrimSpace(msg) == "" {
+						msg = gateway.Bare429FallbackMessage
+					}
+					p.emitError(ctx, ticketID, msg, "upstream_rate_limit")
+					return
+				}
+				// 其余错误已作为 error 事件投递给客户端，后台任务直接结束
+				if errors.Is(streamErr, errDelivered) {
+					if lease != nil {
+						lease.Release()
+					}
+					return
+				}
+				if ctx.Err() != nil {
+					if lease != nil {
+						lease.Release()
+					}
+					return // 票务已被释放，无需继续
+				}
+				bare429Count = 0
+				firstBare429Acc = nil
+				if acc.ID == preferredID && p.Affinity != nil {
+					p.Affinity.EvictIfAccount(lookupKey, acc.ID)
+				}
+				web.Warn(ticketID, "请求失败: "+streamErr.Error())
+				networkRetry = true
+				lastNetworkError = streamErr.Error()
+				break
 			}
-			// 其余错误已作为 error 事件投递给客户端，后台任务直接结束
-			if errors.Is(streamErr, errDelivered) {
-				return
+			if lease != nil {
+				lease.Release()
 			}
-			if ctx.Err() != nil {
-				return // 票务已被释放，无需继续
+			if requeueGate && requeueCount < gateway.MaxGateRequeue {
+				web.Warn(ticketID, fmt.Sprintf("帳號 %s 併發上限已自適應收窄，歸還槽位並排回隊首重試（第 %d 次）", acc.Name, requeueCount+1))
+				continue
 			}
-			web.Warn(ticketID, "请求失败: "+streamErr.Error())
-			networkRetry = true
-			lastNetworkError = streamErr.Error()
 			break
 		}
 
+		if immediateSwitch {
+			continue
+		}
 		if !networkRetry {
 			// 验证码重试循环耗尽（防御分支，对齐 Python for-else）
 			p.emitError(ctx, ticketID, "上游连续拒绝验证码", "captcha_required")
@@ -409,22 +668,62 @@ func (p *Pool) attemptUpstream(
 	ctx context.Context,
 	ticketID string,
 	acc *model.Account,
+	addrKey string,
 	modelName string,
+	attempt int,
+	requeueCount int,
+	restoreToolSearch bool,
+	skippedCaptcha bool,
 	req upstream.Request,
 	payload []byte,
 ) (bool, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, strings.NewReader(string(payload)))
-	if err != nil {
-		return false, err
-	}
-	for k, v := range req.Headers {
-		httpReq.Header.Set(k, v)
-	}
+	var (
+		resp       *http.Response
+		reqCleanup func()
+	)
+	for netAttempt := 0; netAttempt < 2; netAttempt++ {
+		tracedCtx, traceState := gateway.AttachReplayTrace(ctx)
+		reqCtx, reqBody, cleanup, stalled := gateway.WrapBodyWithStallGuard(tracedCtx, payload, p.uploadStallTimeout(), traceState)
 
-	resp, err := p.clientFor(acc).Do(httpReq)
-	if err != nil {
-		return false, err
+		httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, req.URL, reqBody)
+		if err != nil {
+			cleanup()
+			return false, err
+		}
+		httpReq.ContentLength = int64(len(payload))
+		for k, v := range req.Headers {
+			httpReq.Header.Set(k, v)
+		}
+
+		r, doErr := p.clientFor(acc).Do(httpReq)
+		if doErr == nil {
+			resp = r
+			reqCleanup = cleanup
+			break
+		}
+		wasStalled := stalled()
+		cleanup()
+		if wasStalled {
+			p.closeIdleForAccount(acc)
+			web.Warn(ticketID, fmt.Sprintf("帳號 %s 上游請求體上傳流控停滯逾時，驅逐閒置連線並換號", acc.Name))
+			return false, gateway.ErrUploadStalled
+		}
+		if ctx.Err() != nil {
+			return false, doErr
+		}
+		if netAttempt == 0 && gateway.ShouldTransparentReplay(ctx, doErr, traceState, false) {
+			p.closeIdleForAccount(acc)
+			web.Warn(ticketID, fmt.Sprintf("帳號 %s 出站連線未送達即斷開，%dms 後透明重放 1 次", acc.Name, p.replayDelay().Milliseconds()))
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(p.replayDelay()):
+				continue
+			}
+		}
+		return false, doErr
 	}
+	defer reqCleanup()
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -439,36 +738,40 @@ func (p *Pool) attemptUpstream(
 		// 分类顺序与 engine.handleUpstreamError 一致（PLAN §5.2），
 		// 同一账号在两条路径下必须标出相同状态。
 		if gateway.IsCaptchaError(bodyText, resp.StatusCode, resp.Header) {
-			// 验证码被拒：令牌作废，由调用方在内层循环内换令牌重试
-			p.Captcha.Invalidate()
+			if skippedCaptcha {
+				// 動態免驗撞見驗證碼挑戰：立即失效免驗開關並回退補驗，不消耗驗證碼重試次數
+				p.Captcha.InvalidateModelSkip()
+				web.Warn(ticketID, fmt.Sprintf("帳號 %s 動態免驗被上游要求驗證，立即補辦驗證碼重送", acc.Name))
+				return false, errSkippedCaptchaRetry
+			}
+			// 验证码被拒：按出口作廢令牌，由调用方在内层循环内换令牌重试
+			p.Captcha.InvalidateForAddr(addrKey)
 			return false, errCaptchaRejected
 		}
 
-		// 405：先区分边缘拦截页（网络级，全局熔断）与账号级风控（3012，长冷却）
+		// 405：先區分邊緣攔截頁（按出口熔斷並換其他出口）與帳號級風控（3012，長冷卻）
 		if gateway.IsZcodeEdgeBlocked(resp.StatusCode, bodyText) {
-			gateway.HoldEdge(time.Duration(config.EdgeHoldSeconds)*time.Second, time.Now())
+			gateway.HoldEdgeFor(addrKey, time.Duration(config.EdgeHoldSeconds)*time.Second, time.Now().Round(0))
+			p.closeIdleForAccount(acc)
 			p.bumpFail(acc)
-			web.Warn(ticketID, fmt.Sprintf("上游边缘防火墙拦截本机出口，全局熔断 %d s", config.EdgeHoldSeconds))
-			p.emit(ctx, ticketID, ticketEvent{
-				Type: "error",
-				Data: map[string]any{"error": map[string]any{
-					"message": "上游边缘防火墙已封锁本机出口，稍后自动恢复", "type": "upstream_edge_blocked"}},
-			})
-			return false, errDelivered
+			web.Warn(ticketID, fmt.Sprintf("上游邊緣防火牆攔截出口（%s），熔斷 %d s 並嘗試其他出口", addrKey, config.EdgeHoldSeconds))
+			return false, errEdgeBlocked
 		}
 		if gateway.IsZcodeRestricted(resp.StatusCode, bodyText) {
+			p.closeIdleForAccount(acc)
 			p.bumpFail(acc)
 			gateway.MarkAccountCooling(p.Store, acc.Provider, acc.ID,
 				"上游风控 3012 拒绝（HTTP 405）",
-				time.Duration(config.RestrictedCooldownSeconds)*time.Second, time.Now())
+				time.Duration(config.RestrictedCooldownSeconds)*time.Second, time.Now().Round(0))
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 被上游风控限制（3012），冷却 %d s 后重试", acc.Name, config.RestrictedCooldownSeconds))
 			return false, errNetwork{bodyText}
 		}
 
-		// 401/403 → 账号失效，换号
+		// 401/403 → 帳號失效並驅逐該出口髒閒置連線，換號
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			p.closeIdleForAccount(acc)
 			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusInvalid,
-				fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode), time.Now())
+				fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode), time.Now().Round(0))
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
 			return false, errNetwork{bodyText}
 		}
@@ -481,20 +784,38 @@ func (p *Pool) attemptUpstream(
 			return false, errNetwork{bodyText}
 		}
 
-		// 429 且 code=3010：模型并发准入限制，账号仍可用，不标状态
+		// 429 且 code∈{3008,3009,3010}：併發准入限制，帳號仍可用；首次同號延遲重試，
+		// 二次仍被拒時以 retryAttempt=1 回報閘門觸發收窄隊首重排或忙線熔斷。
 		if gateway.IsModelConcurrencyLimit(resp.StatusCode, bodyText) {
-			web.Warn(ticketID, fmt.Sprintf("账号 %s 模型并发准入受限，保留账号状态", acc.Name))
+			if attempt == 0 {
+				return false, errConcurrencyRetry
+			}
+			if p.Gate != nil {
+				requeue, holdTriggered := p.Gate.RecordConcurrencyRefusal(acc.ID, addrKey, 1)
+				if holdTriggered {
+					_, rem := p.Gate.BusyHeld(addrKey)
+					holdErr := &gateway.BusyHoldError{Remaining: rem}
+					p.emitError(ctx, ticketID, holdErr.Error(), "start_plan_busy_hold")
+					return false, errDelivered
+				}
+				if requeue && requeueCount < gateway.MaxGateRequeue {
+					return false, errGateRequeue
+				}
+			}
+			web.Warn(ticketID, fmt.Sprintf("帳號 %s 模型併發准入持續受限，保留帳號狀態並換號", acc.Name))
 			return false, errNetwork{bodyText}
 		}
 
-		// 429：额度上限码族 → 该模型耗尽；其余瞬时限流 → 冷却
+		// 429：額度上限碼族 → 該模型耗盡；裸 429 → 交外層防雪崩止損；其餘瞬時限流 → 冷卻
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if gateway.IsQuotaExhaustedCode(bodyText) {
 				gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
 					fmt.Sprintf("%s 額度/用量上限已達", gateway.OrCurrent(modelName)))
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, gateway.OrCurrent(modelName)))
+			} else if gateway.IsBare429(resp.StatusCode, bodyText, resp.Header) {
+				return false, errBare429{body: bodyText}
 			} else {
-				gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling, "上游限流 HTTP 429", time.Now())
+				gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling, "上游限流 HTTP 429", time.Now().Round(0))
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
 			}
 			return false, errNetwork{bodyText}
@@ -504,7 +825,7 @@ func (p *Pool) attemptUpstream(
 		if resp.StatusCode == http.StatusServiceUnavailable {
 			p.bumpFail(acc)
 			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling,
-				"上游服務不可用 HTTP 503", time.Now())
+				"上游服務不可用 HTTP 503", time.Now().Round(0))
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
 			return false, errNetwork{bodyText}
 		}
@@ -527,11 +848,11 @@ func (p *Pool) attemptUpstream(
 		if readErr != nil {
 			return false, readErr
 		}
-		return p.handleUpstreamJSON(ctx, ticketID, acc, modelName, buffered)
+		return p.handleUpstreamJSON(ctx, ticketID, acc, addrKey, modelName, skippedCaptcha, buffered)
 	}
 
 	// 200：转发 SSE；转发开始后中断按 chunk 计数区分两种出路
-	return p.forwardSSE(ctx, ticketID, resp, acc)
+	return p.forwardSSE(ctx, ticketID, resp, acc, restoreToolSearch)
 }
 
 // handleUpstreamJSON 处理 HTTP 200 且 content-type 为 JSON 的响应。
@@ -540,7 +861,9 @@ func (p *Pool) handleUpstreamJSON(
 	ctx context.Context,
 	ticketID string,
 	acc *model.Account,
+	addrKey string,
 	modelName string,
+	skippedCaptcha bool,
 	buffered []byte,
 ) (bool, error) {
 	text := string(buffered)
@@ -555,8 +878,13 @@ func (p *Pool) handleUpstreamJSON(
 		return false, errNetwork{text}
 
 	case code == "3007":
-		// 验证码被拒：令牌作废，由调用方在内层循环内换令牌重试
-		p.Captcha.Invalidate()
+		if skippedCaptcha {
+			p.Captcha.InvalidateModelSkip()
+			web.Warn(ticketID, fmt.Sprintf("帳號 %s 動態免驗收到 3007，立即補辦驗證碼重送", acc.Name))
+			return false, errSkippedCaptchaRetry
+		}
+		// 验证码被拒：按出口作廢令牌，由调用方在内层循环内换令牌重试
+		p.Captcha.InvalidateForAddr(addrKey)
 		return false, errCaptchaRejected
 
 	case code != "" && code != "0":
@@ -570,6 +898,15 @@ func (p *Pool) handleUpstreamJSON(
 				"code":    code,
 			}},
 		})
+		return false, errDelivered
+	}
+
+	// 靜默版本淘汰空信封攔截：不記帳號失敗、不換號
+	if gateway.IsRefusedEnvelope(buffered) {
+		web.Warn(ticketID, fmt.Sprintf("上游返回空信封疑似客戶端版本過舊（帳號 %s），不計帳號失敗並終止請求", acc.Name))
+		p.emitError(ctx, ticketID,
+			"上游靜默拒絕請求（返回空信封，疑似客戶端版本號過舊，請檢查 ZCODE_CLIENT_VERSION）",
+			"upstream_version_refused")
 		return false, errDelivered
 	}
 
@@ -589,6 +926,23 @@ func (p *Pool) handleUpstreamJSON(
 // errCaptchaRejected 上游拒绝验证码：调用方在内层循环内换令牌重试（不换号）。
 var errCaptchaRejected = errors.New("上游拒绝验证码")
 
+// errSkippedCaptchaRetry 動態免驗遇驗證碼挑戰：呼叫端強制補驗重送，不計驗證碼重試次數。
+var errSkippedCaptchaRetry = errors.New("免驗被拒需補驗證碼重送")
+
+// errEdgeBlocked 上游邊緣 405 封鎖目前出口：呼叫端立即切換其他代理出口帳號。
+var errEdgeBlocked = errors.New("上游邊緣封鎖目前出口")
+
+// errBare429 上游回傳無業務碼裸 429：由外層防雪崩機制決定探測換號或止損。
+type errBare429 struct{ body string }
+
+func (e errBare429) Error() string { return e.body }
+
+// errConcurrencyRetry 上游併發准入受限（3008/3009/3010）：首次同號延遲重試。
+var errConcurrencyRetry = errors.New("上游併發准入受限重試")
+
+// errGateRequeue 閘門觸發自適應收窄，歸還槽位並排回同帳號隊首重試。
+var errGateRequeue = errors.New("閘門隊首重排重試")
+
 // errDelivered 非 200 错误体已作为 error 事件投递给客户端，任务直接结束。
 var errDelivered = errors.New("已投递错误事件")
 
@@ -600,18 +954,26 @@ func (e errNetwork) Error() string { return e.body }
 // forwardSSE 把上游 SSE 行转成 ticket chunk 事件，并累计账号 token 用量。
 // 完整结束时投递 done 并返回 (false, nil)；转发开始后中断时返回
 // (true, err)，零 chunk 时返回 (false, err) 由调用方换号重试。
-func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Response, acc *model.Account) (bool, error) {
+func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Response, acc *model.Account, restoreToolSearch bool) (bool, error) {
 	usage := gateway.NewUsageCollector(true)
 	chunksSent := 0
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var reader io.Reader = resp.Body
+	if restoreToolSearch {
+		reader = gateway.RestoreToolSearchStream(reader)
+	}
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	for scanner.Scan() {
 		line := scanner.Text()
 		usage.FeedLine(line)
-		if !strings.HasPrefix(line, "data: ") {
+		var chunkData string
+		if strings.HasPrefix(line, "data: ") {
+			chunkData = line[len("data: "):]
+		} else if strings.HasPrefix(line, "data:") {
+			chunkData = strings.TrimSpace(line[len("data:"):])
+		} else {
 			continue
 		}
-		chunkData := line[len("data: "):]
 		if strings.TrimSpace(chunkData) == "[DONE]" {
 			continue
 		}
@@ -640,9 +1002,37 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	p.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
 		a.AccumulateTokens(got)
 	})
-	gateway.MarkSuccess(p.Store, acc.Provider, acc.ID, time.Now())
+	gateway.MarkSuccess(p.Store, acc.Provider, acc.ID, time.Now().Round(0))
 	p.emit(ctx, ticketID, ticketEvent{Type: "done"})
 	return false, nil
+}
+
+// replayDelay 取得未送達／複用斷連透明重放延遲。
+func (p *Pool) replayDelay() time.Duration {
+	if p.ReplayDelay > 0 {
+		return p.ReplayDelay
+	}
+	return gateway.DefaultReplayDelay
+}
+
+// uploadStallTimeout 取得上傳流控停滯看門狗逾時。
+func (p *Pool) uploadStallTimeout() time.Duration {
+	if p.UploadStallTimeout > 0 {
+		return p.UploadStallTimeout
+	}
+	return gateway.DefaultUploadStallTimeout
+}
+
+// closeIdleForAccount 驅逐指定帳號對應出口的髒閒置連線。
+func (p *Pool) closeIdleForAccount(acc *model.Account) {
+	if p.Client != nil {
+		p.Client.CloseIdleConnections()
+	}
+	raw := ""
+	if acc != nil && acc.ProxyURL != nil {
+		raw = strings.TrimSpace(*acc.ProxyURL)
+	}
+	proxy.CloseIdleFor(raw)
 }
 
 // bumpFail 累加账号失败计数（锁内修改，供 503 与未知错误分支复用）。
@@ -685,7 +1075,6 @@ func (p *Pool) clientFor(acc *model.Account) *http.Client {
 // marshalJSON 与网关一致（Python json.dumps(ensure_ascii=False) 形态）：
 // 紧凑序列化、不转义 HTML 字符、无尾部换行。
 
-
 // sseJSON 对齐 Python json.dumps 默认的 ensure_ascii=True：非 ASCII 字符
 // 转义为 \uXXXX（含 UTF-16 代理对），HTML 字符不转义。分隔符沿用 Go 紧凑
 // 形态（Python 默认逗号冒号后带空格，SSE 消费方按 JSON 解析无感知）。
@@ -720,6 +1109,4 @@ func shallowCopyBody(body map[string]any) map[string]any {
 
 // newUUID 生成 UUIDv4（不引入第三方依赖）。
 
-
 // writeJSONStatus 错误 JSON 响应（与网关 writeJSON 同形态）。
-

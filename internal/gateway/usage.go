@@ -80,9 +80,12 @@ func (u *UsageCollector) FeedLine(line string) {
 	}
 }
 
-// Finish 回應结束后收尾：非 SSE 模式在此解析缓冲的完整 JSON。
+// Finish 回應結束後收尾：SSE 模式先刷出未含尾部換行的殘留行，非 SSE 模式解析完整 JSON。
 func (u *UsageCollector) Finish() {
 	if u.isSSE {
+		if len(u.buf) > 0 {
+			u.FeedLine(string(u.buf))
+		}
 		u.buf = nil
 		return
 	}
