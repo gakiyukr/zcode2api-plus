@@ -20,6 +20,7 @@ import (
 	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
@@ -441,7 +442,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				actualBody["stream"] = true
 				toolSearchRenamed := gateway.RewriteToolSearchRequest(actualBody)
 				upstream.SetQueryID(&req, actualBody)
-				gateway.NormalizeBodyFor(actualBody, true, upstream.AccountDeviceMid(acc), req.Headers["x-session-id"])
+				gateway.NormalizeBodyForSKU(actualBody, true, upstream.AccountDeviceMid(acc), req.Headers["x-session-id"], fingerprint.For(acc))
 				payload, err := util.MarshalJSON(actualBody)
 				if err != nil {
 					if lease != nil {
@@ -999,8 +1000,9 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	// 且冷却到期的账号即使这里已成功也仍停在 cooling。
 	usage.Finish()
 	got := usage.AsDict()
-	p.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+	_ = p.Store.UpdateStats(acc.Provider, acc.ID, func(a *model.Account) bool {
 		a.AccumulateTokens(got)
+		return false
 	})
 	gateway.MarkSuccess(p.Store, acc.Provider, acc.ID, time.Now().Round(0))
 	p.emit(ctx, ticketID, ticketEvent{Type: "done"})
@@ -1037,8 +1039,9 @@ func (p *Pool) closeIdleForAccount(acc *model.Account) {
 
 // bumpFail 累加账号失败计数（锁内修改，供 503 与未知错误分支复用）。
 func (p *Pool) bumpFail(acc *model.Account) {
-	p.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+	_ = p.Store.UpdateStats(acc.Provider, acc.ID, func(a *model.Account) bool {
 		a.FailCount++
+		return false
 	})
 }
 

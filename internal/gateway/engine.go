@@ -12,13 +12,14 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
+	"zcode2api/internal/egress"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
@@ -27,32 +28,15 @@ import (
 	"zcode2api/internal/web"
 )
 
-// edgeHoldMap 按出口地址（代理 URL 或 "direct"）隔離的上游邊緣防火牆 405 熔斷
-// 截止時間表（key: addrKey string, value: int64 unix nano）。不同出口 IP 互不阻塞。
-var edgeHoldMap sync.Map
-
-func normalizeEdgeKey(addrKey string) string {
-	if strings.TrimSpace(addrKey) == "" {
-		return "direct"
-	}
-	return addrKey
-}
-
 // HoldEdgeFor 開啟指定出口的邊緣熔斷：duration 內該出口不再發送請求，其他出口不受影響。
+// 熔斷表由 egress 套件持有，匿名巡檢與真實請求共用同一份狀態。
 func HoldEdgeFor(addrKey string, duration time.Duration, now time.Time) {
-	now = now.Round(0)
-	edgeHoldMap.Store(normalizeEdgeKey(addrKey), now.Add(duration).UnixNano())
+	egress.HoldFor(addrKey, duration, now)
 }
 
 // EdgeHeldFor 判斷指定出口目前是否處於邊緣熔斷期。
 func EdgeHeldFor(addrKey string, now time.Time) bool {
-	now = now.Round(0)
-	v, ok := edgeHoldMap.Load(normalizeEdgeKey(addrKey))
-	if !ok {
-		return false
-	}
-	until, _ := v.(int64)
-	return until > 0 && now.UnixNano() < until
+	return egress.IsHeld(addrKey, now)
 }
 
 // HoldEdge 開啟直連出口的邊緣熔斷（相容舊介面包裝）。
@@ -205,8 +189,10 @@ type attemptResult struct {
 	switchAccount       bool
 	bare429             bool
 	edgeBlocked         bool
-	empty               *emptyReply
-	final               runResult
+	// retryAltCredential：Start Plan 忙線熔斷／併發拒絕時，改用同號 API Key 通道。
+	retryAltCredential bool
+	empty              *emptyReply
+	final              runResult
 }
 
 // ResolveModel 解析請求模型名：若屬退役旗艦別名（如 GLM-5.3），且帳號池中無
@@ -217,19 +203,7 @@ func ResolveModel(st *store.Store, modelName string, now time.Time) string {
 	if alias == "" || st == nil {
 		return modelName
 	}
-	hasOrig, hasAlias := false, false
-	for _, a := range st.ListAccounts(model.ProviderZai) {
-		if !a.IsSelectable(now) {
-			continue
-		}
-		if a.ModelAvailability(modelName) == "available" {
-			hasOrig = true
-			break
-		}
-		if a.ModelAvailability(alias) == "available" {
-			hasAlias = true
-		}
-	}
+	hasOrig, hasAlias := st.ResolveFlagshipAvailability(modelName, alias, now)
 	if !hasOrig && hasAlias {
 		return alias
 	}
@@ -380,22 +354,10 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 // 为该账号提供的实际模型，额度刷新（quota.Service）会持续同步进快照。
 // 无账号或快照为空时回退 AvailableModels 静态清单，保证端点永远可用。
 func (e *Engine) CollectModels() []string {
-	seen := map[string]bool{}
-	out := []string{}
-	for _, acc := range e.Store.ListAccounts(model.ProviderZai) {
-		for _, entry := range acc.Quota {
-			name, _ := entry["model"].(string)
-			if name == "" || seen[name] {
-				continue
-			}
-			seen[name] = true
-			out = append(out, name)
-		}
-	}
+	out := e.Store.CollectModelNames()
 	if len(out) == 0 {
 		return append([]string{}, AvailableModels...)
 	}
-	sort.Strings(out)
 	return out
 }
 
@@ -469,6 +431,33 @@ func (e *Engine) TestAccount(ctx context.Context, acc *model.Account, modelName 
 }
 
 // tryAccount 單個帳號的嘗試：外層處理 Start Plan 雙層閘門與收窄隊首重排，
+// canDegrade 判斷是否可把 Start Plan 請求改走同號 Coding Plan（API Key）通道。
+// 僅同時具備 JWT 與 API Key 且開關開啟時成立；單憑證帳號完全不受影響。
+func (e *Engine) canDegrade(acc *model.Account) bool {
+	if !config.DualCredentialDegrade || acc == nil || acc.Mode != "jwt" {
+		return false
+	}
+	return acc.APIKey != nil && strings.TrimSpace(*acc.APIKey) != ""
+}
+
+// tryDegradedCredential 以同帳號的 API Key 憑證重送一次。此路徑不佔 Start Plan
+// 閘門、不求解驗證碼；鑑權與額度錯誤不會回寫 JWT 帳號的狀態。
+func (e *Engine) tryDegradedCredential(
+	ctx context.Context,
+	reqID string,
+	acc *model.Account,
+	addrKey string,
+	body map[string]any,
+	modelName string,
+	stream bool,
+	retryEmpty bool,
+	incomingHeaders map[string]string,
+	deliver DeliverFunc,
+) attemptResult {
+	web.Warn(reqID, fmt.Sprintf("帳號 %s 的 Start Plan 通道不可用，改用同號 Coding Plan (API Key) 通道", acc.Name))
+	return e.tryAccountWithLease(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, false, 0, incomingHeaders, deliver, nil, "apiKey", true)
+}
+
 // 內層處理驗證碼與併發准入重試（對齊 MaxCaptchaRetries）。
 func (e *Engine) tryAccount(
 	ctx context.Context,
@@ -483,6 +472,7 @@ func (e *Engine) tryAccount(
 ) attemptResult {
 	needsCaptcha := acc.Mode == "jwt"
 	addrKey := AddressKeyFor(acc)
+	altTried := false
 
 	for requeueCount := 0; requeueCount <= MaxGateRequeue; requeueCount++ {
 		var lease *GateLease
@@ -497,21 +487,33 @@ func (e *Engine) tryAccount(
 				var holdErr *BusyHoldError
 				if errors.As(err, &holdErr) {
 					web.Warn(reqID, holdErr.Error())
+					if !altTried && e.canDegrade(acc) {
+						altTried = true
+						return e.tryDegradedCredential(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, incomingHeaders, deliver)
+					}
 					return attemptResult{final: errResult(http.StatusTooManyRequests, "start_plan_busy_hold", holdErr.Error())}
 				}
 				var waitErr *GateWaitError
 				if errors.As(err, &waitErr) {
 					web.Warn(reqID, waitErr.Error())
+					if !altTried && e.canDegrade(acc) {
+						altTried = true
+						return e.tryDegradedCredential(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, incomingHeaders, deliver)
+					}
 					return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", waitErr.Error())}
 				}
 				return attemptResult{final: errResult(http.StatusTooManyRequests, "rate_limit_error", err.Error())}
 			}
 		}
 
-		res := e.tryAccountWithLease(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, needsCaptcha, requeueCount, incomingHeaders, deliver, &lease)
+		res := e.tryAccountWithLease(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, needsCaptcha, requeueCount, incomingHeaders, deliver, &lease, "", false)
 		if lease != nil {
 			lease.Release()
 			lease = nil
+		}
+		if res.retryAltCredential && !altTried && e.canDegrade(acc) {
+			altTried = true
+			return e.tryDegradedCredential(ctx, reqID, acc, addrKey, body, modelName, stream, retryEmpty, incomingHeaders, deliver)
 		}
 		if res.requeueGate && requeueCount < MaxGateRequeue {
 			web.Warn(reqID, fmt.Sprintf("帳號 %s 併發上限已自適應收窄，歸還槽位並排回隊首重試（第 %d 次）", acc.Name, requeueCount+1))
@@ -538,6 +540,8 @@ func (e *Engine) tryAccountWithLease(
 	incomingHeaders map[string]string,
 	deliver DeliverFunc,
 	leasePtr **GateLease,
+	credentialMode string,
+	altCredential bool,
 ) attemptResult {
 	captchaAttempt := 0
 	busyAttempt := 0
@@ -566,8 +570,12 @@ func (e *Engine) tryAccountWithLease(
 		}
 		skippedCaptcha := needsCaptcha && verifyParam == ""
 
-		req, err := upstream.BuildRequest(acc, verifyParam, verifyRegion, incomingHeaders)
+		req, err := upstream.BuildRequestForCredential(acc, credentialMode, verifyParam, verifyRegion, incomingHeaders)
 		if err != nil {
+			if altCredential {
+				web.Warn(reqID, fmt.Sprintf("账号 %s 的備用 API Key 無效，保留 Start Plan 憑證狀態", acc.Name))
+				return attemptResult{switchAccount: true}
+			}
 			e.mark(acc, model.StatusInvalid, err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 凭证无效，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}
@@ -578,7 +586,7 @@ func (e *Engine) tryAccountWithLease(
 		actualBody := shallowCopyBody(body)
 		toolSearchRenamed := RewriteToolSearchRequest(actualBody)
 		upstream.SetQueryID(&req, actualBody)
-		NormalizeBodyFor(actualBody, needsCaptcha, upstream.AccountDeviceMid(acc), req.Headers["x-session-id"])
+		NormalizeBodyForSKU(actualBody, needsCaptcha, upstream.AccountDeviceMid(acc), req.Headers["x-session-id"], fingerprint.For(acc))
 		payload, err := util.MarshalJSON(actualBody)
 		if err != nil {
 			web.Err(reqID, fmt.Sprintf("请求体序列化失败: %v", err))
@@ -652,7 +660,7 @@ func (e *Engine) tryAccountWithLease(
 		}
 
 		if resp.StatusCode >= 400 {
-			res := e.handleUpstreamError(ctx, reqID, acc, addrKey, modelName, needsCaptcha, skippedCaptcha, resp, captchaAttempt, busyAttempt, requeueCount)
+			res := e.handleUpstreamError(ctx, reqID, acc, addrKey, modelName, needsCaptcha, skippedCaptcha, resp, captchaAttempt, busyAttempt, requeueCount, altCredential)
 			reqCleanup()
 			if res.skippedCaptchaRetry {
 				forceCaptcha = true
@@ -741,9 +749,10 @@ func (e *Engine) tryAccountWithLease(
 			return res
 		}
 
-		// SSE 成功：串流交付結束並關閉 Body 後再釋放看門狗上下文
-		defer reqCleanup()
-		return e.deliverStream(reqID, acc, contentType, resp, toolSearchRenamed, deliver)
+		// SSE 成功：前奏緩衝與交付都在同一 ctx 下完成；守衛熔斷時主動取消上游。
+		cancelOnce := sync.OnceFunc(reqCleanup)
+		defer cancelOnce()
+		return e.deliverStream(ctx, reqID, acc, contentType, resp, toolSearchRenamed, deliver, cancelOnce)
 	}
 
 	// 验证码重试次数耗尽
@@ -766,6 +775,7 @@ func (e *Engine) handleUpstreamError(
 	captchaAttempt int,
 	busyAttempt int,
 	requeueCount int,
+	altCredential bool,
 ) attemptResult {
 	// 错误响应体限长：正常路径是流式转发（边读边发），只有错误分支才整段读进
 	// 内存。上游或账号级代理异常时可能回一个极大的 body，无上限会直接吃光内存。
@@ -777,6 +787,10 @@ func (e *Engine) handleUpstreamError(
 		if isCanceled(ctx, err) {
 			web.Warn(reqID, "客户端已断开，终止重试")
 			return canceledResult()
+		}
+		if altCredential {
+			web.Warn(reqID, "備用 API Key 通道讀取錯誤體失敗，保留 Start Plan 帳號狀態")
+			return attemptResult{switchAccount: true}
 		}
 		e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
 		return attemptResult{switchAccount: true}
@@ -830,6 +844,10 @@ func (e *Engine) handleUpstreamError(
 	// 2) 鉴权失败是强信号（JWT 上游为裸 401 空 body；api.z.ai 为 type=1000/1001/1003）
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		e.closeIdleForAccount(acc)
+		if altCredential {
+			web.Warn(reqID, fmt.Sprintf("账号 %s 的備用 API Key 鑑權失敗，保留 Start Plan 憑證狀態", acc.Name))
+			return attemptResult{switchAccount: true}
+		}
 		e.mark(acc, model.StatusInvalid, fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
 		web.Warn(reqID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
 		return attemptResult{switchAccount: true}
@@ -837,6 +855,10 @@ func (e *Engine) handleUpstreamError(
 
 	// 3) 402 → 该模型耗尽
 	if resp.StatusCode == http.StatusPaymentRequired {
+		if altCredential {
+			web.Warn(reqID, "備用 API Key 通道額度不足，保留 Start Plan 帳號狀態並換號")
+			return attemptResult{switchAccount: true}
+		}
 		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度已用完", OrCurrent(modelName)))
 		web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, OrCurrent(modelName)))
 		e.fireRefresh(acc)
@@ -848,6 +870,10 @@ func (e *Engine) handleUpstreamError(
 		if needsCaptcha && e.Gate != nil {
 			requeue, holdTriggered := e.Gate.RecordConcurrencyRefusal(acc.ID, addrKey, busyAttempt)
 			if holdTriggered {
+				if !altCredential && e.canDegrade(acc) {
+					web.Warn(reqID, "Start Plan 忙線熔斷，改用同號 Coding Plan 通道")
+					return attemptResult{retryAltCredential: true}
+				}
 				_, rem := e.Gate.BusyHeld(addrKey)
 				holdErr := &BusyHoldError{Remaining: rem}
 				web.Warn(reqID, holdErr.Error())
@@ -862,6 +888,10 @@ func (e *Engine) handleUpstreamError(
 			web.Warn(reqID, fmt.Sprintf("模型併發准入受限，先歸還槽位並於 %g s 後隊首重取重試", delay.Seconds()))
 			return attemptResult{retryBusy: true, busyDelay: delay}
 		}
+		if !altCredential && e.canDegrade(acc) {
+			web.Warn(reqID, fmt.Sprintf("模型併發准入持續受限（帳號 %s），改用同號 Coding Plan 通道", acc.Name))
+			return attemptResult{retryAltCredential: true}
+		}
 		web.Warn(reqID, fmt.Sprintf("模型併發准入持續受限（帳號 %s），保留帳號狀態", acc.Name))
 		return attemptResult{final: runResult{
 			Status: resp.StatusCode,
@@ -871,6 +901,10 @@ func (e *Engine) handleUpstreamError(
 
 	// 5) 429：官方用量上限码族 → 该模型耗尽；無業務碼裸 429 → 交由 RunMessages 雙號探測止損；其餘瞬時限流 → 冷卻
 	if resp.StatusCode == http.StatusTooManyRequests {
+		if altCredential {
+			web.Warn(reqID, "備用 API Key 通道被限流，保留 Start Plan 帳號狀態並換號")
+			return attemptResult{switchAccount: true}
+		}
 		if quotaExhaustedCodes[UpstreamBusinessCode(text)] {
 			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", OrCurrent(modelName)))
 			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, OrCurrent(modelName)))
@@ -898,6 +932,10 @@ func (e *Engine) handleUpstreamError(
 
 	// 6) 503 → 冷却换号
 	if resp.StatusCode == http.StatusServiceUnavailable {
+		if altCredential {
+			web.Warn(reqID, "備用 API Key 通道服務不可用，保留 Start Plan 帳號狀態並換號")
+			return attemptResult{switchAccount: true}
+		}
 		e.bumpFail(acc)
 		e.mark(acc, model.StatusCooling, "上游服務不可用 HTTP 503")
 		web.Warn(reqID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
@@ -1036,19 +1074,36 @@ func isEmptyAnthropicReply(buffered []byte) bool {
 	return true
 }
 
-// deliverStream 交付 SSE 流式响应；usage 随读取同步收集，客户端完整接收后计入。
-func (e *Engine) deliverStream(reqID string, acc *model.Account, contentType string, resp *http.Response, restoreToolSearch bool, deliver DeliverFunc) attemptResult {
+// deliverStream 交付 SSE 流式响应。首個實質內容前先緩衝前奏；此階段失敗
+// 尚未寫出 HTTP 頭，可直接換號重試。commit 之後才計入成功並啟動心跳與
+// loopGuard，首字後的斷流不再重試（避免重複拼貼）。
+func (e *Engine) deliverStream(ctx context.Context, reqID string, acc *model.Account, contentType string, resp *http.Response, restoreToolSearch bool, deliver DeliverFunc, cancel func()) attemptResult {
+	preamble, rest, hasContent, preErr := readPreamble(resp.Body, maxPreambleBytes)
+	if !hasContent {
+		_ = resp.Body.Close()
+		if isCanceled(ctx, preErr) {
+			web.Warn(reqID, "客戶端已斷開，終止前奏讀取")
+			return canceledResult()
+		}
+		web.Warn(reqID, fmt.Sprintf("帳號 %s 的串流在首個實質內容前結束，丟棄前奏並換號重試", acc.Name))
+		return attemptResult{switchAccount: true}
+	}
+
 	e.success(acc)
 	usage := NewUsageCollector(strings.Contains(contentType, "text/event-stream"))
-	var bodyReader io.Reader = resp.Body
+	var bodyReader io.Reader = io.MultiReader(bytes.NewReader(preamble), rest)
 	if restoreToolSearch {
 		bodyReader = RestoreToolSearchStream(bodyReader)
 	}
+	bodyReader = newStreamGuard(bodyReader, cancel)
+	heartbeat := newHeartbeatReader(bodyReader, streamHeartbeatInterval)
+	defer heartbeat.Close()
+
 	err := deliver(Delivery{
 		StatusCode:  resp.StatusCode,
 		ContentType: contentType,
 		Header:      resp.Header,
-		Body:        &teeReader{r: bodyReader, c: usage},
+		Body:        &teeReader{r: heartbeat, c: usage},
 	})
 	_ = resp.Body.Close()
 	return e.finishDelivery(reqID, acc, usage, err)
@@ -1062,8 +1117,9 @@ func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCo
 	}
 	usage.Finish()
 	got := usage.AsDict()
-	e.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+	_ = e.Store.UpdateStats(acc.Provider, acc.ID, func(a *model.Account) bool {
 		a.AccumulateTokens(got)
+		return false
 	})
 	web.ReqOk(reqID, got.Output)
 	return attemptResult{final: runResult{Delivered: true}}
@@ -1174,12 +1230,15 @@ func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg st
 func MarkSuccess(st *store.Store, provider, id string, now time.Time) {
 	now = now.Round(0)
 	ts := float64(now.UnixNano()) / 1e9
-	st.Update(provider, id, func(a *model.Account) {
+	_ = st.UpdateStats(provider, id, func(a *model.Account) bool {
 		a.UseCount++
 		a.LastUsedAt = &ts
+		// 狀態復位是調度可見的關鍵變更，必須立即落庫，不能等統計批次。
 		if a.Status == model.StatusCooling || a.Status == model.StatusExhausted {
 			a.Status = model.StatusActive
+			return true
 		}
+		return false
 	})
 }
 
@@ -1191,8 +1250,9 @@ func (e *Engine) success(acc *model.Account) {
 }
 
 func (e *Engine) bumpFail(acc *model.Account) {
-	e.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+	_ = e.Store.UpdateStats(acc.Provider, acc.ID, func(a *model.Account) bool {
 		a.FailCount++
+		return false
 	})
 }
 

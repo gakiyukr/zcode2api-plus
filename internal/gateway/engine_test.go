@@ -22,6 +22,7 @@ import (
 	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/model"
 	"zcode2api/internal/store"
 )
@@ -225,6 +226,7 @@ func TestJSONPassthroughAndUsage(t *testing.T) {
 func TestStreamPassthroughAndUsage(t *testing.T) {
 	f := newFixture(t)
 	sse := "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
 		"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\ndata: [DONE]\n\n"
 	f.respond = func(int, *http.Request) (int, http.Header, string) {
 		return 200, http.Header{"Content-Type": []string{"text/event-stream"}}, sse
@@ -475,6 +477,13 @@ func TestJWTInjectsSystemAndCaptcha(t *testing.T) {
 	sys, ok := call.Body["system"].([]any)
 	if !ok || len(sys) == 0 {
 		t.Fatalf("JWT 必须注入 system: %v", call.Body["system"])
+	}
+	sku := fingerprint.For(acc)
+	if got := call.Header.Get("X-Platform"); got != sku.Platform {
+		t.Fatalf("請求頭平台未使用帳號 SKU: %q vs %+v", got, sku)
+	}
+	if text, _ := sys[2].(map[string]any)["text"].(string); !strings.Contains(text, sku.PlatformName+" "+sku.OsVersion+" "+sku.Arch) {
+		t.Fatalf("system environment 未使用帳號 SKU: %q", text)
 	}
 	if got := f.st.Find(model.ProviderZai, acc.ID); got.UseCount != 1 {
 		t.Fatalf("use_count 应为 1")
@@ -1010,8 +1019,8 @@ func TestEdgeHold_PerAddrKey(t *testing.T) {
 	proxyB := "http://proxy-b.invalid:8080"
 	HoldEdgeFor(proxyA, 5*time.Minute, now)
 	t.Cleanup(func() {
-		edgeHoldMap.Delete(proxyA)
-		edgeHoldMap.Delete(proxyB)
+		HoldEdgeFor(proxyA, -time.Minute, time.Now())
+		HoldEdgeFor(proxyB, -time.Minute, time.Now())
 	})
 
 	if !EdgeHeldFor(proxyA, now.Add(time.Minute)) {
@@ -1197,7 +1206,7 @@ func TestModelSkipFallbackOn3007(t *testing.T) {
 func TestEdgeBlocked405SwitchesProxyExit(t *testing.T) {
 	f := newFixture(t)
 	t.Cleanup(func() {
-		edgeHoldMap.Delete("direct")
+		HoldEdgeFor("direct", -time.Minute, time.Now())
 	})
 
 	// 建立本機測試 HTTP 代理並附加標記頭，讓 mock 上游區分直連與代理出口
@@ -1252,7 +1261,7 @@ func TestEdgeBlocked405SwitchesProxyExit(t *testing.T) {
 	})
 	a2Updated := f.st.Find(model.ProviderZai, a2.ID)
 	t.Cleanup(func() {
-		edgeHoldMap.Delete(AddressKeyFor(a2Updated))
+		HoldEdgeFor(AddressKeyFor(a2Updated), -time.Minute, time.Now())
 	})
 
 	f.respond = func(_ int, r *http.Request) (int, http.Header, string) {
@@ -1397,12 +1406,23 @@ func TestConcurrencyRetryReleasesGateLeaseDuringSleep(t *testing.T) {
 
 	aGot3008 := make(chan struct{})
 	bSucceeded := make(chan struct{})
+	var aSession atomic.Value
+	var aOnce sync.Once
 	var reqACall atomic.Int32
 
 	f.respond = func(_ int, r *http.Request) (int, http.Header, string) {
-		var payload map[string]any
-		// 透過 x-client-tag 區分請求 A 與請求 B
-		if r.Header.Get("X-Test-Caller") == "A" {
+		// 嚴格白名單不再透傳自訂測試頭；改用引擎生成的 x-session-id 區分
+		// A/B（incoming X-Session-Id 經 AccountSessionID 穩定映射）。
+		sid := r.Header.Get("x-session-id")
+		isA := false
+		aOnce.Do(func() {
+			aSession.Store(sid)
+			isA = true
+		})
+		if !isA && aSession.Load() == sid {
+			isA = true
+		}
+		if isA {
 			if reqACall.Add(1) == 1 {
 				close(aGot3008)
 				return http.StatusTooManyRequests, http.Header{"Content-Type": []string{"application/json"}},
@@ -1410,7 +1430,6 @@ func TestConcurrencyRetryReleasesGateLeaseDuringSleep(t *testing.T) {
 			}
 			return http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, okUpstreamJSON
 		}
-		_ = payload
 		select {
 		case <-bSucceeded:
 		default:
@@ -1424,7 +1443,7 @@ func TestConcurrencyRetryReleasesGateLeaseDuringSleep(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodPost, f.srv.URL+"/v1/messages", bytes.NewReader(data))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-api-key", "sk-test")
-		req.Header.Set("X-Test-Caller", caller)
+		req.Header.Set("X-Session-Id", "caller-"+caller)
 		resp, err := f.srv.Client().Do(req)
 		if err != nil {
 			return 0, err.Error()
@@ -1464,5 +1483,203 @@ func TestConcurrencyRetryReleasesGateLeaseDuringSleep(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("等待請求 A 完成逾時")
+	}
+}
+
+func TestDualCredentialDegradesToAPIKey(t *testing.T) {
+	f := newFixture(t)
+	oldDegrade := config.DualCredentialDegrade
+	config.DualCredentialDegrade = true
+	t.Cleanup(func() { config.DualCredentialDegrade = oldDegrade })
+
+	oldBrowser := config.CaptchaBrowserEnabled
+	config.CaptchaBrowserEnabled = true
+	t.Cleanup(func() { config.CaptchaBrowserEnabled = oldBrowser })
+	f.cm.SetConfigProvider(func(context.Context) (captcha.Config, error) {
+		return captcha.DefaultConfig, nil
+	})
+	f.cm.SetSolver(stubSolver{token: "token-dual"})
+
+	acc, err := f.st.AddAccount(model.ProviderZai, "dual", "a.b.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKey := "sk-dual-api"
+	if err := f.st.Update(acc.Provider, acc.ID, func(a *model.Account) { a.APIKey = &apiKey }); err != nil {
+		t.Fatal(err)
+	}
+
+	// 關閉 Start Plan 閘門，聚焦「併發拒絕耗盡 → 同號 API Key」決策。
+	f.eng.Gate = nil
+	f.respond = func(_ int, r *http.Request) (int, http.Header, string) {
+		header := http.Header{"Content-Type": []string{"application/json"}}
+		if r.URL.Path == "/fallback" {
+			return http.StatusOK, header, okUpstreamJSON
+		}
+		return http.StatusTooManyRequests, header, `{"code":3008,"message":"concurrency"}`
+	}
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != http.StatusOK {
+		t.Fatalf("雙憑證降級應成功: %d %s", status, raw)
+	}
+	last := f.lastCall()
+	if last.Path != "/fallback" {
+		t.Fatalf("降級應走 API Key 端點: %s", last.Path)
+	}
+	if last.Header.Get("x-api-key") != apiKey {
+		t.Fatalf("降級應帶同號 API Key: %v", last.Header)
+	}
+	if last.Header.Get("Authorization") != "" {
+		t.Fatalf("降級不得帶 JWT: %v", last.Header)
+	}
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusActive {
+		t.Fatalf("降級成功後帳號應保持 active: %s", got.Status)
+	}
+	if got.UseCount != 1 {
+		t.Fatalf("降級成功應計一次使用: %d", got.UseCount)
+	}
+}
+
+func sseHeader() http.Header {
+	return http.Header{"Content-Type": []string{"text/event-stream"}}
+}
+
+func TestStreamPreambleFailoverBeforeFirstToken(t *testing.T) {
+	f := newFixture(t)
+	empty := "data: {\"type\":\"message_start\"}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+	good := "data: {\"type\":\"message_start\"}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	f.respond = func(call int, _ *http.Request) (int, http.Header, string) {
+		if call == 1 {
+			return http.StatusOK, sseHeader(), empty
+		}
+		return http.StatusOK, sseHeader(), good
+	}
+	a1, _ := f.st.AddAccount(model.ProviderZai, "empty-stream", "sk-empty")
+	if _, err := f.st.AddAccount(model.ProviderZai, "good-stream", "sk-good"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := msgBody()
+	body["stream"] = true
+	status, raw := f.post(t, body, "sk-test")
+	if status != http.StatusOK || !strings.Contains(raw, "ok") {
+		t.Fatalf("空串流應換號後成功: %d %q", status, raw)
+	}
+	if f.callCount() != 2 {
+		t.Fatalf("應只重試一次: %d", f.callCount())
+	}
+	if got := f.st.Find(model.ProviderZai, a1.ID); got.UseCount != 0 {
+		t.Fatalf("首字前失敗的帳號不應計成功: %d", got.UseCount)
+	}
+}
+
+func TestStreamMidStreamBreakIsNotRetried(t *testing.T) {
+	f := newFixture(t)
+	partial := "data: {\"type\":\"message_start\"}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
+	f.respond = func(int, *http.Request) (int, http.Header, string) {
+		return http.StatusOK, sseHeader(), partial
+	}
+	if _, err := f.st.AddAccount(model.ProviderZai, "one", "sk-one"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := msgBody()
+	body["stream"] = true
+	status, raw := f.post(t, body, "sk-test")
+	if status != http.StatusOK || !strings.Contains(raw, "partial") {
+		t.Fatalf("首字後斷流應交付已有內容: %d %q", status, raw)
+	}
+	if f.callCount() != 1 {
+		t.Fatalf("首字後斷流不得重試: %d", f.callCount())
+	}
+}
+
+func TestStreamHeartbeatAfterCommit(t *testing.T) {
+	f := newFixture(t)
+	oldInterval := streamHeartbeatInterval
+	streamHeartbeatInterval = 20 * time.Millisecond
+	t.Cleanup(func() { streamHeartbeatInterval = oldInterval })
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"message_start\"}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(100 * time.Millisecond)
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer up.Close()
+	oldURL := config.UpstreamZaiFallback
+	config.UpstreamZaiFallback = up.URL
+	t.Cleanup(func() { config.UpstreamZaiFallback = oldURL })
+
+	if _, err := f.st.AddAccount(model.ProviderZai, "heartbeat", "sk-heartbeat"); err != nil {
+		t.Fatal(err)
+	}
+	body := msgBody()
+	body["stream"] = true
+	status, raw := f.post(t, body, "sk-test")
+	if status != http.StatusOK {
+		t.Fatalf("心跳測試應成功: %d %s", status, raw)
+	}
+	if !strings.Contains(raw, ": keepalive") {
+		t.Fatalf("commit 後長靜默應收到心跳: %q", raw)
+	}
+}
+
+func TestStreamLoopGuardStopsRunawayOutput(t *testing.T) {
+	f := newFixture(t)
+	var b strings.Builder
+	b.WriteString("data: {\"type\":\"message_start\"}\n\n")
+	for range 100 {
+		b.WriteString("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"same line same line\\n\"}}\n\n")
+	}
+	b.WriteString("data: {\"type\":\"message_stop\"}\n\n")
+	f.respond = func(int, *http.Request) (int, http.Header, string) {
+		return http.StatusOK, sseHeader(), b.String()
+	}
+	if _, err := f.st.AddAccount(model.ProviderZai, "loop", "sk-loop"); err != nil {
+		t.Fatal(err)
+	}
+	body := msgBody()
+	body["stream"] = true
+	status, raw := f.post(t, body, "sk-test")
+	if status != http.StatusOK {
+		t.Fatalf("loopGuard 應以正常 HTTP 收尾: %d %s", status, raw)
+	}
+	if !strings.Contains(raw, "message_stop") {
+		t.Fatalf("熔斷後應補上終止事件: %q", raw)
+	}
+	if f.callCount() != 1 {
+		t.Fatalf("loopGuard 不得觸發換號: %d", f.callCount())
+	}
+}
+
+func TestAllStreamsEmptyReturns503(t *testing.T) {
+	f := newFixture(t)
+	empty := "data: {\"type\":\"message_start\"}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+	f.respond = func(int, *http.Request) (int, http.Header, string) {
+		return http.StatusOK, sseHeader(), empty
+	}
+	if _, err := f.st.AddAccount(model.ProviderZai, "e1", "sk-e1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.AddAccount(model.ProviderZai, "e2", "sk-e2"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := msgBody()
+	body["stream"] = true
+	status, raw := f.post(t, body, "sk-test")
+	if status != http.StatusServiceUnavailable || !strings.Contains(raw, "no_available_account") {
+		t.Fatalf("全池空串流應回 503 而非空 200: %d %q", status, raw)
 	}
 }

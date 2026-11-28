@@ -21,6 +21,8 @@ import (
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/claim"
 	"zcode2api/internal/config"
+	"zcode2api/internal/egress"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/guest"
 	"zcode2api/internal/model"
@@ -50,6 +52,7 @@ func serve() error {
 		return fmt.Errorf("存储初始化失败: %w", err)
 	}
 	defer func() { _ = st.Close() }()
+	fingerprint.SetSaltResolver(st.FingerprintSalt)
 
 	mux := http.NewServeMux()
 	authSvc := auth.New(st)
@@ -99,6 +102,13 @@ func serve() error {
 		claimMon := claim.NewMonitor(st, cm, qs)
 		claimMon.Start()
 		defer claimMon.Stop()
+	}
+
+	// 匿名出口巡檢：提前隔離被 WAF 封鎖或 alicdn 路由劣化的代理出口。
+	if config.EgressProbeInterval > 0 {
+		egressMon := egress.NewMonitor(st)
+		egressMon.Start()
+		defer egressMon.Stop()
 	}
 
 	printBanner(st)

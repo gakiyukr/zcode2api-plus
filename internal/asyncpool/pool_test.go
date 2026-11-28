@@ -1327,9 +1327,15 @@ func TestConcurrencyRetryReleasesGateLeaseDuringSleep_AsyncPool(t *testing.T) {
 
 	aGot3008 := make(chan struct{})
 	var reqACalls atomic.Int32
+	var aSession atomic.Value
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
-		if r.Header.Get("X-Test-Caller") == "A" {
+		// 嚴格白名單不再透傳自訂測試頭；用引擎生成的 x-session-id 區分 A/B。
+		sid := r.Header.Get("x-session-id")
+		if aSession.Load() == nil {
+			aSession.Store(sid)
+		}
+		if sid == aSession.Load().(string) {
 			if reqACalls.Add(1) == 1 {
 				close(aGot3008)
 				w.Header().Set("Content-Type", "application/json")
@@ -1346,9 +1352,9 @@ func TestConcurrencyRetryReleasesGateLeaseDuringSleep_AsyncPool(t *testing.T) {
 	config.UpstreamZai = up.URL
 
 	tkA := insertTicket(p, "ticket-A", map[string]any{"model": "GLM-5.3", "messages": []any{}})
-	tkA.headers = map[string]string{"X-Test-Caller": "A"}
+	tkA.headers = map[string]string{"X-Session-Id": "caller-A"}
 	tkB := insertTicket(p, "ticket-B", map[string]any{"model": "GLM-5.3", "messages": []any{}})
-	tkB.headers = map[string]string{"X-Test-Caller": "B"}
+	tkB.headers = map[string]string{"X-Session-Id": "caller-B"}
 
 	aDone := make(chan struct{})
 	go func() {
