@@ -97,7 +97,7 @@ ENV ZCODE_HOST=0.0.0.0 \
 ARG PREFETCH_BROWSER=false
 RUN if [ "$PREFETCH_BROWSER" = "true" ]; then \
         ZCODE_CAPTCHA_BROWSER=true ZCODE_CAPTCHA_BROWSER_BIN="" \
-        /app/zcode2api accounts >/dev/null 2>&1 || \
+        /app/zcode2api prefetch-browser >/dev/null 2>&1 || \
         echo "warn: 預下載瀏覽器未成功，將於首次啟動時重試" >&2; \
     fi
 

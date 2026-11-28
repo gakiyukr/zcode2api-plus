@@ -61,34 +61,25 @@ func runCLI(cmd string, rest []string, serveFn func() error) int {
 		}
 		return 0
 	case "login":
-		cmdLogin(rest)
-		return 0
+		return cmdLogin(rest)
 	case "add-account":
-		cmdAddAccount(rest)
-		return 0
+		return cmdAddAccount(rest)
 	case "accounts":
-		cmdAccounts(rest)
-		return 0
+		return cmdAccounts(rest)
 	case "remove-account":
-		cmdRemoveAccount(rest)
-		return 0
+		return cmdRemoveAccount(rest)
 	case "set-admin-key":
-		cmdSetAdminKey(rest)
-		return 0
+		return cmdSetAdminKey(rest)
 	case "status":
-		cmdStatus()
-		return 0
+		return cmdStatus()
 	case "prefetch-browser":
 		return cmdPrefetchBrowser()
 	case "quota":
-		cmdQuota()
-		return 0
+		return cmdQuota()
 	case "export":
-		cmdExport(rest)
-		return 0
+		return cmdExport(rest)
 	case "import":
-		cmdImport(rest)
-		return 0
+		return cmdImport(rest)
 	}
 	fmt.Println(web.Red + "未知命令: " + cmd + web.Reset)
 	fmt.Print(cliUsage)
@@ -151,16 +142,16 @@ func printGeneratedKeys(st *store.Store) {
 
 // ── login ───────────────────────────────────────────────────────────────────
 
-func cmdLogin(args []string) {
+func cmdLogin(args []string) int {
 	if len(args) == 0 || args[0] != "zai" {
 		fmt.Println(web.Red + "目前仅支持: zcode2api login zai" + web.Reset)
-		return
+		return 1
 	}
 	flow := oauth.NewFlow()
 	flowID, authorizeURL, err := flow.Init()
 	if err != nil {
 		fmt.Println(web.Red + "❌ 登录初始化失败: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 	_ = flowID
 	fmt.Println(web.Green + "\n✔ OAuth 初始化成功！请在浏览器中打开下面链接完成授权：" + web.Reset)
@@ -179,20 +170,20 @@ func cmdLogin(args []string) {
 	code, state, oauthErr, err := oauth.ParseCallbackURL(line)
 	if err != nil {
 		fmt.Println(web.Red + "❌ 授权失败: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 	if oauthErr != "" {
 		fmt.Println(web.Red + "❌ 授权失败: Z.AI 拒绝授权: " + oauthErr + web.Reset)
-		return
+		return 1
 	}
 	if !flow.MatchesState(state) {
 		fmt.Println(web.Red + "❌ 授权失败: state 校验失败" + web.Reset)
-		return
+		return 1
 	}
 	result, err := flow.ExchangeCode(code, state)
 	if err != nil {
 		fmt.Println(web.Red + "❌ 授权失败: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 
 	st := openStore()
@@ -201,7 +192,7 @@ func cmdLogin(args []string) {
 		acc, err := st.AddAccount(model.ProviderZai, "oauth-login", result.Token)
 		if err != nil {
 			fmt.Println(web.Red + "❌ 保存 JWT 账号失败: " + err.Error() + web.Reset)
-			return
+			return 1
 		}
 		if result.Email != nil && strings.TrimSpace(*result.Email) != "" {
 			if err := st.Update(acc.Provider, acc.ID, func(a *model.Account) {
@@ -211,7 +202,7 @@ func cmdLogin(args []string) {
 				// 不吞错：落库失败时下面仍会打印「已保存」，而 email/name
 				// 只存在于内存，重启即回滚，属于明确误导。
 				fmt.Println(web.Red + "❌ 账号信息落库失败: " + err.Error() + web.Reset)
-				return
+				return 1
 			}
 			// Update 改的是 Store 内部对象，acc 仍是 AddAccount 时的副本；
 			// 重新取快照，否则下面会打印出改名前的旧名字。
@@ -227,8 +218,10 @@ func cmdLogin(args []string) {
 			cm.SetSolver(captcha.NewBrowserSolver())
 		}
 		outcomes := claim.NewService(cm).AutoClaimAllPlans(acc)
+		claimedAny := false
 		for _, o := range outcomes {
 			if ok, _ := o["ok"].(bool); ok {
+				claimedAny = true
 				planName, _ := o["plan_name"].(string)
 				fmt.Println(web.Green + "✔ 自动领取成功: " + planName + web.Reset)
 			} else {
@@ -237,16 +230,22 @@ func cmdLogin(args []string) {
 			}
 		}
 		_ = cm.Close()
+		if claimedAny {
+			quota.NewService(st).RefreshAccounts([]*model.Account{acc})
+		}
 	}
 	if result.AccessToken != "" {
 		if key, err := oauth.ExchangeAPIKey(result.AccessToken); err == nil {
 			if _, err := st.AddAccount(model.ProviderZai, "oauth-apikey", key); err == nil {
 				fmt.Println(web.Green + "✔ 已兑换并保存 API Key: " + key[:min(8, len(key))] + "..." + web.Reset)
+			} else {
+				fmt.Println(web.Yellow + "⚠️ 保存 API Key 失敗: " + err.Error() + web.Reset)
 			}
 		} else {
 			fmt.Println(web.Yellow + "⚠️ 兑换 API Key 失败: " + err.Error() + web.Reset)
 		}
 	}
+	return 0
 }
 
 func min(a, b int) int {
@@ -258,22 +257,23 @@ func min(a, b int) int {
 
 // ── 账号管理 ────────────────────────────────────────────────────────────────
 
-func cmdAddAccount(args []string) {
+func cmdAddAccount(args []string) int {
 	if len(args) < 3 {
 		fmt.Println(web.Red + "格式: zcode2api add-account <zai> <name> <jwt|key>" + web.Reset)
-		return
+		return 1
 	}
 	st := openStore()
 	defer func() { _ = st.Close() }()
 	acc, err := st.AddAccount(args[0], args[1], args[2])
 	if err != nil {
 		fmt.Println(web.Red + "❌ 添加失败: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 	fmt.Println(web.Green + fmt.Sprintf("✔ 已添加账号 %s (%s) 模式=%s", acc.Name, acc.ID, acc.Mode) + web.Reset)
+	return 0
 }
 
-func cmdAccounts(args []string) {
+func cmdAccounts(args []string) int {
 	provider := ""
 	if len(args) > 0 && args[0] == model.ProviderZai {
 		provider = args[0]
@@ -283,7 +283,7 @@ func cmdAccounts(args []string) {
 	accounts := st.ListAccounts(provider)
 	if len(accounts) == 0 {
 		fmt.Println("无账号")
-		return
+		return 0
 	}
 	fmt.Println(web.Cyan + fmt.Sprintf("\n--- 账号列表 (%s) ---", or(provider, "全部")) + web.Reset)
 	now := time.Now()
@@ -291,46 +291,49 @@ func cmdAccounts(args []string) {
 		tokens := fmt.Sprintf("  tok(in/out): %d/%d", a.TotalInputTokens, a.TotalOutputTokens)
 		fmt.Printf("%s  %s  %s  %s  %s%s\n", a.ID, a.Provider, a.Mode, a.EffectiveStatus(now), a.Name, tokens)
 	}
+	return 0
 }
 
-func cmdRemoveAccount(args []string) {
+func cmdRemoveAccount(args []string) int {
 	if len(args) < 2 {
 		fmt.Println(web.Red + "格式: zcode2api remove-account <provider> <id|name>" + web.Reset)
-		return
+		return 1
 	}
 	st := openStore()
 	defer func() { _ = st.Close() }()
 	ok, err := st.RemoveAccount(args[0], args[1])
 	if err != nil {
 		fmt.Println(web.Red + "❌ 删除失败: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 	if ok {
 		fmt.Println(web.Green + "✔ 已删除账号 " + args[1] + web.Reset)
-	} else {
-		fmt.Println(web.Yellow + "⚠️ 未找到指定账号" + web.Reset)
+		return 0
 	}
+	fmt.Println(web.Yellow + "⚠️ 未找到指定账号" + web.Reset)
+	return 1
 }
 
-func cmdSetAdminKey(args []string) {
+func cmdSetAdminKey(args []string) int {
 	if len(args) == 0 {
 		fmt.Println(web.Red + "格式: zcode2api set-admin-key <key>" + web.Reset)
-		return
+		return 1
 	}
 	// 空值会让后台立即全量 401（VerifyAdminKey 对空密钥 fail-closed），
 	// 而后台 API 对同一字段已有拒绝逻辑——CLI 不能更宽松。
 	key := strings.TrimSpace(args[0])
 	if key == "" {
 		fmt.Println(web.Red + "❌ 后台密钥不能为空（空值会让后台无法登录）" + web.Reset)
-		return
+		return 1
 	}
 	st := openStore()
 	defer func() { _ = st.Close() }()
 	if err := st.SetSetting("admin_key", key); err != nil {
 		fmt.Println(web.Red + "❌ 更新失败: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 	fmt.Println(web.Green + "✔ 已更新后台密码" + web.Reset)
+	return 0
 }
 
 // ── status / quota ──────────────────────────────────────────────────────────
@@ -359,7 +362,7 @@ func cmdPrefetchBrowser() int {
 	return 0
 }
 
-func cmdStatus() {
+func cmdStatus() int {
 	fmt.Println(web.Cyan + "\n--- zcode2api-plus (Go) 状态 ---" + web.Reset)
 	fmt.Printf("数据库      : %s\n", web.Blue+config.DBPath+web.Reset)
 	fmt.Printf("默认端口    : %s\n", web.Blue+strconv.Itoa(config.Port)+web.Reset)
@@ -384,9 +387,10 @@ func cmdStatus() {
 		}
 	}
 	fmt.Printf("zai        : %d 个账号，%d 个可用\n", len(accounts), active)
+	return 0
 }
 
-func cmdQuota() {
+func cmdQuota() int {
 	st := openStore()
 	defer func() { _ = st.Close() }()
 	accounts := st.ListAccounts(model.ProviderZai)
@@ -399,7 +403,7 @@ func cmdQuota() {
 	}
 	if len(jwtAccounts) == 0 {
 		fmt.Println(web.Yellow + "无 Coding Plan (JWT) 账号可查询额度。" + web.Reset)
-		return
+		return 0
 	}
 	fmt.Println(web.Cyan + "\n正在拉取各账号实时额度..." + web.Reset)
 	qs := quota.NewService(st)
@@ -427,6 +431,7 @@ func cmdQuota() {
 				anyToNum(q["remaining"]), anyToNum(q["total"]))
 		}
 	}
+	return 0
 }
 
 // anyToNum JSON 数值展示（quota 快照里是 float64）。
@@ -440,7 +445,7 @@ func anyToNum(v any) string {
 
 // ── export / import ─────────────────────────────────────────────────────────
 
-func cmdExport(args []string) {
+func cmdExport(args []string) int {
 	out := "zcode-accounts.json"
 	if len(args) > 0 {
 		out = args[0]
@@ -450,38 +455,40 @@ func cmdExport(args []string) {
 	data, err := json.MarshalIndent(st.Export(), "", "  ")
 	if err != nil {
 		fmt.Println(web.Red + "❌ 序列化失败: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 	if err := os.WriteFile(out, data, 0o600); err != nil {
 		fmt.Println(web.Red + "❌ 写入失败: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 	fmt.Println(web.Green + "✔ 已导出到 " + out + web.Reset)
+	return 0
 }
 
-func cmdImport(args []string) {
+func cmdImport(args []string) int {
 	if len(args) == 0 {
 		fmt.Println(web.Red + "格式: zcode2api import <file>" + web.Reset)
-		return
+		return 1
 	}
 	raw, err := os.ReadFile(args[0])
 	if err != nil {
 		fmt.Println(web.Red + "❌ 读取失败: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 	var payload store.ImportPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		fmt.Println(web.Red + "❌ 文件不是合法的导出 JSON: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 	st := openStore()
 	defer func() { _ = st.Close() }()
 	count, err := st.ImportAccounts(payload)
 	if err != nil {
 		fmt.Println(web.Red + "❌ 导入失败: " + err.Error() + web.Reset)
-		return
+		return 1
 	}
 	fmt.Println(web.Green + fmt.Sprintf("✔ 已导入 %d 个账号", count) + web.Reset)
+	return 0
 }
 
 func or(s, fallback string) string {

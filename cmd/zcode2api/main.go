@@ -19,6 +19,7 @@ import (
 	"zcode2api/internal/asyncpool"
 	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
+	"zcode2api/internal/claim"
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/guest"
@@ -53,9 +54,10 @@ func serve() error {
 	mux := http.NewServeMux()
 	authSvc := auth.New(st)
 	cm := captcha.NewManager()
-	// 浏览器池求解器（M5）：启用时注入 rod 求解，失败冷却后回退人工回填
+	// 瀏覽器池求解器（M5）：啟用時注入 rod 求解並開啟按出口背景預熱，失敗冷卻後回退人工回填
 	if config.CaptchaBrowserEnabled {
 		cm.SetSolver(captcha.NewBrowserSolver())
+		cm.SetPrewarm(true)
 	}
 	defer func() { _ = cm.Close() }()
 
@@ -76,18 +78,28 @@ func serve() error {
 	// 默认关闭——需管理员在后台设置邀请码后才开放。
 	guest.New(st, authSvc, cm, qs, engine).Register(mux)
 
-	// Async 空闲池：与 Python 版一致按设置条件挂载
+	// Async 空閒池：與同步網關共用同一把 Start Plan 併發閘門與會話親和表
 	if config.AsyncEnabled {
-		asyncpool.NewPool(st, authSvc, cm).Register(mux)
+		ap := asyncpool.NewPool(st, authSvc, cm)
+		ap.Gate = engine.Gate
+		ap.Affinity = engine.Affinity
+		ap.Register(mux)
 	}
 
 	// SPA 托管（/ → /admin、/assets 静态、/admin/{path...} 回落 index.html、/meta）
 	web.NewSPA(distSub()).Register(mux)
 
-	// 后台额度监控：随服务启动、退出时等待循环收尾（对齐 lifespan）
+	// 背景額度監控：隨服務啟動、退出時等待迴圈收尾
 	mon := qs.NewMonitor()
 	mon.Start()
 	defer mon.Stop()
+
+	// 背景活動套餐補領：預設每 30 分鐘輪詢一次（ZCODE_CLAIM_REFRESH_INTERVAL=0 可關閉）
+	if config.ClaimRefreshInterval > 0 {
+		claimMon := claim.NewMonitor(st, cm, qs)
+		claimMon.Start()
+		defer claimMon.Stop()
+	}
 
 	printBanner(st)
 

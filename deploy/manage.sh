@@ -986,7 +986,15 @@ bin_migrate() {
 			cp -f "$target/.env" "$target/.env.pre-migrate" 2>/dev/null || true
 		fi
 		cp -f "$src/.env" "$target/.env" && chmod 0600 "$target/.env"
-		info "已遷移 .env"
+		# 僅改寫指向舊安裝目錄的資料與快取目錄環境變數，避免誤傷密鑰或註解
+		local src_esc target_esc
+		src_esc="$(printf '%s' "$src" | sed 's/[&|\\]/\\&/g')"
+		target_esc="$(printf '%s' "$target" | sed 's/[&|\\]/\\&/g')"
+		sed -i -E \
+			-e "s|^(ZCODE_DATA_DIR=[\"']?)${src_esc}(/.*)?([\"']?)$|\1${target_esc}\2\3|" \
+			-e "s|^(CLOAKBROWSER_CACHE_DIR=[\"']?)${src_esc}(/.*)?([\"']?)$|\1${target_esc}\2\3|" \
+			"$target/.env"
+		info "已遷移 .env（路徑已改寫）"
 	fi
 
 	printf '%s' "$tag" >"$target/.installed-version"
