@@ -56,7 +56,11 @@ func messageToOpenAI(message map[string]any) (map[string]any, []any) {
 				t, _ := block["text"].(string)
 				texts += t
 			case "tool_use":
-				args, err := marshalCompact(block["input"])
+				toolInput := block["input"]
+				if toolInput == nil {
+					toolInput = map[string]any{}
+				}
+				args, err := marshalCompact(toolInput)
 				if err != nil {
 					args = "{}"
 				}
@@ -87,10 +91,17 @@ func messageToOpenAI(message map[string]any) (map[string]any, []any) {
 }
 
 // mapStopReason 映射 Anthropic stop_reason → OpenAI finish_reason：
-// end_turn/stop_sequence → stop、max_tokens → length、tool_use → tool_calls、
-// refusal → content_filter；未列出的值按 stop 处理。
+// nil、空字串或未列出的值統一回傳 "stop"（OpenAI 非串流契約要求 finish_reason 必為字串）；
+// max_tokens → "length"、tool_use → "tool_calls"、refusal → "content_filter"。
 func mapStopReason(v any) string {
-	switch s, _ := v.(string); s {
+	if v == nil {
+		return "stop"
+	}
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return "stop"
+	}
+	switch s {
 	case "max_tokens":
 		return "length"
 	case "tool_use":

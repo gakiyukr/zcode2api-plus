@@ -366,3 +366,113 @@ func TestStreamErrorEventIsFlat(t *testing.T) {
 		t.Fatalf("不应保留嵌套 error: %v", flat)
 	}
 }
+
+func TestSSEDispatchFallsBackToPayloadType(t *testing.T) {
+	// 上游或代理省略 event: 行時，應自動從 data JSON 的 type 欄位分發事件
+	feed := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_notype","model":"GLM-5.3","usage":{"input_tokens":3}}}`,
+		``,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"哈囉"}}`,
+		``,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+		``,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	var chunks []string
+	if err := reencodeSSE(strings.NewReader(feed), false, func(ev string) error {
+		chunks = append(chunks, ev)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(chunks, "")
+	if !strings.Contains(joined, `"id":"chatcmpl-msg_notype"`) ||
+		!strings.Contains(joined, `"content":"哈囉"`) ||
+		!strings.Contains(joined, "data: [DONE]") {
+		t.Fatalf("省略 event: 行時仍應完整重編碼事件，實際輸出: %s", joined)
+	}
+}
+
+func TestMapStopReason_NilInput(t *testing.T) {
+	// 非串流路徑：nil/空字串必須回傳 "stop"（OpenAI 契約要求 finish_reason 為字串）
+	if got := mapStopReason(nil); got != "stop" {
+		t.Fatalf("mapStopReason(nil) 應回傳 \"stop\"，實際: %#v", got)
+	}
+	if got := mapStopReason(""); got != "stop" {
+		t.Fatalf("mapStopReason(\"\") 應回傳 \"stop\"，實際: %#v", got)
+	}
+	if got := mapStopReason("end_turn"); got != "stop" {
+		t.Fatalf("mapStopReason(\"end_turn\") 應回傳 \"stop\"，實際: %#v", got)
+	}
+	if got := mapStopReason("max_tokens"); got != "length" {
+		t.Fatalf("mapStopReason(\"max_tokens\") 應回傳 \"length\"，實際: %#v", got)
+	}
+	if got := mapStopReason("tool_use"); got != "tool_calls" {
+		t.Fatalf("mapStopReason(\"tool_use\") 應回傳 \"tool_calls\"，實際: %#v", got)
+	}
+}
+
+func TestConvertResponse_FinishReasonIsString(t *testing.T) {
+	payload := map[string]any{
+		"id":    "msg_test",
+		"model": "GLM-5.4",
+		"content": []any{
+			map[string]any{"type": "text", "text": "hello"},
+		},
+		"stop_reason": nil,
+		"usage": map[string]any{
+			"input_tokens":  float64(10),
+			"output_tokens": float64(5),
+		},
+	}
+	out := ConvertResponse(payload)
+	if out == nil {
+		t.Fatal("ConvertResponse 不應回傳 nil")
+	}
+	choice := out["choices"].([]any)[0].(map[string]any)
+	if fr, ok := choice["finish_reason"].(string); !ok || fr != "stop" {
+		t.Fatalf("非串流缺 stop_reason 時 finish_reason 應為字串 \"stop\"，實際: %#v", choice["finish_reason"])
+	}
+
+	// 串流路徑：message_delta 缺或空 stop_reason 時 chunk 的 finish_reason 必須保持 null
+	feed := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"m_nil_sr","model":"GLM-5.4","usage":{"input_tokens":1}}}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2}}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":""},"usage":{"output_tokens":3}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+	var chunks []map[string]any
+	if err := reencodeSSE(strings.NewReader(feed), false, func(ev string) error {
+		trimmed := strings.TrimSpace(strings.TrimPrefix(ev, "data: "))
+		if trimmed == "[DONE]" {
+			return nil
+		}
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+			return err
+		}
+		chunks = append(chunks, obj)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("應產出 3 個 chunk，實際 %d", len(chunks))
+	}
+	for _, idx := range []int{1, 2} {
+		c := chunks[idx]["choices"].([]any)[0].(map[string]any)
+		if c["finish_reason"] != nil {
+			t.Fatalf("串流 message_delta 缺/空 stop_reason 時 finish_reason 應為 nil，實際: %#v", c["finish_reason"])
+		}
+	}
+}

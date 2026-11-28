@@ -5,6 +5,7 @@ package openai
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -129,18 +130,32 @@ func convertResponsesInput(input any) ([]any, error) {
 				flushUser()
 				messages = append(messages, map[string]any{"role": role, "content": blocks})
 			case "function_call":
-				// assistant 的历史工具调用 → tool_use block（独立 assistant 消息）
+				// assistant 的歷史工具呼叫 → 合併至前置 assistant 訊息（避免連續多個 assistant 訊息）
 				input := map[string]any{}
 				if rawArgs, _ := item["arguments"].(string); strings.TrimSpace(rawArgs) != "" {
 					_ = json.Unmarshal([]byte(rawArgs), &input)
+					if input == nil {
+						input = map[string]any{}
+					}
+				}
+				toolUseBlock := map[string]any{
+					"type": "tool_use", "id": item["call_id"],
+					"name": item["name"], "input": input,
 				}
 				flushUser()
+				if len(messages) > 0 {
+					if prev, ok := messages[len(messages)-1].(map[string]any); ok {
+						if prevRole, _ := prev["role"].(string); prevRole == "assistant" {
+							if content, ok := prev["content"].([]any); ok {
+								prev["content"] = append(content, toolUseBlock)
+								continue
+							}
+						}
+					}
+				}
 				messages = append(messages, map[string]any{
-					"role": "assistant",
-					"content": []any{map[string]any{
-						"type": "tool_use", "id": item["call_id"],
-						"name": item["name"], "input": input,
-					}},
+					"role":    "assistant",
+					"content": []any{toolUseBlock},
 				})
 			case "function_call_output":
 				pendingBlocks = append(pendingBlocks, map[string]any{
@@ -244,7 +259,11 @@ func messageToResponsesOutput(message map[string]any) ([]any, bool) {
 			t, _ := block["text"].(string)
 			texts = append(texts, t)
 		case "tool_use":
-			args, err := marshalCompact(block["input"])
+			toolInput := block["input"]
+			if toolInput == nil {
+				toolInput = map[string]any{}
+			}
+			args, err := marshalCompact(toolInput)
 			if err != nil {
 				args = "{}"
 			}
@@ -350,7 +369,15 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	var body map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON", "invalid_request_error")
+		if errors.As(err, new(*http.MaxBytesError)) {
+			writeError(w, http.StatusRequestEntityTooLarge, "請求體過大", "request_too_large")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "請求體不是合法 JSON", "invalid_request_error")
+		return
+	}
+	if body == nil {
+		writeError(w, http.StatusBadRequest, "請求體不能為空", "invalid_request_error")
 		return
 	}
 

@@ -15,7 +15,7 @@ import (
 // /v1/chat/completions 与 /v1/responses 共用这段骨架，仅 dispatch 的实现不同。
 func scanSSE(body io.Reader, dispatch func(event, data string) error) error {
 	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 8<<20)
 
 	event := ""
 	var data strings.Builder
@@ -54,7 +54,6 @@ func reencodeSSE(body io.Reader, includeUsage bool, write func(string) error) er
 	return scanSSE(body, enc.dispatch)
 }
 
-
 // sseEncoder 持有跨事件的流状态（id/model/tool 序号/usage）。
 type sseEncoder struct {
 	write func(string) error
@@ -76,6 +75,13 @@ func (e *sseEncoder) dispatch(event, data string) error {
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(data), &payload); err != nil {
 		return nil // 非 JSON 数据跳过（对齐引擎透传容错）
+	}
+
+	// 上游或代理省略 event: 行時，回退從 JSON payload 的 "type" 欄位推斷事件名稱
+	if event == "" {
+		if t, ok := payload["type"].(string); ok {
+			event = t
+		}
 	}
 
 	switch event {
@@ -170,12 +176,16 @@ func (e *sseEncoder) onContentBlockDelta(payload map[string]any) error {
 
 func (e *sseEncoder) onMessageDelta(payload map[string]any) error {
 	if u, ok := payload["usage"].(map[string]any); ok {
-		e.outputUsage = u
+		e.outputUsage = mergeUsageMax(e.outputUsage, u)
 	}
 	deltaObj, _ := payload["delta"].(map[string]any)
-	stopReason := any(nil)
+	var stopReason any // 串流中 nil 表示 finish_reason: null（尚未結束）
 	if deltaObj != nil {
-		stopReason = mapStopReason(deltaObj["stop_reason"])
+		if sr := deltaObj["stop_reason"]; sr != nil {
+			if s, ok := sr.(string); ok && s != "" {
+				stopReason = mapStopReason(sr)
+			}
+		}
 	}
 	return e.emit(chunk(e.id, e.model, map[string]any{}, stopReason))
 }

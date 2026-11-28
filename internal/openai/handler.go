@@ -4,6 +4,7 @@ package openai
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 
@@ -37,7 +38,15 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	var body map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON", "invalid_request_error")
+		if errors.As(err, new(*http.MaxBytesError)) {
+			writeError(w, http.StatusRequestEntityTooLarge, "請求體過大", "request_too_large")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "請求體不是合法 JSON", "invalid_request_error")
+		return
+	}
+	if body == nil {
+		writeError(w, http.StatusBadRequest, "請求體不能為空", "invalid_request_error")
 		return
 	}
 

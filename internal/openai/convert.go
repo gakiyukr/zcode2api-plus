@@ -103,10 +103,20 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 		}
 	}
 
-	// messages：system/developer 归并到顶层 system；user/assistant/tool 映射
+	// messages：system/developer 归并到顶层 system；連續 tool 合併進同一個 user 訊息
 	rawMessages, _ := body["messages"].([]any)
 	messages := make([]any, 0, len(rawMessages))
 	var systemBlocks []any
+	var pendingToolResults []any
+	flushToolResults := func() {
+		if len(pendingToolResults) > 0 {
+			messages = append(messages, map[string]any{
+				"role":    "user",
+				"content": pendingToolResults,
+			})
+			pendingToolResults = nil
+		}
+	}
 	for _, item := range rawMessages {
 		msg, ok := item.(map[string]any)
 		if !ok {
@@ -115,12 +125,30 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 		role, _ := msg["role"].(string)
 		switch role {
 		case "system", "developer":
+			flushToolResults()
 			blocks, err := contentToTextBlocks(msg["content"])
 			if err != nil {
 				return nil, err
 			}
 			systemBlocks = append(systemBlocks, blocks...)
+		case "tool":
+			// 連續 tool 訊息合併進同一個 user 訊息的 content，符合 Anthropic 輪替規範
+			result := map[string]any{
+				"type":        "tool_result",
+				"tool_use_id": msg["tool_call_id"],
+			}
+			blocks, err := contentBlocks(msg["content"])
+			if err != nil {
+				return nil, err
+			}
+			if len(blocks) > 0 {
+				result["content"] = blocks
+			} else {
+				result["content"] = []any{}
+			}
+			pendingToolResults = append(pendingToolResults, result)
 		default:
+			flushToolResults()
 			converted, err := convertMessage(msg, role)
 			if err != nil {
 				return nil, err
@@ -128,6 +156,7 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 			messages = append(messages, converted)
 		}
 	}
+	flushToolResults()
 	if len(systemBlocks) > 0 {
 		// 归并后的 system 交给引擎 NormalizeBody 注入 zcode_system 块时
 		// 追加在其后（见 gateway/body.go：blocks 在前、existing 在后）
@@ -350,6 +379,9 @@ func toolCallToUse(call map[string]any) (map[string]any, error) {
 			}
 			input = map[string]any{}
 			_ = arr // arguments 为数组等非对象形态：保留空对象，上游按 schema 校验
+		}
+		if input == nil {
+			input = map[string]any{}
 		}
 	}
 	return map[string]any{

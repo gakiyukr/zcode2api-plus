@@ -285,3 +285,42 @@ func TestOpenAIDirectivesSilentlyIgnored(t *testing.T) {
 		}
 	}
 }
+
+func TestConvertRequestMergesToolMessages(t *testing.T) {
+	out := convertInput(t, map[string]any{
+		"model": "glm-5.3-flash",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "查三地天氣"},
+			map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{
+					map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "w", "arguments": `{}`}},
+					map[string]any{"id": "c2", "type": "function", "function": map[string]any{"name": "w", "arguments": `{}`}},
+					map[string]any{"id": "c3", "type": "function", "function": map[string]any{"name": "w", "arguments": `{}`}},
+				},
+			},
+			map[string]any{"role": "tool", "tool_call_id": "c1", "content": "台北晴"},
+			map[string]any{"role": "tool", "tool_call_id": "c2", "content": "東京雨"},
+			map[string]any{"role": "tool", "tool_call_id": "c3", "content": "倫敦霧"},
+		},
+	})
+	msgs := out["messages"].([]any)
+	// user → assistant → 單一合併後的 user（含 3 個 tool_result）
+	if len(msgs) != 3 {
+		t.Fatalf("連續 3 條 tool 訊息應合併為 1 條 user 訊息，實際訊息數: %d (%v)", len(msgs), msgs)
+	}
+	toolMsg := msgs[2].(map[string]any)
+	if toolMsg["role"] != "user" {
+		t.Fatalf("合併後角色應為 user: %v", toolMsg["role"])
+	}
+	blocks := toolMsg["content"].([]any)
+	if len(blocks) != 3 {
+		t.Fatalf("合併後的 content 應含 3 個 tool_result block，實際: %d", len(blocks))
+	}
+	for i, id := range []string{"c1", "c2", "c3"} {
+		b := blocks[i].(map[string]any)
+		if b["type"] != "tool_result" || b["tool_use_id"] != id {
+			t.Fatalf("第 %d 個 tool_result 不符: %v", i, b)
+		}
+	}
+}

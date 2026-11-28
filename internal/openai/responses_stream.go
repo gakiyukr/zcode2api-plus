@@ -5,6 +5,7 @@ package openai
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ type responsesEncoder struct {
 	// active_item 为空时走 error_or_panic（turn.rs），故文字增量前必须先宣告。
 	messageAnnounced bool
 	functionCalls    []any // 完整 function_call item（completed 时回填 output）
+	toolBlockMap     []int // 上游 content block index → functionCalls 陣列索引映射
 }
 
 // emit 写出一个 `event: X\ndata: {...}\n\n` 事件。
@@ -54,6 +56,13 @@ func (e *responsesEncoder) dispatch(event, data string) error {
 		return nil
 	}
 
+	// 上游或代理省略 event: 行時，回退從 JSON payload 的 "type" 欄位推斷事件名稱
+	if event == "" {
+		if t, ok := payload["type"].(string); ok {
+			event = t
+		}
+	}
+
 	switch event {
 	case "message_start":
 		return e.onMessageStart(payload)
@@ -63,11 +72,22 @@ func (e *responsesEncoder) dispatch(event, data string) error {
 		return e.onContentBlockDelta(payload)
 	case "message_delta":
 		if u, ok := payload["usage"].(map[string]any); ok {
-			e.outputUsage = u
+			e.outputUsage = mergeUsageMax(e.outputUsage, u)
 		}
 		return nil
 	case "message_stop":
 		return e.onMessageStop()
+	case "error":
+		// 上游串流報錯：發出 response.failed 事件並返回錯誤中止串流
+		errPayload := openAIErrorObject(payload)
+		_ = e.emit("response.failed", map[string]any{
+			"response": e.responseEnvelope("failed", nil),
+		})
+		msg, _ := errPayload["message"].(string)
+		if msg == "" {
+			msg = "上游串流報錯"
+		}
+		return fmt.Errorf("upstream error: %s", msg)
 	default:
 		return nil
 	}
@@ -103,6 +123,13 @@ func (e *responsesEncoder) onContentBlockStart(payload map[string]any) error {
 		"status":    "in_progress",
 	}
 	e.functionCalls = append(e.functionCalls, item)
+	if indexVal, ok := payload["index"].(float64); ok && int(indexVal) >= 0 {
+		idx := int(indexVal)
+		for len(e.toolBlockMap) <= idx {
+			e.toolBlockMap = append(e.toolBlockMap, -1)
+		}
+		e.toolBlockMap[idx] = len(e.functionCalls) - 1
+	}
 	return e.emit("response.output_item.added", map[string]any{
 		"output_index": float64(len(e.functionCalls)), // message item 占 index 0
 		"item":         item,
@@ -136,9 +163,17 @@ func (e *responsesEncoder) onContentBlockDelta(payload map[string]any) error {
 		if partial == "" {
 			return nil
 		}
+		// 按上游 payload["index"] 路由到對應的 function_call item，未命中時回退末項
+		idx := len(e.functionCalls) - 1
+		if indexVal, ok := payload["index"].(float64); ok {
+			mapped := int(indexVal)
+			if mapped >= 0 && mapped < len(e.toolBlockMap) && e.toolBlockMap[mapped] >= 0 {
+				idx = e.toolBlockMap[mapped]
+			}
+		}
 		itemID := ""
-		if len(e.functionCalls) > 0 {
-			if item, ok := e.functionCalls[len(e.functionCalls)-1].(map[string]any); ok {
+		if idx >= 0 && idx < len(e.functionCalls) {
+			if item, ok := e.functionCalls[idx].(map[string]any); ok {
 				item["arguments"] = stringOf(item["arguments"]) + partial
 				// item_id 必须与 output_item.added 一致（同一 function_call item），
 				// 否则客户端无法把增量关联到对应工具调用。
@@ -214,10 +249,10 @@ func (e *responsesEncoder) announceMessageItem() error {
 	return e.emit("response.output_item.added", map[string]any{
 		"output_index": float64(0),
 		"item": map[string]any{
-			"type":   "message",
-			"id":     "msg_" + e.respID,
-			"role":   "assistant",
-			"status": "in_progress",
+			"type":    "message",
+			"id":      "msg_" + e.respID,
+			"role":    "assistant",
+			"status":  "in_progress",
 			"content": []any{},
 		},
 	})

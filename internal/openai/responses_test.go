@@ -370,3 +370,109 @@ func post(f *fixture, t *testing.T, key, payload string) (int, string) {
 	}
 	return resp.StatusCode, string(raw)
 }
+
+func TestResponsesMergesConsecutiveFunctionCalls(t *testing.T) {
+	got, err := ConvertResponsesRequest(map[string]any{
+		"model": "glm-5.3-flash",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "查兩個城市"},
+			map[string]any{"type": "message", "role": "assistant", "content": "我來查詢"},
+			map[string]any{"type": "function_call", "call_id": "call_1", "name": "weather", "arguments": `{"city":"台北"}`},
+			map[string]any{"type": "function_call", "call_id": "call_2", "name": "weather", "arguments": `{"city":"高雄"}`},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := got["messages"].([]any)
+	// user → 單一 assistant（含 1 text + 2 tool_use）
+	if len(msgs) != 2 {
+		t.Fatalf("連續 assistant 與 function_call 應合併為 1 條 assistant 訊息，實際訊息數: %d (%v)", len(msgs), msgs)
+	}
+	asst := msgs[1].(map[string]any)
+	if asst["role"] != "assistant" {
+		t.Fatalf("角色應為 assistant: %v", asst)
+	}
+	blocks := asst["content"].([]any)
+	if len(blocks) != 3 {
+		t.Fatalf("assistant content 應含 1 text + 2 tool_use，實際: %v", blocks)
+	}
+	if blocks[0].(map[string]any)["type"] != "text" ||
+		blocks[1].(map[string]any)["type"] != "tool_use" ||
+		blocks[2].(map[string]any)["type"] != "tool_use" {
+		t.Fatalf("合併後的 block 類型順序不符: %v", blocks)
+	}
+}
+
+func TestResponsesDispatchHandlesError(t *testing.T) {
+	feed := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"m_err","model":"GLM-5.3","usage":{}}}`,
+		``,
+		`event: error`,
+		`data: {"type":"error","error":{"type":"overloaded_error","message":"upstream overloaded"}}`,
+		``,
+	}, "\n")
+
+	var events []string
+	err := reencodeResponsesSSE(strings.NewReader(feed), func(ev string) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "upstream overloaded") {
+		t.Fatalf("error 事件應返回非 nil 錯誤並含上游訊息，實際: %v", err)
+	}
+	hasFailed := false
+	for _, ev := range events {
+		if strings.HasPrefix(ev, "event: response.failed\n") {
+			hasFailed = true
+		}
+	}
+	if !hasFailed {
+		t.Fatalf("上游 error 事件應發出 response.failed，實際事件: %v", events)
+	}
+}
+
+func TestResponsesInputJsonDeltaRoutedByIndex(t *testing.T) {
+	// 兩個平行 tool_use（上游 block index 分別為 1 與 3），交錯送出 input_json_delta
+	feed := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"m_par","model":"GLM-5.3","usage":{}}}`,
+		``,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_A","name":"fnA"}}`,
+		``,
+		`data: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"call_B","name":"fnB"}}`,
+		``,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}`,
+		``,
+		`data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"b\":"}}`,
+		``,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"1}"}}`,
+		``,
+		`data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"2}"}}`,
+		``,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	var completed map[string]any
+	err := reencodeResponsesSSE(strings.NewReader(feed), func(ev string) error {
+		if strings.HasPrefix(ev, "event: response.completed\n") {
+			data := strings.TrimPrefix(strings.SplitN(ev, "\n", 2)[1], "data: ")
+			return json.Unmarshal([]byte(data), &completed)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := completed["response"].(map[string]any)
+	output := resp["output"].([]any)
+	if len(output) != 3 {
+		t.Fatalf("應含 message + 2 個 function_call，實際: %v", output)
+	}
+	fcA := output[1].(map[string]any)
+	fcB := output[2].(map[string]any)
+	if fcA["arguments"] != `{"a":1}` || fcB["arguments"] != `{"b":2}` {
+		t.Fatalf("交錯 input_json_delta 應依 block index 路由至正確工具，實際 A=%v B=%v", fcA["arguments"], fcB["arguments"])
+	}
+}
