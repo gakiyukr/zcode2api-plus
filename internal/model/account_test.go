@@ -283,6 +283,18 @@ func TestPlanTextAndTrial(t *testing.T) {
 	}
 }
 
+func TestIsTrialPlan_SkipsNonString(t *testing.T) {
+	if IsTrialPlan(map[string]any{"amount": 0, "count": 42}) {
+		t.Fatal("純數值欄位不應觸發試用方案判定")
+	}
+	if !IsTrialPlan(map[string]any{"name": "trial plan"}) {
+		t.Fatal("字串含 trial 應判定為試用方案")
+	}
+	if IsTrialPlan(map[string]any{"custom_flag": true, "score": 1.5}) {
+		t.Fatal("非試用鍵名的布林與數值不應經字串比對誤判")
+	}
+}
+
 func TestAccumulateAndPublicView(t *testing.T) {
 	acc := &Account{
 		Name:     "acc",

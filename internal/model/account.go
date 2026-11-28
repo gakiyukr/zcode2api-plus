@@ -149,6 +149,23 @@ func (a *Account) Secret() string {
 	return derefString(a.APIKey)
 }
 
+// DeviceMid 返回帳號專屬的穩定裝置指紋（UUID v5）。
+// 以憑證為種子（空時退回帳號 ID），避免多帳號共用單一全域 device_mid 遭上游
+// 關聯風控，同時維持資料庫 schema 與舊版完全互通。
+func (a *Account) DeviceMid() string {
+	if a == nil {
+		return ""
+	}
+	seed := strings.TrimSpace(a.Secret())
+	if seed == "" {
+		seed = strings.TrimSpace(a.ID)
+	}
+	if seed == "" {
+		return ""
+	}
+	return util.UUIDv5("zcode-device", seed)
+}
+
 // Clone 深拷贝账号（含 map/slice 与指针字段）。
 //
 // 用途：Store 在持锁状态下把账号副本交给并发路径读取，
@@ -577,7 +594,12 @@ func isTrialPlan(plan any, depth int) bool {
 			if isTrialPlan(value, depth+1) {
 				return true
 			}
-			s := strings.ToLower(fmt.Sprint(value))
+			// 僅對字串值做關鍵字子串比對，避免數值或布林經 fmt.Sprint 誤判
+			strVal, ok := value.(string)
+			if !ok {
+				continue
+			}
+			s := strings.ToLower(strVal)
 			for _, marker := range markers {
 				if strings.Contains(s, marker) {
 					return true
@@ -696,5 +718,3 @@ func newAccountID(name string) string {
 	}
 	return safe + "-" + util.RandomHex(4)
 }
-
-

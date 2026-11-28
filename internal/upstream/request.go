@@ -11,10 +11,10 @@ package upstream
 
 import (
 	_ "embed"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -37,13 +37,13 @@ var (
 // ContextBuilder 的顺序拼接动态段（行为、技能指引、环境、模型、上下文管理、
 // 调用方 system），外部 agent 的 system 文本并入第三块末尾。
 type zcodePrompts struct {
-	CliPrefix        string   `json:"cliPrefix"`
-	StableSections   []string `json:"stableSections"`
-	DynamicBehavior  string   `json:"dynamicBehavior"`
-	SessionGuidance  string   `json:"sessionGuidance"`
-	ContextManagement string  `json:"contextManagement"`
-	PoweredBy        string   `json:"poweredBy"`
-	Environment      struct {
+	CliPrefix         string   `json:"cliPrefix"`
+	StableSections    []string `json:"stableSections"`
+	DynamicBehavior   string   `json:"dynamicBehavior"`
+	SessionGuidance   string   `json:"sessionGuidance"`
+	ContextManagement string   `json:"contextManagement"`
+	PoweredBy         string   `json:"poweredBy"`
+	Environment       struct {
 		Heading        string `json:"heading"`
 		InvokedLine    string `json:"invokedLine"`
 		CwdLabel       string `json:"cwdLabel"`
@@ -93,15 +93,31 @@ var dropHeaders = map[string]bool{
 	"x-app":                          true,
 	"x-request-id":                   true,
 	"x-session-id":                   true,
+	"x-conversation-id":              true,
 	// 官方客户端的 messages 请求不携带 X-Device-Mid：客户端伪造同样剔除，
 	// 设备身份经由 body 的 metadata.user_id 传递（见 DressSystem）
-	"x-device-mid":                   true,
+	"x-device-mid": true,
 	"anthropic-dangerous-direct-browser-access": true,
+	"x-query-id":          true,
+	"x-forwarded-for":     true,
+	"x-real-ip":           true,
+	"forwarded":           true,
+	"via":                 true,
+	"cf-connecting-ip":    true,
+	"cf-ray":              true,
+	"cf-ipcountry":        true,
+	"true-client-ip":      true,
+	"origin":              true,
+	"proxy-authorization": true,
 }
 
-// dropHeaderPrefixes 按前缀剔除的 agent 特征头（x-stainless-* 是官方 SDK
-// 的遥测头族；x-claude-code-* / x-magpie-* 是 agent 网关的会话头）。
-var dropHeaderPrefixes = []string{"x-stainless-", "x-claude-code-", "x-magpie-"}
+// dropHeaderPrefixes 按前缀剔除的 agent、反代與瀏覽器特徵頭（x-stainless-* 是官方 SDK
+// 的遙測頭族；x-claude-code-* / x-magpie-* 是 agent 網關的會話頭；
+// x-forwarded-* / sec-* / cf-* 為反向代理或瀏覽器頭）。
+var dropHeaderPrefixes = []string{
+	"x-stainless-", "x-claude-code-", "x-magpie-",
+	"x-forwarded-", "sec-", "cf-",
+}
 
 // Request 构造结果：目标 URL 与请求头。
 type Request struct {
@@ -132,9 +148,12 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 		return Request{}, fmt.Errorf("未知提供商: %s", acc.Provider)
 	}
 
-	// 固定头一律用 Go 的规范化形式（textproto canonical），与客户端头的 key
-	// 形式保持一致——否则同一逻辑头会以两个不同 key 存在于 map 中，
-	// 最终值取决于 map 迭代顺序（随机）。
+	device := accountDeviceMid(acc)
+	sessionID := AccountSessionID(incomingHeaders, device)
+
+	// 固定頭一律用 Go 的規範化形式（或明確小寫鍵），並於透傳客戶端頭之後寫回。
+	// X-Title 對齊 ZCode 桌面端（Z Code@electron，magpie 0.1.55 實證）；
+	// x-session-id 供上游 prompt cache 定位快取節點（不帶時長對話快取命中率極低）。
 	fixed := map[string]string{
 		"Content-Type":         "application/json",
 		authHeader:             authValue,
@@ -143,13 +162,14 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 		"X-ZCode-App-Version":  config.ZcodeClientVersion,
 		"X-ZCode-Agent":        "glm",
 		"HTTP-Referer":         "https://zcode.z.ai",
-		"X-Title":              "Z Code@cli",
+		"X-Title":              "Z Code@electron",
 		"X-Release-Channel":    "production",
 		"X-Client-Language":    config.ClientLanguage,
 		"X-Client-Timezone":    config.ClientTimezone,
 		"X-Platform":           config.ClientPlatform(),
 		"X-Os-Category":        config.OsCategory(),
 		"x-request-id":         util.NewUUID(),
+		"x-session-id":         sessionID,
 		"x-zcode-session-type": "main",
 		"x-zcode-trace-id":     util.NewUUID(),
 		"x-zcode-query-source": "main_turn",
@@ -191,21 +211,34 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 	return Request{URL: targetURL, Headers: headers}, nil
 }
 
-// DressSystem 按 ZCode 3.17.2 官方客户端的形态重建请求体的 system 与相关字段。
-// 不幂等（重复调用会重复追加日期前缀），调用方须保证对同一 body 只调用一次。
-//
-// 官方形态要点（magpie dress 语义，风控按此校验）：
-//  1. 顶层 system 恰好三块：cliPrefix、两段 stable 合并、动态段（官方文本 +
-//     调用方 system 文本并入块尾）——上游拒绝第四块（405/3012）；
-//  2. 首个 user turn 之前插入日期 <system-reminder>（官方把当天日期放在
-//     user turn 而非 system）；
-//  3. cache_control 只出现在 system 三块与最后一条非 system 消息的末块上，
-//     消息中间块与 tools 上一律清除；
-//  4. metadata.user_id 标记设备（官方按它选缓存节点，缺失会命中不了缓存）。
+// DressSystem 按 ZCode 官方客戶端形態重建請求體的 system 與相關欄位（使用全域 device_mid）。
+// 若呼叫方已有帳號與會話資訊，應優先使用 DressSystemFor。
 func DressSystem(body map[string]any) {
+	dev := config.DeviceMid()
+	DressSystemFor(body, dev, SessionID(dev))
+}
+
+// DressSystemFor 以指定的帳號裝置指紋與會話 ID 重建請求體。
+// 不冪等（重複呼叫會重複追加日期前綴），呼叫方須保證對同一 body 只呼叫一次。
+//
+// 官方形態要點（magpie dress 語義，風控按此校驗）：
+//  1. 頂層 system 恰好三塊：cliPrefix、兩段 stable 合併、動態段（官方文本 +
+//     呼叫方 system 文本併入塊尾）——上游拒絕第四塊（405/3012）；
+//  2. 首個 user turn 之前插入日期 <system-reminder>（官方把當天日期放在
+//     user turn 而非 system）；
+//  3. cache_control 只出現在 system 三塊與最後一條非 system 訊息的末塊上，
+//     訊息中間塊與 tools 上一律清除；
+//  4. metadata.user_id 標記裝置與會話（須與 x-session-id 一致，否則命中不了快取）。
+func DressSystemFor(body map[string]any, device, session string) {
 	p := ZcodePrompts()
 	if p == nil || body == nil {
 		return
+	}
+	if strings.TrimSpace(device) == "" {
+		device = config.DeviceMid()
+	}
+	if strings.TrimSpace(session) == "" {
+		session = SessionID(device)
 	}
 
 	// 调用方原有 system 文本：字串或 blocks 数组，一律并入第三块
@@ -259,7 +292,7 @@ func DressSystem(body map[string]any) {
 		cached("\n\n" + strings.Join(dynamic, "\n\n")),
 	}
 
-	// 日期前缀：官方以 <system-reminder> 包裹当天日期放在首个 user turn
+	// 日期前綴與 cache_control 重排：複製訊息與區塊 map，避免就地修改呼叫方共享的 body 結構
 	dateLine := strings.ReplaceAll(p.Context.CurrentDateLine, "{date}", time.Now().Format("2006-01-02"))
 	prefix := map[string]any{
 		"role": "user",
@@ -268,28 +301,39 @@ func DressSystem(body map[string]any) {
 			"text": "<system-reminder>" + dateLine + "</system-reminder>",
 		}},
 	}
-	messages, _ := body["messages"].([]any)
-	body["messages"] = append([]any{prefix}, messages...)
-
-	// cache_control 重排：消息内所有块清除，仅最后一条非 system 消息的末块保留
+	origMessages, _ := body["messages"].([]any)
+	clonedMessages := make([]any, 0, len(origMessages)+1)
+	clonedMessages = append(clonedMessages, prefix)
 	var last map[string]any
-	for _, item := range body["messages"].([]any) {
-		msg, ok := item.(map[string]any)
+	for _, item := range origMessages {
+		origMsg, ok := item.(map[string]any)
 		if !ok {
+			clonedMessages = append(clonedMessages, item)
 			continue
 		}
-		if role, _ := msg["role"].(string); role == "system" {
-			continue
-		}
-		last = msg
-		if blocks, ok := msg["content"].([]any); ok {
-			for _, b := range blocks {
-				if m, ok := b.(map[string]any); ok {
-					delete(m, "cache_control")
+		msg := maps.Clone(origMsg)
+		if role, _ := msg["role"].(string); role != "system" {
+			last = msg
+			if blocks, ok := msg["content"].([]any); ok {
+				newBlocks := make([]any, len(blocks))
+				for i, b := range blocks {
+					if m, ok := b.(map[string]any); ok {
+						mc := maps.Clone(m)
+						delete(mc, "cache_control")
+						newBlocks[i] = mc
+					} else {
+						newBlocks[i] = b
+					}
 				}
+				msg["content"] = newBlocks
 			}
 		}
+		clonedMessages = append(clonedMessages, msg)
 	}
+	if last == nil {
+		last = prefix
+	}
+	body["messages"] = clonedMessages
 	if last != nil {
 		switch content := last["content"].(type) {
 		case string:
@@ -302,21 +346,173 @@ func DressSystem(body map[string]any) {
 			}
 		}
 	}
-	if tools, ok := body["tools"].([]any); ok {
-		for _, item := range tools {
+	if origTools, ok := body["tools"].([]any); ok {
+		clonedTools := make([]any, len(origTools))
+		for i, item := range origTools {
 			if t, ok := item.(map[string]any); ok {
-				delete(t, "cache_control")
+				tc := maps.Clone(t)
+				delete(tc, "cache_control")
+				clonedTools[i] = tc
+			} else {
+				clonedTools[i] = item
 			}
 		}
+		body["tools"] = clonedTools
 	}
 
-	// metadata.user_id：官方在每个请求上标记设备（选缓存节点用）
-	meta, _ := body["metadata"].(map[string]any)
+	// metadata.user_id：官方在每個請求上標記裝置與會話（選快取節點用）；先複製再寫入防污染原 map
+	origMeta, _ := body["metadata"].(map[string]any)
+	meta := maps.Clone(origMeta)
 	if meta == nil {
 		meta = map[string]any{}
 	}
-	meta["user_id"] = UserID(config.DeviceMid(), SessionID(config.DeviceMid()))
+	meta["user_id"] = UserID(device, session)
 	body["metadata"] = meta
+}
+
+// accountDeviceMid 取得帳號專屬裝置指紋；帳號為空或無憑證時回退全域裝置指紋。
+func accountDeviceMid(acc *model.Account) string {
+	if acc != nil {
+		if mid := acc.DeviceMid(); mid != "" {
+			return mid
+		}
+	}
+	return config.DeviceMid()
+}
+
+// AccountDeviceMid 供跨包（gateway / asyncpool）取得與請求標頭一致的裝置指紋。
+func AccountDeviceMid(acc *model.Account) string {
+	return accountDeviceMid(acc)
+}
+
+// ExtractClientSessionKey 依優先順序（x-session-id → x-claude-code-session-id → x-conversation-id）
+// 大小寫不敏感提取客戶端傳入的原始會話鍵；皆無則回傳空串。
+func ExtractClientSessionKey(incomingHeaders map[string]string) string {
+	var s1, s2, s3 string
+	for k, v := range incomingHeaders {
+		val := strings.TrimSpace(v)
+		if val == "" {
+			continue
+		}
+		switch strings.ToLower(k) {
+		case "x-session-id":
+			if s1 == "" {
+				s1 = val
+			}
+		case "x-claude-code-session-id":
+			if s2 == "" {
+				s2 = val
+			}
+		case "x-conversation-id":
+			if s3 == "" {
+				s3 = val
+			}
+		}
+	}
+	if s1 != "" {
+		return s1
+	}
+	if s2 != "" {
+		return s2
+	}
+	return s3
+}
+
+// AccountSessionID 以帳號裝置指紋與客戶端會話鍵組合派生專屬 UUID v5：
+// 同一帳號多輪對話維持相同 x-session-id 以命中快取，跨帳號故障轉移則派生全新 UUID 避免關聯。
+func AccountSessionID(incomingHeaders map[string]string, device string) string {
+	if strings.TrimSpace(device) == "" {
+		device = config.DeviceMid()
+	}
+	if raw := ExtractClientSessionKey(incomingHeaders); raw != "" {
+		return util.UUIDv5("zcode-account-session", device+"\x00"+strings.ToLower(raw))
+	}
+	return SessionID(device)
+}
+
+// SessionIDFromHeaders 依客戶端會話頭（x-session-id / x-claude-code-session-id）
+// 歸一化為標準 UUID；若客戶端未攜帶則以帳號 device 派生穩定 UUID。
+// 確保同一對話的每輪請求維持相同 x-session-id，讓上游 Prompt Cache 穩定命中。
+func SessionIDFromHeaders(incomingHeaders map[string]string, device string) string {
+	var raw string
+	for k, v := range incomingHeaders {
+		lower := strings.ToLower(k)
+		if lower == "x-session-id" && strings.TrimSpace(v) != "" {
+			raw = strings.TrimSpace(v)
+			break
+		}
+		if lower == "x-claude-code-session-id" && strings.TrimSpace(v) != "" && raw == "" {
+			raw = strings.TrimSpace(v)
+		}
+	}
+	if raw != "" {
+		if util.IsUUID(raw) {
+			return strings.ToLower(raw)
+		}
+		return util.UUIDv5("zcode-session", raw)
+	}
+	return SessionID(device)
+}
+
+// QueryID 依會話 ID 與請求體中「含非 tool_result 的使用者訊息數」派生每輪查詢 UUID。
+// 對齊 ZCode 官方 createModelRequestAttributionHeaders（magpie 0.1.55 queryOf）：
+// 同一輪工具呼叫迴圈維持不變，下一次使用者提問自動換新。
+func QueryID(body map[string]any, session string) string {
+	if body == nil || strings.TrimSpace(session) == "" {
+		return ""
+	}
+	msgs, ok := body["messages"].([]any)
+	if !ok {
+		return ""
+	}
+	turns := 0
+	for _, item := range msgs {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "user" {
+			continue
+		}
+		if userMessageHasNonToolResult(msg["content"]) {
+			turns++
+		}
+	}
+	if turns == 0 {
+		return ""
+	}
+	return util.UUIDv5("zcode-query", fmt.Sprintf("%s\x00%d", session, turns))
+}
+
+func userMessageHasNonToolResult(content any) bool {
+	switch c := content.(type) {
+	case string:
+		return strings.TrimSpace(c) != ""
+	case []any:
+		for _, part := range c {
+			block, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := block["type"].(string); t != "tool_result" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SetQueryID 依已組裝請求的 x-session-id 與原始請求體寫入 x-query-id 標頭。
+func SetQueryID(req *Request, body map[string]any) {
+	if req == nil || req.Headers == nil {
+		return
+	}
+	// 防止大小寫變體與此處寫入的小寫鍵共存
+	delete(req.Headers, "X-Query-Id")
+	delete(req.Headers, "X-Query-ID")
+	if qid := QueryID(body, req.Headers["x-session-id"]); qid != "" {
+		req.Headers["x-query-id"] = qid
+	}
 }
 
 // userIDPayload 字段顺序对齐官方（device_id、account_uuid、session_id）；
@@ -336,14 +532,9 @@ func UserID(device, session string) string {
 	return string(payload)
 }
 
-// SessionID 把会话标识归一为官方形态：UUID 直接用；非 UUID 的会话（或缺失）
-// 以 device 为种子派生稳定 UUID（对齐 magpie sessionOf，uuid v5 形态）。
+// SessionID 把会话标识归一为官方形态：以 device 为种子派生稳定 UUID v5。
 func SessionID(device string) string {
-	sum := sha256.Sum256([]byte("zcode-session-device\x00" + device))
-	u := sum[:16]
-	u[6] = (u[6] & 0x0f) | 0x50
-	u[8] = (u[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+	return util.UUIDv5("zcode-session-device", device)
 }
 
 // hasSkillTool 请求是否携带 Skill 工具（官方在有该工具时追加技能指引段）。

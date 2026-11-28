@@ -8,16 +8,20 @@ import (
 	"zcode2api/internal/upstream"
 )
 
-// NormalizeBody 对请求体做三件事（注入语义对齐 ZCode 3.17.2 官方客户端，
-// 移植自 magpie 的 dress）：
-//  1. 模型名去 "provider/" 前缀，并按 MODEL_NAME_MAP 做大小写映射（幂等）；
-//  2. 字符串 content 桥接为 [{type:"text"}]（不改写原始消息 map，幂等）；
-//  3. needsZcodeSystem（JWT 账号）时重建 system 为官方三块形态并补齐
-//     日期前缀 / cache_control / metadata——否则上游返回 405。
+// NormalizeBody 對請求體做三件事（注入語義對齊官方客戶端）：
+//  1. 模型名去 "provider/" 前綴，並按 ModelNameMap 做大小寫映射（冪等）；
+//  2. 字串 content 橋接為 [{type:"text"}]（不改寫原始訊息 map，冪等）；
+//  3. needsZcodeSystem（JWT 帳號）時重建 system 為官方三塊形態並補齊
+//     日期前綴 / cache_control / metadata——否則上游返回 405。
 //
-// 注意：system 重建**不幂等**（重复调用会重复追加日期前缀），调用方须保证
-// 对同一个 body 只注入一次（Python 版同样是入口一次 + 账号副本一次）。
+// 注意：system 重建不冪等，呼叫方須保證對同一 body 只注入一次。
 func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
+	return NormalizeBodyFor(body, needsZcodeSystem, "", "")
+}
+
+// NormalizeBodyFor 同 NormalizeBody，並支援傳入帳號專屬 device 與會話 ID，
+// 使 metadata.user_id 與上游 x-session-id 一致。
+func NormalizeBodyFor(body map[string]any, needsZcodeSystem bool, device, session string) map[string]any {
 	if raw, ok := body["model"].(string); ok {
 		m := raw
 		if strings.Contains(m, "/") {
@@ -51,9 +55,23 @@ func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 	}
 
 	if needsZcodeSystem {
-		// 官方形态重建：三块 system + 日期前缀 + cache_control + metadata.user_id。
-		// 上游按官方客户端的形态逐项校验，外部 agent 的 system 文本并入第三块。
-		upstream.DressSystem(body)
+		// 官方形態重建：三塊 system + 日期前綴 + cache_control + metadata.user_id。
+		// 上游按官方客戶端的形態逐項校驗，外部 agent 的 system 文本併入第三塊。
+		upstream.DressSystemFor(body, device, session)
+	} else if strings.TrimSpace(device) != "" {
+		// API Key（Coding Plan）路徑不改動 system，僅於未帶 metadata.user_id 時補齊裝置與會話識別
+		if strings.TrimSpace(session) == "" {
+			session = upstream.SessionID(device)
+		}
+		origMeta, _ := body["metadata"].(map[string]any)
+		if uid, _ := origMeta["user_id"].(string); strings.TrimSpace(uid) == "" {
+			meta := maps.Clone(origMeta)
+			if meta == nil {
+				meta = map[string]any{}
+			}
+			meta["user_id"] = upstream.UserID(device, session)
+			body["metadata"] = meta
+		}
 	}
 	return body
 }
