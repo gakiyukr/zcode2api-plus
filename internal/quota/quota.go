@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
@@ -76,11 +77,16 @@ func authHeaders(acc *model.Account) map[string]string {
 	if deviceMid == "" {
 		deviceMid = config.DeviceMid()
 	}
+	sku := fingerprint.For(acc)
 	headers := map[string]string{
 		"Content-Type":        "application/json",
 		"User-Agent":          config.UserAgent,
 		"X-ZCode-App-Version": config.ZcodeBillingVersion,
-		"X-Platform":          config.ZcodeClientPlatform,
+		"X-Platform":          sku.Platform,
+		"X-Os-Category":       sku.OsCategory,
+		"X-Os-Version":        sku.OsVersion,
+		"X-Client-Language":   sku.Language,
+		"X-Client-Timezone":   sku.Timezone,
 		"X-Device-Mid":        deviceMid,
 		"HTTP-Referer":        "https://zcode.z.ai/",
 	}
@@ -192,7 +198,7 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 
 	query := url.Values{}
 	query.Set("app_version", config.ZcodeBillingVersion)
-	query.Set("platform", config.ZcodeClientPlatform)
+	query.Set("platform", fingerprint.For(acc).Platform)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 		strings.TrimRight(config.ZcodeBillingBase, "/")+"/billing/balance?"+query.Encode(), nil)
 	if err == nil {

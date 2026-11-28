@@ -11,13 +11,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/util"
@@ -30,9 +29,6 @@ var EventReportURL = "https://zcode.z.ai/api/v1/event/report"
 // ActivationElements preview 前依次上报的两个激活事件。
 var ActivationElements = []string{"app_launch", "app_daily_active"}
 
-// activationScreen 桌面端常见分辨率；上游仅做形态校验，固定值即可。
-const activationScreen = "2560x1440"
-
 // eventClient 上報客戶端（測試可注入；預設 10s 超時直連）。
 var eventClient = &http.Client{Timeout: 10 * time.Second}
 
@@ -40,56 +36,29 @@ var eventClient = &http.Client{Timeout: 10 * time.Second}
 // （總計 3 次嘗試：首發 + 2s + 4s，冪等安全；測試可縮短）。
 var ActivationRetryDelays = []time.Duration{2 * time.Second, 4 * time.Second}
 
-func osVersion() string {
-	return config.OsRelease()
-}
-
-// timezone 本机 IANA 时区名；取不到时回退 UTC（上报失败不阻断 preview）。
-func timezone() string {
-	if tz := strings.TrimSpace(os.Getenv("TZ")); tz != "" {
-		return tz
-	}
-	if raw, err := os.ReadFile("/etc/timezone"); err == nil {
-		if name := strings.TrimSpace(string(raw)); name != "" {
-			return name
-		}
-	}
-	return "UTC"
-}
-
-// language 本机 locale 语言标签（LC_ALL / LC_MESSAGES / LANG）。
-func language() string {
-	for _, key := range []string{"LC_ALL", "LC_MESSAGES", "LANG"} {
-		raw := strings.TrimSpace(os.Getenv(key))
-		if raw != "" {
-			return strings.ReplaceAll(strings.SplitN(raw, ".", 2)[0], "_", "-")
-		}
-	}
-	return "en-US"
-}
-
-// BuildActivationEventBody 激活事件体（官方 sendReport 字段集固定这 16 个）。
+// BuildActivationEventBody 保留舊呼叫形狀，使用預設桌面 SKU；
+// 帳號路徑應使用 BuildActivationEventBodyFor 與請求頭保持同源。
 func BuildActivationEventBody(element, userID, deviceMid string) map[string]any {
-	osCategory := map[string]string{
-		"windows": "windows", "darwin": "macos",
-	}[runtime.GOOS]
-	if osCategory == "" {
-		osCategory = "linux"
-	}
+	return BuildActivationEventBodyFor(element, userID, deviceMid, fingerprint.For(nil))
+}
+
+// BuildActivationEventBodyFor 激活事件体（官方 sendReport 字段集固定这 16 个）。
+// 设备维度全部取自帳號 SKU，避免遥测与对话请求头互相矛盾。
+func BuildActivationEventBodyFor(element, userID, deviceMid string, sku fingerprint.SKU) map[string]any {
 	return map[string]any{
 		"event_id":           util.NewUUID(),
-		"client_timezone":    timezone(),
-		"client_language":    language(),
+		"client_timezone":    sku.Timezone,
+		"client_language":    sku.Language,
 		"element_name":       element,
 		"event_region":       "app",
 		"event_type":         "view",
 		"event_text":         "",
 		"event_extra_detail": map[string]any{},
 		"user_id":            userID,
-		"screen_resolution":  activationScreen,
+		"screen_resolution":  sku.Screen,
 		"app_version":        config.ZcodeBillingVersion,
-		"device_os_category": osCategory,
-		"device_os_version":  osVersion(),
+		"device_os_category": sku.OsCategory,
+		"device_os_version":  sku.OsVersion,
 		"device_mid":         deviceMid,
 		"mac_id":             "",
 		"marketing_params":   "{}",
@@ -124,7 +93,7 @@ func PostActivationEventContext(ctx context.Context, acc *model.Account, userID,
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	body, err := json.Marshal(BuildActivationEventBody(element, userID, deviceMid))
+	body, err := json.Marshal(BuildActivationEventBodyFor(element, userID, deviceMid, fingerprint.For(acc)))
 	if err != nil {
 		return err
 	}

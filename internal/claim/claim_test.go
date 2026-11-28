@@ -17,6 +17,7 @@ import (
 
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/model"
 	"zcode2api/internal/store"
 )
@@ -489,5 +490,18 @@ func TestBillingRequest_CancelableRetry(t *testing.T) {
 	}
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("重試等待未被即時取消，耗時 %s", elapsed)
+	}
+}
+
+func TestActivationEventUsesAccountSKU(t *testing.T) {
+	acc := model.Create(model.ProviderZai, "telemetry", "a.b.c")
+	sku := fingerprint.For(acc)
+	body := BuildActivationEventBodyFor("app_launch", "u1", acc.DeviceMid(), sku)
+	if body["client_timezone"] != sku.Timezone ||
+		body["client_language"] != sku.Language ||
+		body["screen_resolution"] != sku.Screen ||
+		body["device_os_category"] != sku.OsCategory ||
+		body["device_os_version"] != sku.OsVersion {
+		t.Fatalf("遥测未使用帳號 SKU: %v vs %+v", body, sku)
 	}
 }

@@ -14,12 +14,14 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
+	"zcode2api/internal/fingerprint"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/util"
@@ -30,6 +32,8 @@ import (
 type ClaimError struct {
 	Code int
 	msg  string
+	// RetryAfter 上游 Retry-After 指定的等待时间；0 表示未提供或无法解析。
+	RetryAfter time.Duration
 }
 
 func (e *ClaimError) Error() string { return e.msg }
@@ -280,11 +284,32 @@ func (s *Service) billingRequestCtx(ctx context.Context, acc *model.Account, met
 		}
 		// HTTP >= 400 且未帶非零業務碼時統一視為請求失敗，避免誤判為 code=0 成功
 		if res.StatusCode >= 400 && (body["code"] == nil || BusinessCode(body) == 0) {
-			return nil, &ClaimError{Code: res.StatusCode, msg: fmt.Sprintf("計費 API 回傳 HTTP %d", res.StatusCode)}
+			return nil, &ClaimError{
+				Code:       res.StatusCode,
+				msg:        fmt.Sprintf("計費 API 回傳 HTTP %d", res.StatusCode),
+				RetryAfter: parseRetryAfter(res.Header.Get("Retry-After")),
+			}
 		}
 		return body, nil
 	}
 	return nil, &ClaimError{msg: fmt.Sprintf("上游網路錯誤: %v", lastNetErr)}
+}
+
+// parseRetryAfter 解析 Retry-After（秒數或 HTTP date）；無效值回 0。
+func parseRetryAfter(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(raw); err == nil {
+		if d := time.Until(at); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // authHeaders 計費／活動端點鑑權頭（使用帳號專屬 device_mid 與計費鏈版本號）。
@@ -293,11 +318,16 @@ func authHeaders(acc *model.Account) map[string]string {
 	if deviceMid == "" {
 		deviceMid = config.DeviceMid()
 	}
+	sku := fingerprint.For(acc)
 	headers := map[string]string{
 		"Content-Type":        "application/json",
 		"User-Agent":          config.UserAgent,
 		"X-ZCode-App-Version": config.ZcodeBillingVersion,
-		"X-Platform":          config.ZcodeClientPlatform,
+		"X-Platform":          sku.Platform,
+		"X-Os-Category":       sku.OsCategory,
+		"X-Os-Version":        sku.OsVersion,
+		"X-Client-Language":   sku.Language,
+		"X-Client-Timezone":   sku.Timezone,
 		"X-Device-Mid":        deviceMid,
 		"HTTP-Referer":        "https://zcode.z.ai/",
 	}
@@ -410,8 +440,8 @@ func ParseTouchPlans(data any) []map[string]any {
 }
 
 // marketingLanguage 歸一為 ZCode 活動端點接受的兩種 UI 語言（zh-CN / en-US）。
-func marketingLanguage() string {
-	lang := strings.ToLower(language())
+func marketingLanguage(acc *model.Account) string {
+	lang := strings.ToLower(fingerprint.For(acc).Language)
 	if strings.HasPrefix(lang, "zh") {
 		return "zh-CN"
 	}
@@ -426,7 +456,7 @@ func (s *Service) TouchPlans(acc *model.Account) ([]map[string]any, error) {
 // TouchPlansContext 帶可取消 context 拉取 /api/v1/marketing/touch 活動套餐。
 func (s *Service) TouchPlansContext(ctx context.Context, acc *model.Account) ([]map[string]any, error) {
 	headers := authHeaders(acc)
-	headers["X-Client-Language"] = marketingLanguage()
+	headers["X-Client-Language"] = marketingLanguage(acc)
 	seq := touchSeq.Add(1) - 1
 	url := fmt.Sprintf("%s?seq=%d", MarketingTouchURL, seq)
 	body, err := s.billingRequestCtx(ctx, acc, http.MethodGet, url, headers, nil)
@@ -453,7 +483,7 @@ func (s *Service) PreviewPlans(acc *model.Account) ([]map[string]any, error) {
 func (s *Service) PreviewPlansContext(ctx context.Context, acc *model.Account) ([]map[string]any, error) {
 	headers := authHeaders(acc)
 	body, previewErr := s.billingRequestCtx(ctx, acc, http.MethodGet,
-		"/billing/preview?app_version="+config.ZcodeBillingVersion+"&platform="+config.ZcodeClientPlatform,
+		"/billing/preview?app_version="+config.ZcodeBillingVersion+"&platform="+fingerprint.For(acc).Platform,
 		headers, nil)
 	var previewPlans []map[string]any
 	if previewErr == nil {
@@ -604,7 +634,7 @@ func claimHeaders(acc *model.Account, verifyParam, region string) map[string]str
 		headers[captchaRegionHeader] = region
 	}
 	headers["X-ZCode-App-Version"] = config.ZcodeBillingVersion
-	headers["X-Platform"] = config.ZcodeClientPlatform
+	headers["X-Platform"] = fingerprint.For(acc).Platform
 	return headers
 }
 
