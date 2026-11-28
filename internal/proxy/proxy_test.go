@@ -386,3 +386,215 @@ func TestSocks5DomainReplyFullyConsumed(t *testing.T) {
 		t.Fatalf("响应体被污染: %q", body)
 	}
 }
+
+func TestSocks5MethodNegotiation(t *testing.T) {
+	// 1. 帶帳密時，方法協商必須送出 0x02（RFC 1929 帳密認證），不得送出 0x01（GSSAPI）
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	var seenMethods []byte
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		head := make([]byte, 2)
+		if _, err := readFull(serverConn, head); err != nil {
+			return
+		}
+		seenMethods = make([]byte, head[1])
+		if _, err := readFull(serverConn, seenMethods); err != nil {
+			return
+		}
+		// 回應選擇帳密認證 0x02
+		_, _ = serverConn.Write([]byte{0x05, 0x02})
+		// 讀取子協商：ver(1) + ulen(1) + user + plen(1) + pass
+		authHead := make([]byte, 2)
+		if _, err := readFull(serverConn, authHead); err != nil {
+			return
+		}
+		uBuf := make([]byte, authHead[1])
+		_, _ = readFull(serverConn, uBuf)
+		pLen := make([]byte, 1)
+		_, _ = readFull(serverConn, pLen)
+		pBuf := make([]byte, pLen[0])
+		_, _ = readFull(serverConn, pBuf)
+		// 回應認證成功
+		_, _ = serverConn.Write([]byte{0x01, 0x00})
+		// 讀取 CONNECT 並回應成功
+		req := make([]byte, 4+4+2)
+		_, _ = readFull(serverConn, req)
+		_, _ = serverConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	}()
+
+	u, _ := url.Parse("socks5://alice:secret@127.0.0.1:1080")
+	if err := socks5Handshake(context.Background(), clientConn, u, "127.0.0.1:80", false); err != nil {
+		t.Fatalf("帶帳密 socks5 握手失敗: %v", err)
+	}
+	<-serverDone
+
+	hasUserPass := false
+	for _, m := range seenMethods {
+		if m == 0x01 {
+			t.Fatalf("不應送出 GSSAPI 方法碼 0x01，實際 methods=%v", seenMethods)
+		}
+		if m == 0x02 {
+			hasUserPass = true
+		}
+	}
+	if !hasUserPass {
+		t.Fatalf("帶帳密時必須包含帳密方法碼 0x02，實際 methods=%v", seenMethods)
+	}
+
+	// 2. 無帳密 URL 卻收到代理回 0x02 時，應回傳明確錯誤而非 nil pointer panic
+	c2, s2 := net.Pipe()
+	defer c2.Close()
+	defer s2.Close()
+	go func() {
+		buf := make([]byte, 3)
+		_, _ = readFull(s2, buf)
+		_, _ = s2.Write([]byte{0x05, 0x02})
+	}()
+	uNoAuth, _ := url.Parse("socks5://127.0.0.1:1080")
+	err := socks5Handshake(context.Background(), c2, uNoAuth, "127.0.0.1:80", false)
+	if err == nil || !strings.Contains(err.Error(), "未提供憑證") {
+		t.Fatalf("無帳密收到 0x02 應回傳明確錯誤，實際: %v", err)
+	}
+}
+
+func TestSocks5LengthValidation(t *testing.T) {
+	// 帳號超過 255 位元組應直接報錯而非截斷
+	c1, s1 := net.Pipe()
+	defer c1.Close()
+	defer s1.Close()
+	longUser := strings.Repeat("u", 256)
+	uLongUser := &url.URL{Scheme: "socks5", Host: "127.0.0.1:1080", User: url.UserPassword(longUser, "ok")}
+	if err := socks5Auth(c1, uLongUser); err == nil || !strings.Contains(err.Error(), "255") {
+		t.Fatalf("超長帳號應報錯，實際: %v", err)
+	}
+
+	// 密碼超過 255 位元組應直接報錯
+	longPass := strings.Repeat("p", 256)
+	uLongPass := &url.URL{Scheme: "socks5", Host: "127.0.0.1:1080", User: url.UserPassword("ok", longPass)}
+	if err := socks5Auth(c1, uLongPass); err == nil || !strings.Contains(err.Error(), "255") {
+		t.Fatalf("超長密碼應報錯，實際: %v", err)
+	}
+
+	// socks5h 域名超過 255 位元組應報錯而非截斷
+	c2, s2 := net.Pipe()
+	defer c2.Close()
+	defer s2.Close()
+	go func() {
+		buf := make([]byte, 3)
+		_, _ = readFull(s2, buf)
+		_, _ = s2.Write([]byte{0x05, 0x00})
+	}()
+	u, _ := url.Parse("socks5h://127.0.0.1:1080")
+	longHost := strings.Repeat("a", 256) + ":80"
+	if err := socks5Handshake(context.Background(), c2, u, longHost, true); err == nil || !strings.Contains(err.Error(), "255") {
+		t.Fatalf("超長域名應報錯，實際: %v", err)
+	}
+}
+
+type deadlineTrackingConn struct {
+	net.Conn
+	deadlines []time.Time
+}
+
+func (c *deadlineTrackingConn) SetDeadline(t time.Time) error {
+	c.deadlines = append(c.deadlines, t)
+	return c.Conn.SetDeadline(t)
+}
+
+func TestSocks4HasDeadline(t *testing.T) {
+	c, s := net.Pipe()
+	defer c.Close()
+	defer s.Close()
+	tracked := &deadlineTrackingConn{Conn: c}
+
+	go func() {
+		buf := make([]byte, 64)
+		_, _ = s.Read(buf)
+		_, _ = s.Write([]byte{0x00, 0x5a, 0, 0, 0, 0, 0, 0})
+	}()
+
+	u, _ := url.Parse("socks4://127.0.0.1:1080")
+	if err := socks4Handshake(tracked, u, "127.0.0.1:80", false); err != nil {
+		t.Fatalf("socks4 握手失敗: %v", err)
+	}
+	if len(tracked.deadlines) < 2 || tracked.deadlines[0].IsZero() || !tracked.deadlines[len(tracked.deadlines)-1].IsZero() {
+		t.Fatalf("socks4Handshake 必須先設定非零 deadline 並在結束時清除，實際記錄: %v", tracked.deadlines)
+	}
+
+	// 同時驗證 EvictTransport 會淘汰快取並建立新的 Transport
+	const raw = "http://127.0.0.1:19876"
+	t1, err := TransportFor(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	EvictTransport(raw)
+	t2, err := TransportFor(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t1 == t2 {
+		t.Fatal("EvictTransport 後應建立新的 Transport 實例")
+	}
+	EvictTransport(raw)
+}
+
+func TestTransportForceHTTP2Enabled(t *testing.T) {
+	direct, err := TransportFor("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !direct.ForceAttemptHTTP2 {
+		t.Fatal("直連 Transport 必須顯式啟用 ForceAttemptHTTP2")
+	}
+	proxied, err := TransportFor("http://127.0.0.1:18888")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { EvictTransport("http://127.0.0.1:18888") })
+	if !proxied.ForceAttemptHTTP2 {
+		t.Fatal("代理 Transport 必須顯式啟用 ForceAttemptHTTP2")
+	}
+}
+
+func TestIPv6ZeroByteEOFFallbackToTCP4(t *testing.T) {
+	ResetIPv4Fallback()
+	t.Cleanup(ResetIPv4Fallback)
+
+	const targetAddr = "zcode.z.ai:443"
+	if PreferIPv4(targetAddr) {
+		t.Fatal("初始狀態不應啟用 IPv4 降級")
+	}
+
+	c, s := net.Pipe()
+	_ = s.Close() // 立即關閉對端模擬 IPv6 首包零位元組 EOF
+	probe := &ipv6ProbeConn{Conn: c, addr: targetAddr}
+	buf := make([]byte, 16)
+	n, err := probe.Read(buf)
+	_ = c.Close()
+	if n != 0 || err == nil {
+		t.Fatalf("預期讀到 0 位元組 EOF，實際 n=%d err=%v", n, err)
+	}
+	if !PreferIPv4(targetAddr) {
+		t.Fatal("IPv6 首包零位元組 EOF 後應標記 PreferIPv4 為 true")
+	}
+
+	// CloseIdleFor 驅逐髒連線不應刪除 Transport 快取實例
+	const raw = "http://127.0.0.1:19877"
+	t1, err := TransportFor(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { EvictTransport(raw) })
+	CloseIdleFor(raw)
+	t2, err := TransportFor(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t1 != t2 {
+		t.Fatal("CloseIdleFor 僅驅逐閒置連線，不應刪除快取中的 Transport 實例")
+	}
+}

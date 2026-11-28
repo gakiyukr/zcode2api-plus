@@ -9,11 +9,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,27 +39,108 @@ func TransportFor(raw string) (*http.Transport, error) {
 	return TransportForTimeout(raw, DefaultResponseHeaderTimeout)
 }
 
-// TransportForTimeout 同 TransportFor，但可指定响应头超时。
-//
-// 缓存键包含超时值：不同用途（网关 120s、async 池 180s）各自持有一份
-// Transport，避免共用连接池时超时语义互相覆盖。
-func TransportForTimeout(raw string, responseHeaderTimeout time.Duration) (*http.Transport, error) {
+// NewTransport 建立全新的出站 Transport（不寫入全域快取，適合一次性探測後主動關閉閒置連線）。
+// 完整支援 http/https/socks4/socks5/socks5h；raw 為空時回傳直連 Transport。
+func NewTransport(raw string, responseHeaderTimeout time.Duration) (*http.Transport, error) {
 	normalized, err := NormalizeProxyURL(raw)
 	if err != nil {
 		return nil, err
 	}
-	key := ""
-	if normalized != nil {
-		key = *normalized
+	return buildTransport(normalized, responseHeaderTimeout)
+}
+
+// ipv4FallbackTTL 雙棧 IPv6 遭遇零位元組 EOF 後降級為 tcp4 的記億時長。
+const ipv4FallbackTTL = 30 * time.Minute
+
+var v4FallbackUntil sync.Map // key: addr (string), value: int64 (unix nano)
+
+// PreferIPv4 判斷指定目標位址是否處於 IPv4 優先降級期。
+func PreferIPv4(addr string) bool {
+	v, ok := v4FallbackUntil.Load(addr)
+	if !ok {
+		return false
 	}
-	key = fmt.Sprintf("%s\x00%d", key, responseHeaderTimeout)
-	transportMu.Lock()
-	defer transportMu.Unlock()
-	if t, ok := transportPrec[key]; ok {
-		return t, nil
+	until, _ := v.(int64)
+	if until <= 0 || time.Now().Round(0).UnixNano() >= until {
+		v4FallbackUntil.Delete(addr)
+		return false
 	}
+	return true
+}
+
+// MarkIPv4Fallback 標記該目標位址於 ipv4FallbackTTL 內優先採用 tcp4 撥號。
+func MarkIPv4Fallback(addr string) {
+	if strings.TrimSpace(addr) == "" {
+		return
+	}
+	v4FallbackUntil.Store(addr, time.Now().Round(0).Add(ipv4FallbackTTL).UnixNano())
+}
+
+// ResetIPv4Fallback 清空 IPv4 降級快取（測試清理用）。
+func ResetIPv4Fallback() {
+	v4FallbackUntil.Range(func(key, _ any) bool {
+		v4FallbackUntil.Delete(key)
+		return true
+	})
+}
+
+// ipv6ProbeConn 監聽雙棧 IPv6 連線的首包讀取；若未收到任何位元組即遭遇 EOF/重設，
+// 自動標記該目標位址於 30 分鐘內降級至 IPv4。
+type ipv6ProbeConn struct {
+	net.Conn
+	addr         string
+	gotFirstByte atomic.Bool
+}
+
+func (c *ipv6ProbeConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.gotFirstByte.Store(true)
+		return n, err
+	}
+	if err != nil && !c.gotFirstByte.Load() && !errors.Is(err, net.ErrClosed) {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || isConnResetErr(err) {
+			MarkIPv4Fallback(c.addr)
+			if ra := c.Conn.RemoteAddr(); ra != nil {
+				MarkIPv4Fallback(ra.String())
+			}
+		}
+	}
+	return n, err
+}
+
+func isConnResetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "forcibly closed") ||
+		strings.Contains(msg, "broken pipe")
+}
+
+// SmartDialContext 具備 IPv6 首包零位元組 EOF 自動降級 tcp4 能力的直連撥號器。
+func SmartDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	baseDialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
+	if (network == "tcp" || network == "") && PreferIPv4(addr) {
+		if conn, err := baseDialer.DialContext(ctx, "tcp4", addr); err == nil {
+			return conn, nil
+		}
+	}
+	conn, err := baseDialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	if ta, ok := conn.RemoteAddr().(*net.TCPAddr); ok && ta.IP != nil && ta.IP.To4() == nil && !ta.IP.IsLoopback() {
+		return &ipv6ProbeConn{Conn: conn, addr: addr}, nil
+	}
+	return conn, nil
+}
+
+func buildTransport(normalized *string, responseHeaderTimeout time.Duration) (*http.Transport, error) {
 	t := &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           SmartDialContext,
+		ForceAttemptHTTP2:     true,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 		MaxIdleConnsPerHost:   8,
@@ -78,6 +161,32 @@ func TransportForTimeout(raw string, responseHeaderTimeout time.Duration) (*http
 		default:
 			return nil, fmt.Errorf("不支持的代理协议: %s", u.Scheme)
 		}
+	}
+	return t, nil
+}
+
+// TransportForTimeout 同 TransportFor，但可指定响应头超时。
+//
+// 缓存键包含超时值：不同用途（网关 120s、async 池 180s）各自持有一份
+// Transport，避免共用连接池时超时语义互相覆盖。
+func TransportForTimeout(raw string, responseHeaderTimeout time.Duration) (*http.Transport, error) {
+	normalized, err := NormalizeProxyURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	key := ""
+	if normalized != nil {
+		key = *normalized
+	}
+	key = fmt.Sprintf("%s\x00%d", key, responseHeaderTimeout)
+	transportMu.Lock()
+	defer transportMu.Unlock()
+	if t, ok := transportPrec[key]; ok {
+		return t, nil
+	}
+	t, err := buildTransport(normalized, responseHeaderTimeout)
+	if err != nil {
+		return nil, err
 	}
 	transportPrec[key] = t
 	return t, nil
@@ -151,10 +260,10 @@ func socks5Handshake(ctx context.Context, conn net.Conn, u *url.URL, addr string
 	}
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
-	// 方法协商：无需鉴权；URL 含用户名密码时追加 user/pass 方法
+	// 方法協商：預設無需認證；URL 含 User 資訊時支援帳密認證（0x02，RFC 1929）
 	methods := []byte{0x01, 0x00}
-	if u.User != nil && u.User.Username() != "" {
-		methods = []byte{0x02, 0x01, 0x00}
+	if u.User != nil {
+		methods = []byte{0x02, 0x02, 0x00}
 	}
 	if _, err := conn.Write(append([]byte{0x05}, methods...)); err != nil {
 		return fmt.Errorf("socks5 方法协商写入失败: %v", err)
@@ -168,7 +277,11 @@ func socks5Handshake(ctx context.Context, conn net.Conn, u *url.URL, addr string
 	}
 	switch resp[1] {
 	case 0x00:
+		// 無需認證
 	case 0x02:
+		if u.User == nil {
+			return errors.New("socks5 代理要求帳密認證但 URL 未提供憑證")
+		}
 		if err := socks5Auth(conn, u); err != nil {
 			return err
 		}
@@ -215,7 +328,10 @@ func socks5Handshake(ctx context.Context, conn net.Conn, u *url.URL, addr string
 			}
 		}
 	} else {
-		// ATYP=0x03 后需带 1 字节域名长度（RFC 1928）
+		// ATYP=0x03 後需帶 1 位元組域名長度（RFC 1928），上限 255
+		if len(host) > 255 {
+			return fmt.Errorf("socks5 域名長度超過 255 位元組上限: %d", len(host))
+		}
 		atyp = 0x03
 		hostBytes = append([]byte{byte(len(host))}, host...)
 	}
@@ -259,8 +375,12 @@ func socks5Handshake(ctx context.Context, conn net.Conn, u *url.URL, addr string
 
 // socks5Auth 执行 RFC 1929 用户名/密码子协商。
 func socks5Auth(conn net.Conn, u *url.URL) error {
+	user := u.User.Username()
 	pass, _ := u.User.Password()
-	auth := append([]byte{0x01, byte(len(u.User.Username()))}, []byte(u.User.Username())...)
+	if len(user) > 255 || len(pass) > 255 {
+		return fmt.Errorf("socks5 帳號或密碼長度超過 255 位元組上限（帳號 %d，密碼 %d）", len(user), len(pass))
+	}
+	auth := append([]byte{0x01, byte(len(user))}, []byte(user)...)
 	auth = append(auth, byte(len(pass)))
 	auth = append(auth, []byte(pass)...)
 	if _, err := conn.Write(auth); err != nil {
@@ -280,6 +400,9 @@ func socks5Auth(conn net.Conn, u *url.URL) error {
 // 域名总是以 4a 的形式发给代理解析（httpx 的 socks4 本地解析语义在
 // IPv4-only 场景等价，4a 兼容面更广且不会暴露解析失败差异）。
 func socks4Handshake(conn net.Conn, u *url.URL, addr string, _ bool) error {
+	// SOCKS4 握手以固定撥號超時兜底，防止無回應代理永久阻塞
+	_ = conn.SetDeadline(time.Now().Add(dialTimeout))
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 	host, portText, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("目标地址无效: %v", err)
@@ -352,4 +475,54 @@ func parsePort(text string) (uint16, error) {
 		return 0, fmt.Errorf("端口无效: %q", text)
 	}
 	return uint16(port), nil
+}
+
+// CloseIdleFor 驅逐指定出口所有快取 Transport 的髒閒置連線（不銷毀快取池本身）。
+// raw 為 "" 或 "direct" 代表直連出口。
+func CloseIdleFor(raw string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "direct" {
+		raw = ""
+	}
+	normalized, err := NormalizeProxyURL(raw)
+	if err != nil {
+		return
+	}
+	key := ""
+	if normalized != nil {
+		key = *normalized
+	}
+	transportMu.Lock()
+	var matched []*http.Transport
+	for k, t := range transportPrec {
+		if k == key || strings.HasPrefix(k, key+"\x00") {
+			matched = append(matched, t)
+		}
+	}
+	transportMu.Unlock()
+	for _, t := range matched {
+		t.CloseIdleConnections()
+	}
+}
+
+// EvictTransport 刪除指定代理 URL 的快取 Transport 並關閉閒置連線。
+// 代理刪除或更新時呼叫，防止舊連線池永久常駐。
+func EvictTransport(raw string) {
+	normalized, err := NormalizeProxyURL(raw)
+	if err != nil {
+		return
+	}
+	key := ""
+	if normalized != nil {
+		key = *normalized
+	}
+	transportMu.Lock()
+	defer transportMu.Unlock()
+	// 淘汰所有以此代理 URL 為前綴的快取項（不同超時各一份）
+	for k, t := range transportPrec {
+		if strings.HasPrefix(k, key+"\x00") || k == key {
+			t.CloseIdleConnections()
+			delete(transportPrec, k)
+		}
+	}
 }
