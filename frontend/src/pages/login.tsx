@@ -21,6 +21,7 @@ export function LoginPage() {
     void (async () => {
       const stored = await adminKey.get()
       if (stored && (await verifyKey(stored).catch(() => false))) {
+        if (!alive) return
         navigate('/admin/dashboard', { replace: true })
         return
       }
@@ -42,8 +43,8 @@ export function LoginPage() {
       } else {
         toast.error('密碼無效')
       }
-    } catch {
-      toast.error('連線失敗')
+    } catch (e) {
+      toast.error(e instanceof TypeError ? '連線失敗' : e instanceof Error && e.message ? e.message : '連線失敗')
     } finally {
       setBusy(false)
     }

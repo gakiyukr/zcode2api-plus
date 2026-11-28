@@ -132,7 +132,7 @@ export function GuestPage() {
       w.removeEventListener('solve', onSolve)
       w.removeEventListener('error', onError)
     }
-  }, [capReady, capKey])
+  }, [capReady, capKey, authorizeURL])
 
   /* 用過一次就重置：Cap token 是一次性的，同一個不能提交第二次。
      capKey 遞增讓 React 重建元件，逼出一個全新的 token。 */
@@ -163,6 +163,8 @@ export function GuestPage() {
       const d = (await r.json()) as { flow_id: string; authorize_url: string }
       setFlowID(d.flow_id)
       setAuthorizeURL(d.authorize_url)
+      // 第一步的 Cap token 已被後端消費，重置元件以便第二步重新求解
+      resetCaptcha()
       // 换了链接，上一步贴的回调地址属于旧会话，继续留着只会让人误提交
       if (regenerate) {
         setCallbackURL('')

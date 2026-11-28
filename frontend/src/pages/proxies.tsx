@@ -1,6 +1,6 @@
 /* 代理設定頁：線路清單、目前出口測試、新增／編輯／刪除／測試線路 */
 import { Activity, Pencil, Plus, Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { useConfirm } from '@/components/confirm'
@@ -62,6 +62,7 @@ export function ProxiesPage() {
   const [current, setCurrent] = useState<CurrentResult>({ state: 'idle' })
   const [testingCurrent, setTestingCurrent] = useState(false)
   const [rowResults, setRowResults] = useState<Record<string, RowResult>>({})
+  const testSeqRef = useRef<Record<string, number>>({})
 
   const [modalOpen, setModalOpen] = useState(false)
   const [editingId, setEditingId] = useState('')
@@ -124,12 +125,17 @@ export function ProxiesPage() {
   }
 
   async function testProxy(p: ProxyProfile) {
+    if (rowResults[p.id]?.state === 'testing') return
+    const seq = (testSeqRef.current[p.id] ?? 0) + 1
+    testSeqRef.current[p.id] = seq
     setRowResults((m) => ({ ...m, [p.id]: { state: 'testing', text: '正在測試線路…' } }))
     try {
       const d = await api<EgressInfo>('POST', '/proxies/' + encodeURIComponent(p.id) + '/test')
+      if (testSeqRef.current[p.id] !== seq) return
       setRowResults((m) => ({ ...m, [p.id]: { state: 'ok', text: formatProbe(d) } }))
       toast.success('代理線路正常')
     } catch (e) {
+      if (testSeqRef.current[p.id] !== seq) return
       setRowResults((m) => ({ ...m, [p.id]: { state: 'error', text: errMsg(e) } }))
       toast.error('代理測試失敗：' + errMsg(e))
     }

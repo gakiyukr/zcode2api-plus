@@ -16,7 +16,18 @@ export function AuthGuard({ children }: { children: ReactNode }) {
         if (alive) setState('deny')
         return
       }
-      const ok = await verifyKey(key).catch(() => false)
+      let ok = false
+      let invalidKey = false
+      try {
+        ok = await verifyKey(key)
+        invalidKey = !ok
+      } catch {
+        ok = false
+      }
+      if (invalidKey) {
+        // 密鑰明確驗證失敗（非限流或暫時斷網），主動清除避免重複無效請求
+        adminKey.clear()
+      }
       if (alive) setState(ok ? 'ok' : 'deny')
     })()
     return () => {

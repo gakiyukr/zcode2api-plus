@@ -113,6 +113,7 @@ export interface EgressInfo {
 }
 
 export interface UsageRankingRow {
+  id?: string
   name: string
   provider: string
   requests: number

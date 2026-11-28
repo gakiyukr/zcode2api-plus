@@ -13,7 +13,10 @@ export default defineConfig({
     // 開發模式把 API 與 meta 代理到本機 FastAPI
     proxy: {
       '/admin/api': 'http://127.0.0.1:3000',
+      '/guest/api': 'http://127.0.0.1:3000',
       '/meta': 'http://127.0.0.1:3000',
+      '/v1': 'http://127.0.0.1:3000',
+      '/async': 'http://127.0.0.1:3000',
     },
   },
 })

@@ -7,7 +7,7 @@
  * 欄位以兩欄網格排列（窄螢幕自動堆疊）：標籤、說明、輸入框為一組，說明放在
  * 標籤下方而非輸入框下方，因為它解釋的是「這個欄位是什麼」而不是輸入格式。 */
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { KeyRound, Loader2, UserCheck } from 'lucide-react'
 import { toast } from 'sonner'
 import { Card, CardContent } from '@/components/ui/card'
@@ -21,6 +21,7 @@ import { api, errMsg } from '@/lib/api'
 import type { SettingsResponse } from '@/lib/types'
 
 export function SettingsPage() {
+  const qc = useQueryClient()
   const { data } = useQuery({
     queryKey: ['settings'],
     queryFn: () => api<SettingsResponse>('GET', '/settings'),
@@ -35,10 +36,11 @@ export function SettingsPage() {
   const [capSecret, setCapSecret] = useState('')
   const [showKeys, setShowKeys] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [dirty, setDirty] = useState(false)
 
-  /* 載入完成後填入表單（僅在尚未編輯時同步） */
+  /* 載入完成後填入表單（使用者尚未手動編輯時才同步，避免背景重取覆蓋輸入） */
   useEffect(() => {
-    if (!data) return
+    if (!data || dirty) return
     setAdminKeyInput(data.admin_key || '')
     setGatewayKey(data.gateway_key || '')
     setQuotaInterval(String(data.quota_refresh_interval ?? 60))
@@ -46,7 +48,7 @@ export function SettingsPage() {
     setCapInstance(data.cap_instance || '')
     setCapSiteKey(data.cap_site_key || '')
     setCapSecret(data.cap_secret || '')
-  }, [data])
+  }, [data, dirty])
 
   async function save(e: FormEvent) {
     e.preventDefault()
@@ -76,6 +78,8 @@ export function SettingsPage() {
       })
       /* 同步本機儲存的密鑰，避免改密後被登出 */
       await adminKey.set(adminKeyInput.trim())
+      setDirty(false)
+      void qc.invalidateQueries({ queryKey: ['settings'] })
       toast.success('已儲存')
     } catch (err) {
       toast.error('儲存失敗：' + errMsg(err))
@@ -135,7 +139,7 @@ export function SettingsPage() {
                       id="set-admin-key"
                       type={showKeys ? 'text' : 'password'}
                       value={adminKeyInput}
-                      onChange={(e) => setAdminKeyInput(e.target.value)}
+                      onChange={(e) => { setAdminKeyInput(e.target.value); setDirty(true) }}
                     />
                   </Field>
                   <Field
@@ -154,7 +158,7 @@ export function SettingsPage() {
                       id="set-gateway-key"
                       type={showKeys ? 'text' : 'password'}
                       value={gatewayKey}
-                      onChange={(e) => setGatewayKey(e.target.value)}
+                      onChange={(e) => { setGatewayKey(e.target.value); setDirty(true) }}
                     />
                   </Field>
                 </FieldGrid>
@@ -167,9 +171,9 @@ export function SettingsPage() {
                     id="set-quota-interval"
                     type="number"
                     min={0}
-                    step={5}
+                    step={1}
                     value={quotaInterval}
-                    onChange={(e) => setQuotaInterval(e.target.value)}
+                    onChange={(e) => { setQuotaInterval(e.target.value); setDirty(true) }}
                   />
                 </Field>
                 <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">
@@ -204,7 +208,7 @@ export function SettingsPage() {
                     type={showKeys ? 'text' : 'password'}
                     value={inviteCode}
                     placeholder="留空則關閉訪客提交"
-                    onChange={(e) => setInviteCode(e.target.value)}
+                    onChange={(e) => { setInviteCode(e.target.value); setDirty(true) }}
                   />
                 </Field>
                 <p className="text-xs text-muted-foreground">
@@ -235,7 +239,7 @@ export function SettingsPage() {
                       type="text"
                       value={capInstance}
                       placeholder="https://cap.example.com"
-                      onChange={(e) => setCapInstance(e.target.value)}
+                      onChange={(e) => { setCapInstance(e.target.value); setDirty(true) }}
                     />
                   </Field>
                   <Field
@@ -253,7 +257,7 @@ export function SettingsPage() {
                       type="text"
                       value={capSiteKey}
                       placeholder="d9256640cb53"
-                      onChange={(e) => setCapSiteKey(e.target.value)}
+                      onChange={(e) => { setCapSiteKey(e.target.value); setDirty(true) }}
                     />
                   </Field>
                 </FieldGrid>
@@ -271,7 +275,7 @@ export function SettingsPage() {
                     id="set-cap-secret"
                     type={showKeys ? 'text' : 'password'}
                     value={capSecret}
-                    onChange={(e) => setCapSecret(e.target.value)}
+                    onChange={(e) => { setCapSecret(e.target.value); setDirty(true) }}
                   />
                 </Field>
 

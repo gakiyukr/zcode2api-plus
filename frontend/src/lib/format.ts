@@ -14,18 +14,21 @@ export function fmtCompact(v: number | null | undefined): string {
   return fmt(n)
 }
 
-/* epoch 秒 →「MM/DD HH:mm」 */
+/* epoch 秒／毫秒 →「MM/DD HH:mm」 */
 export function fmtDate(ts: number | null | undefined): string {
   if (!ts) return '—'
-  const d = new Date(ts * 1000)
+  // 自動偵測：數值大於 1e11 視為毫秒（對齊後端 epochSeconds），否則為秒
+  const ms = ts > 1e11 ? ts : ts * 1000
+  const d = new Date(ms)
   if (isNaN(d.getTime())) return '—'
   return d.toLocaleString('zh-TW', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
-/* epoch 秒 → 相對時間（最近活動用） */
+/* epoch 秒／毫秒 → 相對時間（最近活動用） */
 export function relativeTime(ts: number | null | undefined): string {
   if (!ts) return '尚未使用'
-  const sec = Math.max(0, Date.now() / 1000 - ts)
+  const epochMs = ts > 1e11 ? ts : ts * 1000
+  const sec = Math.max(0, (Date.now() - epochMs) / 1000)
   if (sec < 60) return '剛剛'
   if (sec < 3600) return `${Math.floor(sec / 60)} 分鐘前`
   if (sec < 86400) return `${Math.floor(sec / 3600)} 小時前`

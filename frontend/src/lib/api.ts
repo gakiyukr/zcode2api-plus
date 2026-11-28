@@ -8,12 +8,18 @@ export function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
-/* 驗證密鑰是否有效（登入頁與AuthGuard 使用）；網路失敗時向上拋出由呼叫端處理 */
+/* 驗證密鑰是否有效（登入頁與 AuthGuard 使用）；僅 401/403 視為密鑰無效，429/5xx 與其他非 2xx 向上拋出避免後端重啟誤踢出 */
 export async function verifyKey(key: string): Promise<boolean> {
   const r = await fetch(`${ADMIN_API}/verify`, {
     headers: key ? { Authorization: `Bearer ${key}` } : {},
   })
-  return r.ok
+  if (r.ok) return true
+  if (r.status === 401 || r.status === 403) return false
+  if (r.status === 429) {
+    throw new Error('請求過於頻繁，請稍後再試')
+  }
+  const d = await r.json().catch(() => ({}) as { detail?: string })
+  throw new Error((d as { detail?: string }).detail || `後端服務異常（${r.status}）`)
 }
 
 export async function api<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown): Promise<T> {

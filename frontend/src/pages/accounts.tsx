@@ -247,7 +247,7 @@ export function AccountsPage() {
         ...(editToken.trim() && { token: editToken.trim() }),
       }
       if (editProxy !== PROXY_LEGACY) payload.proxy_id = editProxy === PROXY_DIRECT ? null : editProxy
-      await api('PUT', '/accounts/' + editId, payload)
+      await api('PUT', '/accounts/' + encodeURIComponent(editId), payload)
       setEditOpen(false)
       toast.success('已儲存')
       invalidate()
@@ -289,7 +289,7 @@ export function AccountsPage() {
 
   async function toggleEnabled(a: Account) {
     try {
-      await api('POST', '/accounts/' + a.id + '/enabled', { enabled: a.status === 'disabled' })
+      await api('POST', '/accounts/' + encodeURIComponent(a.id) + '/enabled', { enabled: a.status === 'disabled' })
       invalidate()
     } catch (e) {
       toast.error('操作失敗：' + errMsg(e))
@@ -309,7 +309,7 @@ export function AccountsPage() {
       ),
       onConfirm: async () => {
         try {
-          await api('POST', '/accounts/' + a.id + '/archived', { archived: true })
+          await api('POST', '/accounts/' + encodeURIComponent(a.id) + '/archived', { archived: true })
           toast.success('已歸檔')
           invalidate()
         } catch (e) {
@@ -321,7 +321,7 @@ export function AccountsPage() {
 
   async function doRestore(a: Account) {
     try {
-      await api('POST', '/accounts/' + a.id + '/archived', { archived: false })
+      await api('POST', '/accounts/' + encodeURIComponent(a.id) + '/archived', { archived: false })
       toast.success('已恢復到帳號池')
       invalidate()
     } catch (e) {
@@ -344,8 +344,12 @@ export function AccountsPage() {
     if (refreshing.has(a.id)) return
     setRefreshing((s) => new Set(s).add(a.id))
     try {
-      await api('POST', '/accounts/' + a.id + '/refresh')
-      toast.success('額度已重新整理')
+      const d = await api<{ ok?: boolean; message?: string; result?: { error?: string } }>('POST', '/accounts/' + encodeURIComponent(a.id) + '/refresh')
+      if (d.ok === false) {
+        toast.warning(d.message || d.result?.error || '額度刷新未成功')
+      } else {
+        toast.success('額度已重新整理')
+      }
     } catch (e) {
       toast.error('重新整理失敗：' + errMsg(e))
     } finally {
@@ -358,7 +362,11 @@ export function AccountsPage() {
     }
   }
 
+  const [refreshingAll, setRefreshingAll] = useState(false)
+
   async function refreshAll() {
+    if (refreshingAll) return
+    setRefreshingAll(true)
     toast.info('正在重新整理全部額度…')
     try {
       const d = await api<{ summary: { ok: number; fail: number } }>('POST', '/accounts/refresh', { all: true })
@@ -366,6 +374,8 @@ export function AccountsPage() {
       invalidate()
     } catch (e) {
       toast.error('重新整理失敗：' + errMsg(e))
+    } finally {
+      setRefreshingAll(false)
     }
   }
 
@@ -432,7 +442,7 @@ export function AccountsPage() {
       ),
       onConfirm: async () => {
         try {
-          await api('POST', '/accounts/' + a.id + '/reset-stats')
+          await api('POST', '/accounts/' + encodeURIComponent(a.id) + '/reset-stats')
           toast.success('已重置統計')
           invalidate()
         } catch (e) {
@@ -447,10 +457,11 @@ export function AccountsPage() {
     try {
       const d = await api<unknown>('GET', '/export')
       const a = document.createElement('a')
-      a.href = URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' }))
+      const blobURL = URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' }))
+      a.href = blobURL
       a.download = 'zcode-accounts.json'
       a.click()
-      URL.revokeObjectURL(a.href)
+      setTimeout(() => URL.revokeObjectURL(blobURL), 10_000)
     } catch (e) {
       toast.error('匯出失敗：' + errMsg(e))
     }
@@ -489,8 +500,8 @@ export function AccountsPage() {
           <Button variant="outline" size="sm" onClick={() => void doExport()}>
             <Download /> 匯出
           </Button>
-          <Button variant="outline" size="sm" onClick={() => void refreshAll()}>
-            <RefreshCw /> 重新整理額度
+          <Button variant="outline" size="sm" disabled={refreshingAll} onClick={() => void refreshAll()}>
+            <RefreshCw className={refreshingAll ? 'animate-spin' : undefined} /> 重新整理額度
           </Button>
           <Button variant="outline" size="sm" onClick={claimAll}>
             <Gift /> 領取套餐

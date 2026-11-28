@@ -40,6 +40,7 @@ export function DashboardPage() {
   })
 
   const accounts = data?.accountsData.accounts ?? []
+  const liveAccounts = accounts.filter((a) => a.archived_at == null)
   const stats = data?.accountsData.stats
   const providers = data?.accountsData.providers ?? []
   const status = data?.statusData
@@ -53,10 +54,10 @@ export function DashboardPage() {
   const cache = Number(stats?.tokens_cache) || 0
   const tokens = input + output + cache
 
-  /* 額度彙總 */
+  /* 額度彙總（排除已歸檔帳號，僅計入活躍池可用總量） */
   let remaining = 0
   let items = 0
-  accounts.forEach((a) =>
+  liveAccounts.forEach((a) =>
     Object.values(a.quota || {}).forEach((q) => {
       remaining += Number(q.remaining) || 0
       items++
@@ -100,7 +101,7 @@ export function DashboardPage() {
           {providers.length ? (
             <div className="flex flex-col divide-y">
               {providers.map((provider) => {
-                const items2 = accounts.filter((a) => a.provider === provider)
+                const items2 = liveAccounts.filter((a) => a.provider === provider)
                 const callsP = items2.reduce((n, a) => n + (Number(a.use_count) || 0), 0)
                 const tokensP = items2.reduce((n, a) => n + accountTokens(a), 0)
                 const available = items2.filter((a) => a.status === 'active').length
@@ -183,7 +184,7 @@ export function DashboardPage() {
           }
         >
           {(() => {
-            const items3 = [...accounts]
+            const items3 = [...liveAccounts]
               .sort((a, b) => (b.last_used_at || b.created_at || 0) - (a.last_used_at || a.created_at || 0))
               .slice(0, 5)
             return items3.length ? (
@@ -229,10 +230,10 @@ export function DashboardPage() {
               </TableHeader>
               <TableBody>
                 {(usage?.ranking ?? []).length ? (
-                  (usage?.ranking ?? []).map((r) => {
-                    const pct = usageCalls ? (r.requests / usageCalls) * 100 : 0
+                  (usage?.ranking ?? []).map((r, i) => {
+                    const pct = usageCalls ? Math.min(100, (r.requests / usageCalls) * 100) : 0
                     return (
-                      <TableRow key={r.name}>
+                      <TableRow key={r.id || `${r.provider}-${r.name}-${i}`}>
                         <TableCell className="font-medium">{r.name}</TableCell>
                         <TableCell>
                           <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700">{r.provider}</span>
@@ -303,7 +304,7 @@ function HealthDonut({ stats }: { stats?: AccountsResponse['stats'] }) {
   const stops: string[] = []
   keys.forEach((key, i) => {
     const start = cursor
-    cursor += total ? (values[i] / total) * 100 : 0
+    cursor = Math.min(100, cursor + (total ? (values[i] / total) * 100 : 0))
     if (values[i]) stops.push(`${STATUS_COLOR[key]} ${start}% ${cursor}%`)
   })
   return (
@@ -350,9 +351,10 @@ function Donut({ ranking, calls }: { ranking: UsageResponse['ranking']; calls: n
   const top = ranking.slice(0, 5)
   let cursor = 0
   const stops = top.map((r, i) => {
-    const pct = calls ? (Number(r.requests) / calls) * 100 : 0
-    const seg = `${PALETTE[i]} ${cursor}% ${cursor + pct}%`
-    cursor += pct
+    const pct = calls ? Math.min(100, (Number(r.requests) / calls) * 100) : 0
+    const next = Math.min(100, cursor + pct)
+    const seg = `${PALETTE[i]} ${cursor}% ${next}%`
+    cursor = next
     return seg
   })
   stops.push(`#e9edf3 ${cursor}% 100%`)
@@ -370,7 +372,7 @@ function Donut({ ranking, calls }: { ranking: UsageResponse['ranking']; calls: n
       <div className="flex min-w-0 flex-1 flex-col gap-2 text-sm">
         {top.length ? (
           top.map((r, i) => (
-            <div key={r.name} className="flex items-center gap-2">
+            <div key={r.id || `${r.provider}-${r.name}-${i}`} className="flex items-center gap-2">
               <span className="size-2 shrink-0 rounded-full" style={{ background: PALETTE[i] }} />
               <span className="min-w-0 flex-1 truncate text-muted-foreground">{r.name}</span>
               <strong className="shrink-0 tabular-nums">{calls ? ((r.requests / calls) * 100).toFixed(1) : '0'}%</strong>
