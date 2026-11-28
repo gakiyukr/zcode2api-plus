@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"zcode2api/internal/config"
@@ -69,14 +70,18 @@ func NewService(st *store.Store) *Service {
 // SetNow 注入时钟（测试用）。
 func (s *Service) SetNow(fn func() time.Time) { s.now = fn }
 
-// authHeaders 对齐 quota._auth_headers：额度端点必须携带完整设备信息。
+// authHeaders 對齊官方額度端點：攜帶帳號專屬裝置指紋與計費鏈版本號。
 func authHeaders(acc *model.Account) map[string]string {
+	deviceMid := acc.DeviceMid()
+	if deviceMid == "" {
+		deviceMid = config.DeviceMid()
+	}
 	headers := map[string]string{
 		"Content-Type":        "application/json",
 		"User-Agent":          config.UserAgent,
-		"X-ZCode-App-Version": config.ZcodeClientVersion,
+		"X-ZCode-App-Version": config.ZcodeBillingVersion,
 		"X-Platform":          config.ZcodeClientPlatform,
-		"X-Device-Mid":        config.DeviceMid(),
+		"X-Device-Mid":        deviceMid,
 		"HTTP-Referer":        "https://zcode.z.ai/",
 	}
 	if acc.Mode == "jwt" && acc.JWTToken != nil {
@@ -186,7 +191,7 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 	acc = snap
 
 	query := url.Values{}
-	query.Set("app_version", config.ZcodeClientVersion)
+	query.Set("app_version", config.ZcodeBillingVersion)
 	query.Set("platform", config.ZcodeClientPlatform)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 		strings.TrimRight(config.ZcodeBillingBase, "/")+"/billing/balance?"+query.Encode(), nil)
@@ -237,14 +242,31 @@ func (s *Service) clientFor(acc *model.Account) HTTPClient {
 // eventClient 同一模式）。
 var defaultClient = &http.Client{Timeout: 20 * time.Second}
 
+// isWeakStatus 判斷帳號狀態是否可被自動額度刷新覆寫。
+// disabled、已停用（!Enabled）與已歸檔（ArchivedAt != nil）是管理員強狀態，不可覆寫。
+func isWeakStatus(a *model.Account) bool {
+	if a == nil || a.ArchivedAt != nil || !a.Enabled {
+		return false
+	}
+	switch a.Status {
+	case model.StatusActive, model.StatusExhausted, model.StatusCooling, model.StatusInvalid:
+		return true
+	}
+	return false
+}
+
 // handleBillingResponse 处理计费端点响应：错误分类、快照解析与状态回写。
 func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response) map[string]any {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		msg := fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode)
+		checkedAt := float64(s.now().UnixNano()) / 1e9
 		s.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
-			a.Status = model.StatusInvalid
+			a.LastCheckedAt = &checkedAt
+			if isWeakStatus(a) {
+				a.Status = model.StatusInvalid
+			}
 			a.LastError = &msg
 		})
 		return map[string]any{"error": msg}
@@ -252,7 +274,9 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 	if resp.StatusCode != http.StatusOK {
 		// 上游对重复查询返回 405：已有快照时视为幂等成功（清错误、不重建状态）
 		if resp.StatusCode == http.StatusMethodNotAllowed && len(acc.Quota) > 0 {
+			checkedAt := float64(s.now().UnixNano()) / 1e9
 			s.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+				a.LastCheckedAt = &checkedAt
 				a.LastError = nil
 			})
 			return map[string]any{"cached": true, "reason": "上游额度接口拒绝了重复查询（HTTP 405）"}
@@ -301,30 +325,61 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 	// 真正落库统一放到末尾的 Store.Update 中，避免用陈旧快照覆盖并发状态变更。
 	acc.Plans = plans
 
-	// balance 仅提供当期数值；周期与所属方案需由 entitlement 对应回来
+	// 基準時間：優先採用上游 server_time，缺失時回退本機時間。
+	nowSec := epochSeconds(data["server_time"])
+	if nowSec <= 0 {
+		nowSec = s.now().Unix()
+	}
+
+	// 辨識尚未生效（starts_at > now）與已過期方案：其對應餘額列不得計入當前可用額度，
+	// 避免排程誤判有額度而連續碰壁（對齊 magpie giftOf 的 notStarted / expired 規則）。
+	inactiveEnts := map[string]bool{}
+	inactivePlanKeys := map[string]bool{}
+	activePlanKeys := map[string]bool{}
+	pendingPlans := 0
+
+	// balance 僅提供當期數值；週期與所屬方案需由 entitlement 對應回來
 	entitlements := map[string]map[string]any{}
 	entitlementPlans := map[string]map[string]any{}
 	for _, plan := range acc.Plans {
+		status := strings.ToLower(strings.TrimSpace(stringField(plan, "status")))
+		startsAt := epochSeconds(plan["starts_at"])
+		endsAt := epochSeconds(plan["ends_at"])
+		notStarted := startsAt > nowSec && status != "expired"
+		expired := status == "expired" || (endsAt > 0 && endsAt <= nowSec)
+		if notStarted {
+			pendingPlans++
+		}
+		planKey := planIdentityKey(plan)
+		if planKey != "" {
+			if notStarted || expired {
+				inactivePlanKeys[planKey] = true
+			} else {
+				activePlanKeys[planKey] = true
+			}
+		}
+
 		rawEnts, _ := plan["entitlements"].([]any)
 		for _, raw := range rawEnts {
 			ent, ok := raw.(map[string]any)
 			if !ok {
 				continue
 			}
-			// 键必须是可哈希的：上游把 entitlement_id 回成数组或对象时，
-			// 直接拿它当 map[any] 的键会 panic（hash of unhashable type），
-			// 而本函数跑在无 recover 的 goroutine 里，会终止整个进程。
+			// 鍵必須是可雜湊的字串：避免上游回傳非字串容器造成 panic。
 			entID, ok := ent["entitlement_id"].(string)
 			if !ok || entID == "" {
 				continue
 			}
 			entitlements[entID] = ent
 			entitlementPlans[entID] = plan
+			if notStarted || expired {
+				inactiveEnts[entID] = true
+			}
 		}
 	}
 
-	// 同名模型在多个订阅各自独立一列（每日刷新的体验套餐与限时活动套餐不得混合）；
-	// 仅同一订阅内的重复项目才合并加总。
+	// 同名模型在多個訂閱各自獨立一列（每日刷新的體驗套餐與限時活動套餐不得混合）；
+	// 僅同一訂閱內的重複項目才合併加總。
 	multiPlan := len(acc.Plans) > 1
 	rawBalances, _ := data["balances"].([]any)
 	quotaMap := map[string]map[string]any{}
@@ -333,10 +388,14 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 		if !ok {
 			continue
 		}
-		name := firstNonEmptyString(balance["show_name"], balance["model"], "model")
-		// 与写入端同为 string：上游回非字符串时查不到对应项，退化为无周期信息，
-		// 而不是拿容器类型去查 map 触发 panic。
 		entID, _ := balance["entitlement_id"].(string)
+		if entID != "" && inactiveEnts[entID] {
+			continue
+		}
+		if bKey := planIdentityKey(balance); bKey != "" && inactivePlanKeys[bKey] && !activePlanKeys[bKey] {
+			continue
+		}
+		name := firstNonEmptyString(balance["show_name"], balance["model"], "model")
 		ent := entitlements[entID]
 		plan := entitlementPlans[entID]
 		planName, planIsTrial := "", false
@@ -366,9 +425,34 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 
 	if len(quotaMap) == 0 {
 		msg := "账号未返回可用套餐额度"
+		if pendingPlans > 0 {
+			msg = "套餐尚未生效（待開始）"
+		}
+		checkedAt := float64(s.now().UnixNano()) / 1e9
 		s.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+			a.Plans = plans
+			if len(plans) > 0 {
+				a.Plan = plans[0]
+			} else {
+				a.Plan = map[string]any{}
+			}
 			a.Quota = map[string]map[string]any{}
+			a.ExhaustedModels = []string{}
+			a.LastCheckedAt = &checkedAt
 			a.LastError = &msg
+			// 無可用額度（含待生效、全部過期或無方案）時，僅將 active 或已到期 cooling 轉為 exhausted，
+			// 不得降級覆寫 invalid、未到期 cooling、disabled 或已歸檔強狀態。
+			if a.Enabled && a.ArchivedAt == nil {
+				switch a.Status {
+				case model.StatusActive:
+					a.Status = model.StatusExhausted
+				case model.StatusCooling:
+					if a.CoolingUntil == nil || *a.CoolingUntil <= checkedAt {
+						a.Status = model.StatusExhausted
+						a.CoolingUntil = nil
+					}
+				}
+			}
 		})
 		return map[string]any{"balance": payload, "error": msg}
 	}
@@ -400,24 +484,29 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 			a.Plan = map[string]any{}
 		}
 		a.Quota = quotaMap
+		a.LastCheckedAt = &now
 		a.SyncExhaustedModels()
 
 		if allEmpty {
-			a.Status = model.StatusExhausted
+			if isWeakStatus(a) {
+				a.Status = model.StatusExhausted
+			}
 			msg := "額度已用完"
 			a.LastError = &msg
 			return
 		}
 		// 状态机读的是锁内当前值：并发请求可能刚把账号标成 invalid/cooling，
-		// 用陈旧快照判断会把它们错误地刷回 active。
-		switch a.Status {
-		case model.StatusExhausted, model.StatusInvalid:
-			a.Status = model.StatusActive
-			a.CoolingUntil = nil
-		case model.StatusCooling:
-			if a.CoolingUntil != nil && *a.CoolingUntil <= now {
+		// 用陈旧快照判断会把它们错误地刷回 active；同時不得覆寫 disabled/archived 強狀態。
+		if isWeakStatus(a) {
+			switch a.Status {
+			case model.StatusExhausted, model.StatusInvalid:
 				a.Status = model.StatusActive
 				a.CoolingUntil = nil
+			case model.StatusCooling:
+				if a.CoolingUntil != nil && *a.CoolingUntil <= now {
+					a.Status = model.StatusActive
+					a.CoolingUntil = nil
+				}
 			}
 		}
 		if a.Status != model.StatusCooling {
@@ -436,7 +525,7 @@ func (s *Service) FetchQuota(acc *model.Account) map[string]any {
 	if call, ok := s.inflight[acc.ID]; ok {
 		s.mu.Unlock()
 		<-call.done
-		return call.result
+		return maps.Clone(call.result)
 	}
 	if entry, ok := s.cache[acc.ID]; ok {
 		if s.now().Sub(entry.at) < QuotaCacheTTL {
@@ -480,7 +569,7 @@ func (s *Service) FetchQuota(acc *model.Account) map[string]any {
 		result = s.fetchQuotaOnce(acc)
 	}()
 	<-call.done
-	return call.result
+	return maps.Clone(call.result)
 }
 
 // pruneCache 清理已删除账号的额度缓存，避免缓存无界增长（对齐 _prune_quota_cache）。
@@ -539,10 +628,11 @@ func (s *Service) RefreshAccounts(accounts []*model.Account) map[string]any {
 
 // Monitor 后台周期性刷新可管理账号的额度，实现实时用量监控。
 type Monitor struct {
-	svc   *Service
-	stop  chan struct{}
-	done  chan struct{}
-	start sync.Once
+	svc     *Service
+	stop    chan struct{}
+	done    chan struct{}
+	start   sync.Once
+	started atomic.Bool
 }
 
 // NewMonitor 创建后台监控（调用 Start 启动）。
@@ -552,7 +642,10 @@ func (s *Service) NewMonitor() *Monitor {
 
 // Start 启动后台循环；重复调用无操作。
 func (m *Monitor) Start() {
-	m.start.Do(func() { go m.loop() })
+	m.start.Do(func() {
+		m.started.Store(true)
+		go m.loop()
+	})
 }
 
 // loop 对齐 QuotaMonitor._loop：启动先等 5s 避让服务启动；刷新间隔实时读取
@@ -608,6 +701,9 @@ func (m *Monitor) loop() {
 
 // Stop 停止后台循环并等待 goroutine 退出（对齐 monitor.stop 的 gather 语义）。
 func (m *Monitor) Stop() {
+	if !m.started.Load() {
+		return // 從未啟動，無需等待
+	}
 	select {
 	case <-m.stop:
 	default:
@@ -639,4 +735,39 @@ func mapValueOrNil(m map[string]any, key string) any {
 		return nil
 	}
 	return m[key]
+}
+
+// epochSeconds 解析 Unix 時間戳（同時相容秒數與毫秒數）；無效值回傳 0。
+func epochSeconds(v any) int64 {
+	n, ok := asNumber(v)
+	if !ok || n <= 0 {
+		return 0
+	}
+	if n > 1e11 {
+		n = n / 1000
+	}
+	return int64(n)
+}
+
+func stringField(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	s, _ := m[key].(string)
+	return s
+}
+
+// planIdentityKey 構造方案識別鍵（優先 user_plan_id，否則 plan_id），
+// 供 balances 與 plans 對應過濾未生效／已過期方案。
+func planIdentityKey(m map[string]any) string {
+	if m == nil {
+		return ""
+	}
+	if upid := strings.TrimSpace(stringField(m, "user_plan_id")); upid != "" {
+		return "up:" + upid
+	}
+	if pid := strings.TrimSpace(stringField(m, "plan_id")); pid != "" {
+		return "p:" + pid
+	}
+	return ""
 }

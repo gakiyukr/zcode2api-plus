@@ -510,3 +510,187 @@ func TestRefreshAccountsIsolatesPanic(t *testing.T) {
 		t.Fatal("RefreshAccounts 未在预期时间内返回")
 	}
 }
+
+func TestFutureStartsAtAndExpiredPlansFiltered(t *testing.T) {
+	svc, st, billing := setup(t)
+	acc, err := st.AddAccount(model.ProviderZai, "future-and-live", "header.payload.sig")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// server_time = 2000：一個生效中（starts_at=1000）、一個未來未生效（starts_at=3000）、一個已過期（ends_at=1500）
+	billing.body = `{"code":0,"data":{
+		"server_time":2000,
+		"plans":[
+			{"user_plan_id":"up-live","plan_id":"p-live","name":"Live","status":"active","starts_at":1000,"ends_at":5000,
+			 "entitlements":[{"entitlement_id":"e-live","show_name":"GLM-5.4","period":"daily"}]},
+			{"user_plan_id":"up-future","plan_id":"p-future","name":"Future","status":"active","starts_at":3000,"ends_at":9000,
+			 "entitlements":[{"entitlement_id":"e-future","show_name":"GLM-5.3-Flash","period":"one_time"}]},
+			{"user_plan_id":"up-exp","plan_id":"p-exp","name":"Expired","status":"active","starts_at":100,"ends_at":1500,
+			 "entitlements":[{"entitlement_id":"e-exp","show_name":"GLM-5.2","period":"one_time"}]}
+		],
+		"balances":[
+			{"user_plan_id":"up-live","entitlement_id":"e-live","show_name":"GLM-5.4","total_units":100,"used_units":10,"remaining_units":90},
+			{"user_plan_id":"up-future","entitlement_id":"e-future","show_name":"GLM-5.3-Flash","total_units":100,"used_units":0,"remaining_units":100},
+			{"user_plan_id":"up-exp","entitlement_id":"e-exp","show_name":"GLM-5.2","total_units":100,"used_units":0,"remaining_units":100}
+		]
+	}}`
+
+	res := svc.FetchQuota(acc)
+	if _, hasErr := res["error"]; hasErr {
+		t.Fatalf("有生效方案不應報錯: %v", res)
+	}
+	got := st.FindAny(acc.ID)
+	if len(got.Quota) != 1 {
+		t.Fatalf("僅應保留生效方案額度，應過濾未來與過期方案: %v", got.Quota)
+	}
+	if got.ModelAvailability("GLM-5.4") != "available" {
+		t.Fatalf("生效中的 GLM-5.4 應可用: %s", got.ModelAvailability("GLM-5.4"))
+	}
+	if got.ModelAvailability("GLM-5.3-Flash") != "absent" {
+		t.Fatalf("未生效方案的 GLM-5.3-Flash 不應算可用: %s", got.ModelAvailability("GLM-5.3-Flash"))
+	}
+
+	// 僅有未來未生效套餐時，應清空額度並標示尚未生效
+	acc2, _ := st.AddAccount(model.ProviderZai, "only-future", "h2.p2.s2")
+	billing.body = `{"code":0,"data":{
+		"server_time":2000,
+		"plans":[{"user_plan_id":"up-f","plan_id":"p-f","name":"Pending","status":"active","starts_at":3000,
+			"entitlements":[{"entitlement_id":"e-f","show_name":"GLM-5.4","period":"one_time"}]}],
+		"balances":[{"user_plan_id":"up-f","entitlement_id":"e-f","show_name":"GLM-5.4","total_units":100,"remaining_units":100}]
+	}}`
+	res2 := svc.FetchQuota(acc2)
+	if msg, _ := res2["error"].(string); !strings.Contains(msg, "尚未生效") {
+		t.Fatalf("僅有待開始方案應回報尚未生效: %v", res2)
+	}
+	got2 := st.FindAny(acc2.ID)
+	if len(got2.Quota) != 0 || got2.Status != model.StatusExhausted {
+		t.Fatalf("待開始方案帳號不應被排程消耗: status=%s quota=%v", got2.Status, got2.Quota)
+	}
+}
+
+func TestFetchQuota_WeakStatusGuard(t *testing.T) {
+	svc, st, billing := setup(t)
+	now := time.Unix(1750000000, 0)
+	svc.SetNow(func() time.Time { return now })
+
+	emptyPayload := `{"code":0,"data":{"plans":[{"plan_id":"p1","entitlements":[{"entitlement_id":"e1","show_name":"GLM-5.4","period":"daily"}]}],"balances":[{"entitlement_id":"e1","show_name":"GLM-5.4","total_units":100,"used_units":100,"remaining_units":0}]}}`
+	availPayload := `{"code":0,"data":{"plans":[{"plan_id":"p1","entitlements":[{"entitlement_id":"e1","show_name":"GLM-5.4","period":"daily"}]}],"balances":[{"entitlement_id":"e1","show_name":"GLM-5.4","total_units":100,"used_units":10,"remaining_units":90}]}}`
+
+	// 1. active 額度用完 → exhausted，且更新 LastCheckedAt
+	a1, _ := st.AddAccount(model.ProviderZai, "active-empty", "h1.p1.s1")
+	billing.body = emptyPayload
+	svc.FetchQuota(a1)
+	g1 := st.FindAny(a1.ID)
+	if g1.Status != model.StatusExhausted {
+		t.Fatalf("active 帳號額度用完應轉 exhausted，實際: %s", g1.Status)
+	}
+	if g1.LastCheckedAt == nil || *g1.LastCheckedAt < float64(now.Unix()-2) {
+		t.Fatalf("刷新後應更新 LastCheckedAt，實際: %v", g1.LastCheckedAt)
+	}
+
+	// 2. disabled 帳號額度用完 → 不改狀態
+	a2, _ := st.AddAccount(model.ProviderZai, "disabled-empty", "h2.p2.s2")
+	_, _ = st.SetEnabled(a2.Provider, a2.ID, false)
+	billing.body = emptyPayload
+	svc.FetchQuota(a2)
+	if g2 := st.FindAny(a2.ID); g2.Status != model.StatusDisabled {
+		t.Fatalf("disabled 帳號額度用完不得覆寫狀態，實際: %s", g2.Status)
+	}
+
+	// 3. archived 帳號額度用完與有額度 → 皆不改狀態
+	a3, _ := st.AddAccount(model.ProviderZai, "archived-acc", "h3.p3.s3")
+	_, _ = st.SetArchived(a3.Provider, a3.ID, true)
+	billing.body = emptyPayload
+	svc.FetchQuota(a3)
+	if g3 := st.FindAny(a3.ID); g3.Status != model.StatusDisabled || g3.ArchivedAt == nil {
+		t.Fatalf("archived 帳號額度用完不得覆寫狀態: status=%s archived=%v", g3.Status, g3.ArchivedAt)
+	}
+
+	// 4. invalid 帳號拉到有效額度 → 恢復 active 且更新 LastCheckedAt
+	a4, _ := st.AddAccount(model.ProviderZai, "invalid-recover", "h4.p4.s4")
+	_ = st.Update(a4.Provider, a4.ID, func(a *model.Account) { a.Status = model.StatusInvalid })
+	billing.body = availPayload
+	svc.FetchQuota(a4)
+	g4 := st.FindAny(a4.ID)
+	if g4.Status != model.StatusActive {
+		t.Fatalf("invalid 帳號拉到有效額度應恢復 active，實際: %s", g4.Status)
+	}
+	if g4.LastCheckedAt == nil || *g4.LastCheckedAt < float64(now.Unix()-2) {
+		t.Fatalf("有額度刷新成功後必須更新 LastCheckedAt，實際: %v", g4.LastCheckedAt)
+	}
+
+	// 5. disabled 帳號拉到有效額度 → 不改狀態
+	a5, _ := st.AddAccount(model.ProviderZai, "disabled-avail", "h5.p5.s5")
+	_, _ = st.SetEnabled(a5.Provider, a5.ID, false)
+	billing.body = availPayload
+	svc.FetchQuota(a5)
+	if g5 := st.FindAny(a5.ID); g5.Status != model.StatusDisabled {
+		t.Fatalf("disabled 帳號拉到有效額度不得覆寫為 active，實際: %s", g5.Status)
+	}
+
+	// 6. 未呼叫 Start 直接 Stop 不得阻塞
+	mon := svc.NewMonitor()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mon.Stop()
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("quota.Monitor 未啟動就 Stop 不應阻塞")
+	}
+}
+
+func TestFetchQuota_EmptyQuotaAndExpiredPlans(t *testing.T) {
+	svc, st, billing := setup(t)
+	now := time.Now()
+	svc.SetNow(func() time.Time { return now })
+
+	expiredOnlyPayload := `{"code":0,"data":{"server_time":2000,"plans":[{"plan_id":"p_exp","status":"expired","ends_at":1500,"entitlements":[{"entitlement_id":"e1","show_name":"GLM-5.4"}]}],"balances":[{"entitlement_id":"e1","show_name":"GLM-5.4","total_units":100,"used_units":10,"remaining_units":90}]}}`
+
+	// 1. active 帳號全部套餐皆過期（len(quotaMap)==0 且 pendingPlans==0）→ 轉 exhausted 並清空 ExhaustedModels
+	a1, _ := st.AddAccount(model.ProviderZai, "all-expired", "h1.p1.s1")
+	_ = st.Update(a1.Provider, a1.ID, func(a *model.Account) {
+		a.ExhaustedModels = []string{"glm-5.4"}
+	})
+	billing.body = expiredOnlyPayload
+	svc.FetchQuota(a1)
+	g1 := st.FindAny(a1.ID)
+	if g1.Status != model.StatusExhausted {
+		t.Fatalf("全過期空額度帳號應轉 exhausted，實際: %s", g1.Status)
+	}
+	if len(g1.ExhaustedModels) != 0 {
+		t.Fatalf("空額度分支應清空 ExhaustedModels，實際: %v", g1.ExhaustedModels)
+	}
+
+	// 2. invalid 與未到期 cooling 帳號遇空額度不得降級改寫為 exhausted
+	a2, _ := st.AddAccount(model.ProviderZai, "invalid-keep", "h2.p2.s2")
+	_ = st.Update(a2.Provider, a2.ID, func(a *model.Account) { a.Status = model.StatusInvalid })
+	svc.FetchQuota(a2)
+	if g2 := st.FindAny(a2.ID); g2.Status != model.StatusInvalid {
+		t.Fatalf("invalid 遇空額度不得降級為 exhausted，實際: %s", g2.Status)
+	}
+
+	a3, _ := st.AddAccount(model.ProviderZai, "cooling-keep", "h3.p3.s3")
+	future := float64(now.Add(10 * time.Minute).Unix())
+	_ = st.Update(a3.Provider, a3.ID, func(a *model.Account) {
+		a.Status = model.StatusCooling
+		a.CoolingUntil = &future
+	})
+	svc.FetchQuota(a3)
+	if g3 := st.FindAny(a3.ID); g3.Status != model.StatusCooling {
+		t.Fatalf("未到期 cooling 遇空額度不得降級為 exhausted，實際: %s", g3.Status)
+	}
+
+	// 3. Enabled=false 即使 Status 暫非 disabled，isWeakStatus 也必須回傳 false 保護之
+	a4, _ := st.AddAccount(model.ProviderZai, "enabled-false", "h4.p4.s4")
+	_ = st.Update(a4.Provider, a4.ID, func(a *model.Account) {
+		a.Enabled = false
+		a.Status = model.StatusActive
+	})
+	svc.FetchQuota(a4)
+	if g4 := st.FindAny(a4.ID); g4.Status != model.StatusActive {
+		t.Fatalf("!Enabled 帳號不得被額度刷新覆寫狀態，實際: %s", g4.Status)
+	}
+}
