@@ -246,12 +246,17 @@ func (s *Store) load() error {
 
 // ── 持久化（调用方须持有 s.mu）──────────────────────────────────────────────
 
-func (s *Store) persistAccountLocked(acc *model.Account) error {
+// sqlExecer 統一 *sql.DB 與 *sql.Tx 的寫入執行介面，供單筆與跨表交易複用。
+type sqlExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func persistAccountExec(ex sqlExecer, acc *model.Account) error {
 	data, err := util.MarshalJSON(acc)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(
+	_, err = ex.Exec(
 		fmt.Sprintf(`INSERT OR REPLACE INTO %s
 			(id, provider, name, mode, status, enabled, created_at, data)
 			VALUES (?,?,?,?,?,?,?,?)`, accountsTable),
@@ -259,19 +264,26 @@ func (s *Store) persistAccountLocked(acc *model.Account) error {
 	return err
 }
 
+func (s *Store) persistAccountLocked(acc *model.Account) error {
+	return persistAccountExec(s.db, acc)
+}
+
 func (s *Store) deleteAccountLocked(id string) error {
 	_, err := s.db.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", accountsTable), id)
 	return err
 }
 
-func (s *Store) setMeta(key, value string) error {
-	_, err := s.db.Exec(
+func setMetaExec(ex sqlExecer, key, value string) error {
+	_, err := ex.Exec(
 		fmt.Sprintf("INSERT OR REPLACE INTO %s (key, value) VALUES (?, ?)", metaTable), key, value)
 	return err
 }
 
-// marshalJSON 与 Python json.dumps(ensure_ascii=False) 对齐：不转义 HTML 字符。
+func (s *Store) setMeta(key, value string) error {
+	return setMetaExec(s.db, key, value)
+}
 
+// marshalJSON 与 Python json.dumps(ensure_ascii=False) 对齐：不转义 HTML 字符。
 
 // ── 设置 ────────────────────────────────────────────────────────────────────
 
@@ -416,9 +428,14 @@ func (s *Store) saveProxyProfilesLocked(profiles []ProxyProfile) error {
 	if err != nil {
 		return err
 	}
-	s.settings["proxy_profiles"] = string(data)
+	raw := string(data)
+	// 先落庫再更新記憶體與快照，失敗時不污染記憶體狀態
+	if err := s.setMeta("proxy_profiles", raw); err != nil {
+		return err
+	}
+	s.settings["proxy_profiles"] = raw
 	s.publishSettings()
-	return s.setMeta("proxy_profiles", string(data))
+	return nil
 }
 
 // AddProxyProfile 新增命名代理出口。
@@ -434,13 +451,22 @@ func (s *Store) AddProxyProfile(name, url string, enabled bool) (ProxyProfile, e
 	defer s.mu.Unlock()
 	profiles := s.listProxyProfilesLocked()
 	name = strings.TrimSpace(name)
-	if name == "" {
-		name = fmt.Sprintf("代理-%d", len(profiles)+1)
-	}
+	existingNames := make(map[string]bool, len(profiles))
 	for _, p := range profiles {
-		if p.Name == name {
-			return ProxyProfile{}, errors.New("代理名稱已存在")
+		existingNames[p.Name] = true
+	}
+	if name == "" {
+		// 自動命名避開既有同名項（例如刪除「代理-1」後不可再撞名「代理-2」）
+		for seq := len(profiles) + 1; ; seq++ {
+			candidate := fmt.Sprintf("代理-%d", seq)
+			if !existingNames[candidate] {
+				name = candidate
+				break
+			}
 		}
+	}
+	if existingNames[name] {
+		return ProxyProfile{}, errors.New("代理名稱已存在")
 	}
 	profile := ProxyProfile{ID: "proxy-" + util.RandomHex(4), Name: name, URL: *normalized, Enabled: enabled}
 	profiles = append(profiles, profile)
@@ -456,6 +482,12 @@ func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool) (P
 	if normalized == nil {
 		return ProxyProfile{}, errors.New("代理 URL 不能為空")
 	}
+	var evictURL string
+	defer func() {
+		if evictURL != "" {
+			proxy.EvictTransport(evictURL)
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	profiles := s.listProxyProfilesLocked()
@@ -478,33 +510,70 @@ func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool) (P
 			return ProxyProfile{}, errors.New("代理名稱已存在")
 		}
 	}
+	oldURL := profiles[target].URL
 	profiles[target].Name = name
 	profiles[target].URL = *normalized
 	profiles[target].Enabled = enabled
-	if err := s.saveProxyProfilesLocked(profiles); err != nil {
+
+	// 代理表與關聯帳號包入單一 SQLite 交易：提交成功後再統一套用記憶體狀態
+	data, err := util.MarshalJSON(profiles)
+	if err != nil {
 		return ProxyProfile{}, err
 	}
+	raw := string(data)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ProxyProfile{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := setMetaExec(tx, "proxy_profiles", raw); err != nil {
+		return ProxyProfile{}, err
+	}
+	var affected []*model.Account
 	for _, acc := range s.allAccountsLocked() {
 		if acc.ProxyID != nil && *acc.ProxyID == profileID {
-			acc.ProxyURL = normalized
-			if err := s.persistAccountLocked(acc); err != nil {
+			clone := acc.Clone()
+			u := *normalized
+			clone.ProxyURL = &u
+			if err := persistAccountExec(tx, clone); err != nil {
 				return ProxyProfile{}, err
 			}
+			affected = append(affected, acc)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ProxyProfile{}, err
+	}
+	s.settings["proxy_profiles"] = raw
+	s.publishSettings()
+	for _, acc := range affected {
+		u := *normalized
+		acc.ProxyURL = &u
+	}
+	if oldURL != *normalized {
+		evictURL = oldURL
 	}
 	return profiles[target], nil
 }
 
 // DeleteProxyProfile 删除代理线路并解除账号指派；不存在返回 false。
 func (s *Store) DeleteProxyProfile(profileID string) (bool, error) {
+	var evictURL string
+	defer func() {
+		if evictURL != "" {
+			proxy.EvictTransport(evictURL)
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	profiles := s.listProxyProfilesLocked()
 	remaining := make([]ProxyProfile, 0, len(profiles))
 	removed := false
+	removedURL := ""
 	for _, p := range profiles {
 		if p.ID == profileID {
 			removed = true
+			removedURL = p.URL
 			continue
 		}
 		remaining = append(remaining, p)
@@ -512,18 +581,43 @@ func (s *Store) DeleteProxyProfile(profileID string) (bool, error) {
 	if !removed {
 		return false, nil
 	}
-	if err := s.saveProxyProfilesLocked(remaining); err != nil {
+
+	// 代理表與解除帳號指派包入單一 SQLite 交易：提交成功後再統一修改記憶體
+	data, err := util.MarshalJSON(remaining)
+	if err != nil {
 		return false, err
 	}
+	raw := string(data)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := setMetaExec(tx, "proxy_profiles", raw); err != nil {
+		return false, err
+	}
+	var affected []*model.Account
 	for _, acc := range s.allAccountsLocked() {
 		if acc.ProxyID != nil && *acc.ProxyID == profileID {
-			acc.ProxyID = nil
-			acc.ProxyURL = nil
-			if err := s.persistAccountLocked(acc); err != nil {
-				return true, err
+			clone := acc.Clone()
+			clone.ProxyID = nil
+			clone.ProxyURL = nil
+			if err := persistAccountExec(tx, clone); err != nil {
+				return false, err
 			}
+			affected = append(affected, acc)
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	s.settings["proxy_profiles"] = raw
+	s.publishSettings()
+	for _, acc := range affected {
+		acc.ProxyID = nil
+		acc.ProxyURL = nil
+	}
+	evictURL = removedURL
 	return true, nil
 }
 
@@ -535,8 +629,9 @@ func (s *Store) AssignProxyProfile(accountID, profileID string) (bool, error) {
 	if acc == nil {
 		return false, nil
 	}
-	var profileURL *string
+	clone := acc.Clone()
 	if profileID != "" {
+		var profileURL *string
 		found := false
 		for _, p := range s.listProxyProfilesLocked() {
 			if p.ID == profileID {
@@ -549,13 +644,19 @@ func (s *Store) AssignProxyProfile(accountID, profileID string) (bool, error) {
 		if !found {
 			return false, ErrProxyNotFound
 		}
-		acc.ProxyID = &profileID
-		acc.ProxyURL = profileURL
+		pid := profileID
+		clone.ProxyID = &pid
+		clone.ProxyURL = profileURL
 	} else {
-		acc.ProxyID = nil
-		acc.ProxyURL = nil
+		clone.ProxyID = nil
+		clone.ProxyURL = nil
 	}
-	return true, s.persistAccountLocked(acc)
+	// 先在副本上落庫成功再回寫記憶體，避免失敗造成記憶體與 DB 不一致
+	if err := s.persistAccountLocked(clone); err != nil {
+		return false, err
+	}
+	*acc = *clone
+	return true, nil
 }
 
 // ── 账号读取 ────────────────────────────────────────────────────────────────
@@ -733,15 +834,17 @@ func (s *Store) SetEnabled(provider, idOrName string, enabled bool) (bool, error
 	if acc == nil {
 		return false, nil
 	}
-	acc.Enabled = enabled
+	clone := acc.Clone()
+	clone.Enabled = enabled
 	if !enabled {
-		acc.Status = model.StatusDisabled
-	} else if acc.Status == model.StatusDisabled {
-		acc.Status = model.StatusActive
+		clone.Status = model.StatusDisabled
+	} else if clone.Status == model.StatusDisabled {
+		clone.Status = model.StatusActive
 	}
-	if err := s.persistAccountLocked(acc); err != nil {
+	if err := s.persistAccountLocked(clone); err != nil {
 		return false, err
 	}
+	*acc = *clone
 	return true, nil
 }
 
@@ -754,38 +857,55 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 	if acc == nil {
 		return false, nil
 	}
+	clone := acc.Clone()
 	if archived {
 		now := float64(time.Now().UnixNano()) / 1e9
-		acc.ArchivedAt = &now
-		acc.Enabled = false
-		acc.Status = model.StatusDisabled
+		clone.ArchivedAt = &now
+		clone.Enabled = false
+		clone.Status = model.StatusDisabled
 	} else {
-		acc.ArchivedAt = nil
+		clone.ArchivedAt = nil
 	}
-	if err := s.persistAccountLocked(acc); err != nil {
+	if err := s.persistAccountLocked(clone); err != nil {
 		return false, err
 	}
+	*acc = *clone
 	return true, nil
 }
 
 // ── 轮询选择 ────────────────────────────────────────────────────────────────
 
-// Select 按模型额度与 round-robin 选择账号。
-// 有该模型余额的账号优先；尚无快照无法判断者仅作后备；
-// 快照中未提供此模型（absent）的账号一律排除。
-// skipIDs 保证同一次请求不会重复尝试已失败的账号。
-//
-// 返回的是**深拷贝**：调用方（网关引擎、async 池）会在锁外长时间持有它，
-// 若直接返回 Store 内部对象，其字段修改将与 Select 自身的加锁读取竞争
-// （Status 为字符串、CoolingUntil 为指针，撕裂读可致误判或崩溃）。
-// 状态修改须经 Store.Update，不要改这个副本。
+// SelectOptions 智慧選號參數：支援會話親和性偏好、在飛負載感知與自訂過濾。
+type SelectOptions struct {
+	Now         time.Time                     // 零值取 time.Now()，內部統一 .Round(0)
+	PreferredID string                        // Sticky Session 命中之偏好帳號 ID
+	InFlight    func(accountID string) int    // 回傳帳號當前在飛請求數；nil 時視為 0
+	Filter      func(acc *model.Account) bool // 額外硬過濾（如 async 僅選 jwt）
+	CanStick    func(acc *model.Account) bool // 偏好帳號健康度檢查（如未滿載且出口未熔斷）
+}
+
+// urgentPromoHorizon 臨期一次性優惠優先視窗：6 小時內到期者優先消耗，避免浪費。
+const urgentPromoHorizon = 6 * time.Hour
+
+// Select 按模型额度与 round-robin 选择账号（無參數時委派 SelectSmart 維持向後相容）。
 func (s *Store) Select(provider string, skipIDs map[string]bool, modelName string) *model.Account {
+	return s.SelectSmart(provider, skipIDs, modelName, SelectOptions{})
+}
+
+// SelectSmart 結合會話親和性、臨期優惠分層與 Least-Inflight（平手輪詢）選擇帳號。
+// 返回深拷貝，避免呼叫方於鎖外與 Store 寫入競爭。
+func (s *Store) SelectSmart(provider string, skipIDs map[string]bool, modelName string, opts SelectOptions) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now()
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.Round(0)
+
 	var base []*model.Account
 	for _, a := range s.accounts[provider] {
-		if a.IsSelectable(now) && !skipIDs[a.ID] {
+		if a.IsSelectable(now) && !skipIDs[a.ID] && (opts.Filter == nil || opts.Filter(a)) {
 			base = append(base, a)
 		}
 	}
@@ -809,24 +929,72 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 	if len(pool) == 0 {
 		return nil
 	}
-	// 持有未耗尽一次性优惠（period 含 one_time 且 remaining>0）的账号优先：
-	// 优惠额度不用会过期，每日体验额度次日刷新；优惠组耗尽后自然回落全池轮询。
-	var promo, regular []*model.Account
-	for _, a := range pool {
-		if hasPromoQuota(a) {
-			promo = append(promo, a)
-		} else {
-			regular = append(regular, a)
+
+	// Sticky Session 偏好優先命中：健康且未滿載直接回傳，不推進輪詢游標
+	if opts.PreferredID != "" {
+		for _, a := range pool {
+			if a.ID == opts.PreferredID {
+				if opts.CanStick == nil || opts.CanStick(a) {
+					return a.Clone()
+				}
+				break
+			}
 		}
 	}
-	if len(promo) > 0 {
+
+	// 三級優惠額度分層：6h 內臨期一次性優惠 → 一般未過期一次性優惠 → 常規帳號
+	var urgentPromo, promo []*model.Account
+	urgentExp := map[string]time.Time{}
+	for _, a := range pool {
+		hasPromo, isUrgent, earliest := inspectPromoQuota(a, modelName, now)
+		if isUrgent {
+			urgentPromo = append(urgentPromo, a)
+			urgentExp[a.ID] = earliest
+		} else if hasPromo {
+			promo = append(promo, a)
+		}
+	}
+	isUrgentPool := false
+	if len(urgentPromo) > 0 {
+		pool = urgentPromo
+		isUrgentPool = true
+	} else if len(promo) > 0 {
 		pool = promo
 	}
+
 	key := provider + ":" + orStar(modelName)
-	idx := s.rotation[key] % len(pool)
-	acc := pool[idx]
-	s.rotation[key] = (idx + 1) % len(pool)
-	return acc.Clone()
+	startIdx := s.rotation[key] % len(pool)
+	chosenIdx := startIdx
+	if opts.InFlight != nil || isUrgentPool {
+		inFlightOf := func(id string) int {
+			if opts.InFlight == nil {
+				return 0
+			}
+			return opts.InFlight(id)
+		}
+		bestInFlight := inFlightOf(pool[chosenIdx].ID)
+		bestExp := urgentExp[pool[chosenIdx].ID]
+		for offset := 1; offset < len(pool); offset++ {
+			idx := (startIdx + offset) % len(pool)
+			cand := pool[idx]
+			cf := inFlightOf(cand.ID)
+			if cf < bestInFlight {
+				chosenIdx = idx
+				bestInFlight = cf
+				bestExp = urgentExp[cand.ID]
+				continue
+			}
+			if isUrgentPool && cf == bestInFlight {
+				ce := urgentExp[cand.ID]
+				if !ce.IsZero() && (bestExp.IsZero() || bestExp.Sub(ce) > time.Minute) {
+					chosenIdx = idx
+					bestExp = ce
+				}
+			}
+		}
+	}
+	s.rotation[key] = (chosenIdx + 1) % len(pool)
+	return pool[chosenIdx].Clone()
 }
 
 func orStar(modelName string) string {
@@ -836,19 +1004,102 @@ func orStar(modelName string) string {
 	return modelName
 }
 
-// hasPromoQuota 账号额度快照中是否存在未耗尽的一次性优惠额度。
-// 快照缺 remaining 视为未知（不参与优先判定），仅明确 remaining>0 才算优惠在握。
-func hasPromoQuota(a *model.Account) bool {
-	for _, q := range a.Quota {
+// hasPromoQuota 判斷帳號在指定目標模型上是否存在未耗盡且未過期的一次性優惠額度。
+func hasPromoQuota(a *model.Account, modelName string) bool {
+	has, _, _ := inspectPromoQuota(a, modelName, time.Now().Round(0))
+	return has
+}
+
+// inspectPromoQuota 掃描帳號在目標模型上的一次性優惠額度：
+// 排除明確已過期的條目；若存在 6 小時內到期條目則標記 isUrgent=true 並回傳最早到期時刻。
+func inspectPromoQuota(a *model.Account, modelName string, now time.Time) (hasPromo bool, isUrgent bool, earliest time.Time) {
+	target := model.NormalizeModelName(modelName)
+	for key, q := range a.Quota {
+		qModel := ""
+		if m, ok := q["model"].(string); ok && m != "" {
+			qModel = m
+		} else {
+			qModel = key
+		}
+		if target != "" && model.NormalizeModelName(qModel) != target {
+			continue
+		}
 		period, _ := q["period"].(string)
 		if !strings.Contains(period, "one_time") {
 			continue
 		}
-		if v, ok := asNumber(q["remaining"]); ok && v > 0 {
-			return true
+		if v, ok := asNumber(q["remaining"]); !ok || v <= 0 {
+			continue
+		}
+		if exp, ok := parseQuotaExpiresAt(q["expires_at"]); ok {
+			if !now.Before(exp) {
+				// 明確已過期，不計入有效優惠
+				continue
+			}
+			hasPromo = true
+			if exp.Sub(now) <= urgentPromoHorizon {
+				isUrgent = true
+				if earliest.IsZero() || exp.Before(earliest) {
+					earliest = exp
+				}
+			}
+			continue
+		}
+		hasPromo = true
+	}
+	return hasPromo, isUrgent, earliest
+}
+
+// parseQuotaExpiresAt 寬鬆解析額度快照中的 expires_at（支援 RFC3339、常見日期時間字串及秒/毫秒數值）。
+func parseQuotaExpiresAt(raw any) (time.Time, bool) {
+	if raw == nil {
+		return time.Time{}, false
+	}
+	switch v := raw.(type) {
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return time.Time{}, false
+		}
+		for _, layout := range []string{
+			time.RFC3339Nano,
+			time.RFC3339,
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05",
+		} {
+			if t, err := time.Parse(layout, s); err == nil {
+				return t.Round(0), true
+			}
+		}
+		if num, err := strconv.ParseFloat(s, 64); err == nil && num > 0 {
+			return epochToTime(num), true
+		}
+	case float64:
+		if v > 0 {
+			return epochToTime(v), true
+		}
+	case int64:
+		if v > 0 {
+			return epochToTime(float64(v)), true
+		}
+	case int:
+		if v > 0 {
+			return epochToTime(float64(v)), true
 		}
 	}
-	return false
+	return time.Time{}, false
+}
+
+func epochToTime(num float64) time.Time {
+	// 閾值 1e11 對齊後端與前端：大於 1e11 視為毫秒 epoch，否則視為秒 epoch
+	if num > 1e11 {
+		sec := int64(num / 1000)
+		nsec := int64((num - float64(sec)*1000) * 1e6)
+		return time.Unix(sec, nsec).Round(0)
+	}
+	sec := int64(num)
+	nsec := int64((num - float64(sec)) * 1e9)
+	return time.Unix(sec, nsec).Round(0)
 }
 
 func asNumber(v any) (float64, bool) {
@@ -951,10 +1202,6 @@ func (s *Store) ImportAccounts(payload ImportPayload) (int, error) {
 }
 
 // ── 内部工具 ────────────────────────────────────────────────────────────────
-
-
-
-
 
 func boolToInt(b bool) int {
 	if b {

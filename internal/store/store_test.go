@@ -636,3 +636,147 @@ func TestGetSettingDoesNotBlockOnStoreLock(t *testing.T) {
 		t.Fatalf("读取结果不符: %q %v", got, ok)
 	}
 }
+
+func TestHasPromoQuota_FiltersModel(t *testing.T) {
+	acc := &model.Account{
+		Quota: map[string]map[string]any{
+			"model-A": {"model": "model-A", "period": "one_time", "remaining": float64(50)},
+			"model-B": {"model": "model-B", "period": "daily", "remaining": float64(100)},
+			"model-C": {"model": "model-C", "period": "one_time", "remaining": float64(0)},
+		},
+	}
+
+	if !hasPromoQuota(acc, "model-A") {
+		t.Fatal("model-A 具未耗盡 one_time 額度應為 true")
+	}
+	if !hasPromoQuota(acc, "model_a") {
+		t.Fatal("模型名稱正規化後 model_a 應匹配 model-A")
+	}
+	if hasPromoQuota(acc, "model-B") {
+		t.Fatal("查詢 model-B 時不應被 model-A 的促銷額度誤判為 true")
+	}
+	if hasPromoQuota(acc, "model-C") {
+		t.Fatal("remaining=0 的促銷額度不應為 true")
+	}
+	if !hasPromoQuota(acc, "") {
+		t.Fatal("空模型名稱通配時應回傳 true")
+	}
+}
+
+func TestSaveProxyProfilesLocked_DBFirstThenMemory(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "acc-db-fail", "h.p.s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.AddProxyProfile("p1", "http://127.0.0.1:8080", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.AssignProxyProfile(acc.ID, p.ID); !ok || err != nil {
+		t.Fatalf("初始指派失敗: %v %v", ok, err)
+	}
+
+	// 關閉底層 DB 模擬寫入失敗：代理與帳號的記憶體狀態均不得被污染
+	_ = s.db.Close()
+
+	if _, err := s.AddProxyProfile("p2", "http://127.0.0.1:8081", true); err == nil {
+		t.Fatal("DB 關閉後 AddProxyProfile 應回錯")
+	}
+	if got := s.ListProxyProfiles(); len(got) != 1 || got[0].Name != "p1" {
+		t.Fatalf("落庫失敗不得污染記憶體中的 proxy_profiles: %+v", got)
+	}
+	if _, err := s.UpdateProxyProfile(p.ID, "p1-new", "http://127.0.0.1:9999", true); err == nil {
+		t.Fatal("DB 關閉後 UpdateProxyProfile 應回錯")
+	}
+	if got := s.FindAny(acc.ID); got.ProxyURL == nil || *got.ProxyURL != "http://127.0.0.1:8080" {
+		t.Fatalf("UpdateProxyProfile 失敗不得修改記憶體帳號 ProxyURL: %+v", got.ProxyURL)
+	}
+	if _, err := s.SetEnabled(acc.Provider, acc.ID, false); err == nil {
+		t.Fatal("DB 關閉後 SetEnabled 應回錯")
+	}
+	if got := s.FindAny(acc.ID); !got.Enabled || got.Status != model.StatusActive {
+		t.Fatalf("SetEnabled 失敗不得修改記憶體帳號狀態: enabled=%v status=%s", got.Enabled, got.Status)
+	}
+	if _, err := s.SetArchived(acc.Provider, acc.ID, true); err == nil {
+		t.Fatal("DB 關閉後 SetArchived 應回錯")
+	}
+	if got := s.FindAny(acc.ID); got.ArchivedAt != nil || !got.Enabled {
+		t.Fatalf("SetArchived 失敗不得修改記憶體帳號狀態: archived=%v enabled=%v", got.ArchivedAt, got.Enabled)
+	}
+}
+
+func TestSelectSmart_LeastInflightAndUrgentPromo(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Unix(1800000000, 0).UTC()
+
+	aUrgent, _ := s.AddAccount(model.ProviderZai, "urgent", "h1.p1.s1")
+	aLater, _ := s.AddAccount(model.ProviderZai, "later", "h2.p2.s2")
+	aExpired, _ := s.AddAccount(model.ProviderZai, "expired", "h3.p3.s3")
+	aReg1, _ := s.AddAccount(model.ProviderZai, "reg1", "h4.p4.s4")
+	aReg2, _ := s.AddAccount(model.ProviderZai, "reg2", "h5.p5.s5")
+
+	// urgent: 2h 後到期；later: 7 天後到期；expired: 1h 前已過期；reg1/reg2: 每日常規額度
+	_ = s.Update(model.ProviderZai, aUrgent.ID, func(a *model.Account) {
+		a.Quota = map[string]map[string]any{
+			"GLM-5.4": {"model": "GLM-5.4", "period": "one_time", "remaining": float64(50), "expires_at": now.Add(2 * time.Hour).Format(time.RFC3339)},
+		}
+	})
+	_ = s.Update(model.ProviderZai, aLater.ID, func(a *model.Account) {
+		a.Quota = map[string]map[string]any{
+			"GLM-5.4": {"model": "GLM-5.4", "period": "one_time", "remaining": float64(50), "expires_at": now.Add(7 * 24 * time.Hour).Format(time.RFC3339)},
+		}
+	})
+	_ = s.Update(model.ProviderZai, aExpired.ID, func(a *model.Account) {
+		a.Quota = map[string]map[string]any{
+			"GLM-5.4": {"model": "GLM-5.4", "period": "one_time", "remaining": float64(50), "expires_at": now.Add(-time.Hour).Format(time.RFC3339)},
+		}
+	})
+	for _, a := range []*model.Account{aReg1, aReg2} {
+		_ = s.Update(model.ProviderZai, a.ID, func(acc *model.Account) {
+			acc.Quota = map[string]map[string]any{
+				"GLM-5.4": {"model": "GLM-5.4", "period": "daily", "remaining": float64(50)},
+			}
+		})
+	}
+
+	// 1. 6h 內臨期優惠優先於 7 天後優惠與常規帳號
+	got := s.SelectSmart(model.ProviderZai, nil, "GLM-5.4", SelectOptions{Now: now})
+	if got == nil || got.ID != aUrgent.ID {
+		t.Fatalf("應優先選擇 6h 內臨期優惠帳號 urgent，實際: %+v", got)
+	}
+
+	// 2. 跳過 urgent 後應選 7 天後優惠帳號 later（已過期的 expired 不得誤判為優惠）
+	got = s.SelectSmart(model.ProviderZai, map[string]bool{aUrgent.ID: true}, "GLM-5.4", SelectOptions{Now: now})
+	if got == nil || got.ID != aLater.ID {
+		t.Fatalf("跳過 urgent 後應選 later，實際: %+v", got)
+	}
+
+	// 3. 跳過 urgent 與 later 後，常規池（含 expired/reg1/reg2）應選 Least-Inflight 最小在飛帳號
+	inflight := map[string]int{aExpired.ID: 2, aReg1.ID: 2, aReg2.ID: 0}
+	got = s.SelectSmart(model.ProviderZai, map[string]bool{aUrgent.ID: true, aLater.ID: true}, "GLM-5.4", SelectOptions{
+		Now:      now,
+		InFlight: func(id string) int { return inflight[id] },
+	})
+	if got == nil || got.ID != aReg2.ID {
+		t.Fatalf("同組內應選最小在飛帳號 reg2，實際: %+v", got)
+	}
+
+	// 4. PreferredID 命中且 CanStick=true 時優先返回偏好帳號；CanStick=false 時自動溢出
+	got = s.SelectSmart(model.ProviderZai, nil, "GLM-5.4", SelectOptions{
+		Now:         now,
+		PreferredID: aReg1.ID,
+		CanStick:    func(a *model.Account) bool { return true },
+	})
+	if got == nil || got.ID != aReg1.ID {
+		t.Fatalf("PreferredID 且 CanStick=true 時應命中 reg1，實際: %+v", got)
+	}
+	got = s.SelectSmart(model.ProviderZai, nil, "GLM-5.4", SelectOptions{
+		Now:         now,
+		PreferredID: aReg1.ID,
+		CanStick:    func(a *model.Account) bool { return false },
+	})
+	if got == nil || got.ID != aUrgent.ID {
+		t.Fatalf("CanStick=false 滿載時應自動溢出至最優候選 urgent，實際: %+v", got)
+	}
+}
