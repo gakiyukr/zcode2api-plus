@@ -532,7 +532,13 @@ func TestSettingsFlow(t *testing.T) {
 }
 
 func TestMonitorAndUsage(t *testing.T) {
-	mux, st, _ := setup(t)
+	mux, st, billing := setup(t)
+	// 無可用額度會轉為 exhausted，此處為 JWT 帳號提供有效餘額以維持 active 狀態供監控統計斷言
+	billing.setStatus(http.StatusOK, `{"code":0,"data":{
+		"plans":[{"plan_id":"test-plan","entitlements":[
+			{"entitlement_id":"ent-test","show_name":"Test Model","period":"daily"}]}],
+		"balances":[{"entitlement_id":"ent-test","show_name":"Test Model",
+			"total_units":100,"used_units":0,"remaining_units":100,"available_units":100}]}}`)
 	_, added := do(t, mux, st, http.MethodPost, "/admin/api/accounts", map[string]any{
 		"tokens": "tok-a\njwt.b.c",
 	})

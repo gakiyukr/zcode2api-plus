@@ -3,6 +3,7 @@
 package adminapi
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 )
 
@@ -105,7 +107,7 @@ func (h *Handler) handleAssignProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleTestCurrentProxy(w http.ResponseWriter, r *http.Request) {
-	h.writeProbe(w, "")
+	h.writeProbe(r.Context(), w, "")
 }
 
 func (h *Handler) handleTestProxy(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +123,7 @@ func (h *Handler) handleTestProxy(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound("代理配置不存在"))
 		return
 	}
-	h.writeProbe(w, target)
+	h.writeProbe(r.Context(), w, target)
 }
 
 func payloadEnabled(payload map[string]any) bool {
@@ -132,8 +134,8 @@ func payloadEnabled(payload map[string]any) bool {
 }
 
 // writeProbe 执行出口查询并写响应；全部查询服务失败时返回 502（对齐 Python 版）。
-func (h *Handler) writeProbe(w http.ResponseWriter, proxyURL string) {
-	result, err := h.probe(proxyURL)
+func (h *Handler) writeProbe(ctx context.Context, w http.ResponseWriter, proxyURL string) {
+	result, err := h.probe(ctx, proxyURL)
 	if err != nil {
 		writeAPIError(w, &apiError{
 			status: http.StatusBadGateway,
@@ -152,16 +154,20 @@ var ipProbeProviders = []struct{ name, endpoint string }{
 	{"ipapi.is", "https://api.ipapi.is/"},
 }
 
-// probe 经指定出口查询公网信息；主服务失败时自动切换备援。
-func (h *Handler) probe(proxyURL string) (map[string]any, error) {
-	client, err := newProbeClient(proxyURL)
+// probe 經指定出口查詢公網資訊；主服務失敗時自動切換備援，結束後主動關閉閒置連線。
+func (h *Handler) probe(ctx context.Context, proxyURL string) (map[string]any, error) {
+	client, transport, err := newProbeClient(proxyURL)
 	if err != nil {
 		return nil, err
 	}
+	defer transport.CloseIdleConnections()
 	started := time.Now()
 	var lastErr error
 	for _, p := range ipProbeProviders {
-		result, err := fetchIPInfo(client, p.name, p.endpoint)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		result, err := fetchIPInfo(ctx, client, p.name, p.endpoint)
 		if err == nil {
 			result["latency_ms"] = time.Since(started).Milliseconds()
 			return result, nil
@@ -174,33 +180,27 @@ func (h *Handler) probe(proxyURL string) (map[string]any, error) {
 	return nil, lastErr
 }
 
-// newProbeClient 构造带 12s 超时、跟随重定向的探测客户端，默认透传环境代理。
-// Go 标准库支持 http/https/socks5 代理；socks5 拨号即远程解析主机名，
-// 与 socks5h 语义一致；socks4 无标准库支持，直接报错（呈 502 形态）。
-func newProbeClient(proxyURL string) (*http.Client, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if strings.TrimSpace(proxyURL) != "" {
-		u, err := url.Parse(proxyURL)
+// newProbeClient 構造帶 12s 超時的探測客戶端：空代理沿用環境代理，指定代理透過
+// proxy.NewTransport 統一支援 http/https/socks4/socks5/socks5h。
+func newProbeClient(proxyURL string) (*http.Client, *http.Transport, error) {
+	var (
+		transport *http.Transport
+		err       error
+	)
+	if strings.TrimSpace(proxyURL) == "" {
+		transport = http.DefaultTransport.(*http.Transport).Clone()
+	} else {
+		transport, err = proxy.NewTransport(proxyURL, 12*time.Second)
 		if err != nil {
-			return nil, err
-		}
-		switch strings.ToLower(u.Scheme) {
-		case "http", "https":
-			transport.Proxy = http.ProxyURL(u)
-		case "socks5", "socks5h":
-			socks := *u
-			socks.Scheme = "socks5"
-			transport.Proxy = http.ProxyURL(&socks)
-		default:
-			return nil, fmt.Errorf("不支持的代理协议: %s", u.Scheme)
+			return nil, nil, err
 		}
 	}
-	return &http.Client{Timeout: 12 * time.Second, Transport: transport}, nil
+	return &http.Client{Timeout: 12 * time.Second, Transport: transport}, transport, nil
 }
 
-// probeGet 以探测专用 UA 发起 GET。
-func probeGet(client *http.Client, endpoint string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+// probeGet 以探測專用 UA 並透傳請求上下文發起 GET。
+func probeGet(ctx context.Context, client *http.Client, endpoint string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -210,8 +210,8 @@ func probeGet(client *http.Client, endpoint string) (*http.Response, error) {
 
 // fetchIPInfo 查询单个 IP 服务并整理结果；ASN 缺失时向 hackertarget 补查
 // （补查失败仍保留 IP 结果，对齐 Python 版）。
-func fetchIPInfo(client *http.Client, source, endpoint string) (map[string]any, error) {
-	resp, err := probeGet(client, endpoint)
+func fetchIPInfo(ctx context.Context, client *http.Client, source, endpoint string) (map[string]any, error) {
+	resp, err := probeGet(ctx, client, endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +228,7 @@ func fetchIPInfo(client *http.Client, source, endpoint string) (map[string]any, 
 		return nil, err
 	}
 	if ip, _ := result["ip"].(string); result["asn"] == "" && ip != "" {
-		if asn, operator, err := lookupASN(client, ip); err == nil {
+		if asn, operator, err := lookupASN(ctx, client, ip); err == nil {
 			result["asn"] = asn
 			if result["operator"] == "" {
 				result["operator"] = operator
@@ -268,8 +268,8 @@ func parseIPLookup(payload map[string]any) (map[string]any, error) {
 }
 
 // lookupASN 查询并解析 hackertarget 备援 ASN 服务（单行 CSV 回应）。
-func lookupASN(client *http.Client, ip string) (string, string, error) {
-	resp, err := probeGet(client, "https://api.hackertarget.com/aslookup/?q="+url.QueryEscape(ip))
+func lookupASN(ctx context.Context, client *http.Client, ip string) (string, string, error) {
+	resp, err := probeGet(ctx, client, "https://api.hackertarget.com/aslookup/?q="+url.QueryEscape(ip))
 	if err != nil {
 		return "", "", err
 	}

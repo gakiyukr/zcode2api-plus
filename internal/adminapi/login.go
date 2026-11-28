@@ -82,6 +82,16 @@ func (h *Handler) handleLoginComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 通過本地校驗後原子消費 flow，避免併發請求以同一個 flow_id 重複兌換授權碼
+	loginFlowsMu.Lock()
+	if loginFlows[flowID] != flow {
+		loginFlowsMu.Unlock()
+		writeAPIError(w, errNotFound("登入會話不存在或已消費"))
+		return
+	}
+	delete(loginFlows, flowID)
+	loginFlowsMu.Unlock()
+
 	result, err := flow.ExchangeCode(code, state)
 	if err != nil {
 		writeAPIError(w, errBadRequest(err.Error()))
@@ -92,9 +102,6 @@ func (h *Handler) handleLoginComplete(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, apiErr)
 		return
 	}
-	loginFlowsMu.Lock()
-	delete(loginFlows, flowID)
-	loginFlowsMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "account": account.PublicView(time.Now())})
 }
 

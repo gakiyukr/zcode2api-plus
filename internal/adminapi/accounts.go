@@ -215,6 +215,7 @@ func (h *Handler) handleDeleteAccounts(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"deleted": deleted}
 	if len(failed) > 0 {
 		resp["failed"] = failed
+		resp["detail"] = fmt.Sprintf("部分帳號刪除失敗：%s", strings.Join(failed, ", "))
 		writeJSON(w, http.StatusInternalServerError, resp)
 		return
 	}
@@ -314,7 +315,10 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 			a.Mode = setSecret.Mode
 			a.JWTToken = setSecret.JWTToken
 			a.APIKey = setSecret.APIKey
-			a.Status = model.StatusActive
+			// 已停用或已歸檔屬管理員強狀態，更換憑證時不得強制刷回 active
+			if a.Enabled && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
+				a.Status = model.StatusActive
+			}
 			a.LastError = nil
 		}
 		if setProxy {
@@ -578,7 +582,10 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		// 空值合法：表示关闭访客入口（与 admin_key/gateway_key 的必填语义相反）
 		pending = append(pending, setting{"guest_invite_code", strings.TrimSpace(strOf(v))})
 	}
-	if _, ok := payload["cap_instance"]; ok {
+	_, hasCapInstance := payload["cap_instance"]
+	_, hasCapSiteKey := payload["cap_site_key"]
+	_, hasCapSecret := payload["cap_secret"]
+	if hasCapInstance || hasCapSiteKey || hasCapSecret {
 		instance := strings.TrimSpace(strOf(payload["cap_instance"]))
 		siteKey := strings.TrimSpace(strOf(payload["cap_site_key"]))
 		secret := strings.TrimSpace(strOf(payload["cap_secret"]))
